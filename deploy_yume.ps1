@@ -2,73 +2,73 @@ param(
     [string]$Message
 )
 
-# ==== ê¸°ë³¸ ì„¤ì • ====
-# ì´ ìŠ¤í¬ë¦½íŠ¸ê°€ ìˆëŠ” í´ë”(= git repo ë£¨íŠ¸)ë¡œ ì´ë™
+# ==== ±âº» ¼³Á¤ ====
+# ÀÌ ½ºÅ©¸³Æ®°¡ ÀÖ´Â Æú´õ(= git repo ·çÆ®)·Î ÀÌµ¿
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
-# ì„œë²„ ì ‘ì† ì •ë³´ (ë„¤ í™˜ê²½ì— ë§ê²Œ ìˆ˜ì •)
+# ¼­¹ö Á¢¼Ó Á¤º¸ (³× È¯°æ¿¡ ¸Â°Ô ¼öÁ¤)
 $serverUser = "root"
-$serverHost = "vmi2949508"        # ë˜ëŠ” vmi2949508.yourhost.com / IP ë“±ë“±
+$serverHost = "vmi2949508"        # ¶Ç´Â vmi2949508.yourhost.com / IP µîµî
 $server = "$serverUser@$serverHost"
 
-# ì„œë²„ì—ì„œ ì‹¤í–‰í•  ëª…ë ¹
-# - /opt/yume ë¡œ ì´ë™
-# - git pull ë¡œ ìµœì‹  ì½”ë“œ ë°›ê¸°
-# - (í•„ìš”í•˜ë©´ ì•„ë˜ systemctl ì¤„ì„ ë„¤ê°€ ì“°ëŠ” ë°©ì‹ì— ë§ê²Œ ìˆ˜ì •)
+# ¼­¹ö¿¡¼­ ½ÇÇàÇÒ ¸í·É
+# - /opt/yume ·Î ÀÌµ¿
+# - git pull ·Î ÃÖ½Å ÄÚµå ¹Ş±â
+# - (ÇÊ¿äÇÏ¸é ¾Æ·¡ systemctl ÁÙÀ» ³×°¡ ¾²´Â ¹æ½Ä¿¡ ¸Â°Ô ¼öÁ¤)
 $remoteCommand = @"
 cd /opt/yume && \
 git pull && \
 systemctl restart yume.service
 "@
 
-Write-Host "=== Yume ë°°í¬ ìŠ¤í¬ë¦½íŠ¸ ì‹œì‘ ===" -ForegroundColor Cyan
-Write-Host "ì‘ì—… ê²½ë¡œ: $scriptDir" -ForegroundColor DarkGray
+Write-Host "=== Yume ¹èÆ÷ ½ºÅ©¸³Æ® ½ÃÀÛ ===" -ForegroundColor Cyan
+Write-Host "ÀÛ¾÷ °æ·Î: $scriptDir" -ForegroundColor DarkGray
 
-# ==== 1) ì»¤ë°‹ ë©”ì‹œì§€ í™•ë³´ ====
+# ==== 1) Ä¿¹Ô ¸Ş½ÃÁö È®º¸ ====
 if (-not $Message) {
-    $Message = Read-Host "ì»¤ë°‹ ë©”ì‹œì§€ë¥¼ ì…ë ¥í•´ì¤˜ (ì—”í„°ë§Œ ì¹˜ë©´ ìë™ ë©”ì‹œì§€ ì‚¬ìš©)"
+    $Message = Read-Host "Ä¿¹Ô ¸Ş½ÃÁö¸¦ ÀÔ·ÂÇØÁà (¿£ÅÍ¸¸ Ä¡¸é ÀÚµ¿ ¸Ş½ÃÁö »ç¿ë)"
     if (-not $Message) {
         $Message = "auto deploy $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     }
 }
 
-# ==== 2) git status í•œë²ˆ ë³´ì—¬ì£¼ê¸° ====
+# ==== 2) git status ÇÑ¹ø º¸¿©ÁÖ±â ====
 Write-Host "`n--- git status ---" -ForegroundColor Yellow
 git status
 
-# ==== 3) ë³€ê²½ì‚¬í•­ ì»¤ë°‹ ====
+# ==== 3) º¯°æ»çÇ× Ä¿¹Ô ====
 Write-Host "`n--- git add . ---" -ForegroundColor Yellow
 git add .
 
 Write-Host "`n--- git commit ---" -ForegroundColor Yellow
 git commit -m "$Message"
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "ì»¤ë°‹ì´ ì•ˆ ëì–´. (ì•„ë§ˆ ë³€ê²½ ì‚¬í•­ì´ ì—†ì„ ìˆ˜ë„ ìˆì–´.)" -ForegroundColor DarkYellow
+    Write-Host "Ä¿¹ÔÀÌ ¾È µÆ¾î. (¾Æ¸¶ º¯°æ »çÇ×ÀÌ ¾øÀ» ¼öµµ ÀÖ¾î.)" -ForegroundColor DarkYellow
 } else {
-    Write-Host "ì»¤ë°‹ ì™„ë£Œ: $Message" -ForegroundColor Green
+    Write-Host "Ä¿¹Ô ¿Ï·á: $Message" -ForegroundColor Green
 }
 
-# ==== 4) GitHub ë¡œ push ====
+# ==== 4) GitHub ·Î push ====
 Write-Host "`n--- git push origin main ---" -ForegroundColor Yellow
 git push origin main
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "git push ë„ì¤‘ì— ë¬¸ì œê°€ ìƒê²¼ì–´. ë°°í¬ ì¤‘ë‹¨." -ForegroundColor Red
+    Write-Host "git push µµÁß¿¡ ¹®Á¦°¡ »ı°å¾î. ¹èÆ÷ Áß´Ü." -ForegroundColor Red
     exit 1
 }
 
-Write-Host "`nGitHub push ì™„ë£Œ!" -ForegroundColor Green
+Write-Host "`nGitHub push ¿Ï·á!" -ForegroundColor Green
 
-# ==== 5) ì„œë²„ë¡œ SSH ì ‘ì†í•´ì„œ git pull + ì¬ì‹œì‘ ====
-Write-Host "`n--- ì„œë²„ë¡œ SSH ì ‘ì†: $server ---" -ForegroundColor Yellow
-Write-Host "ì„œë²„ ë¹„ë°€ë²ˆí˜¸ ë˜ëŠ” SSH í‚¤ íŒ¨ìŠ¤í”„ë ˆì´ì¦ˆë¥¼ ì…ë ¥í•˜ë¼ëŠ” ì°½ì´ ëœ° ìˆ˜ ìˆì–´." -ForegroundColor DarkGray
+# ==== 5) ¼­¹ö·Î SSH Á¢¼ÓÇØ¼­ git pull + Àç½ÃÀÛ ====
+Write-Host "`n--- ¼­¹ö·Î SSH Á¢¼Ó: $server ---" -ForegroundColor Yellow
+Write-Host "¼­¹ö ºñ¹Ğ¹øÈ£ ¶Ç´Â SSH Å° ÆĞ½ºÇÁ·¹ÀÌÁî¸¦ ÀÔ·ÂÇÏ¶ó´Â Ã¢ÀÌ ¶ã ¼ö ÀÖ¾î." -ForegroundColor DarkGray
 
-# Windows 10/11 ê¸°ë³¸ ssh í´ë¼ì´ì–¸íŠ¸ë¥¼ ì‚¬ìš©
+# Windows 10/11 ±âº» ssh Å¬¶óÀÌ¾ğÆ®¸¦ »ç¿ë
 ssh $server "$remoteCommand"
 
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "ì„œë²„ ìª½ ë°°í¬ ëª…ë ¹ì—ì„œ ì—ëŸ¬ê°€ ë‚œ ê²ƒ ê°™ì•„." -ForegroundColor Red
+    Write-Host "¼­¹ö ÂÊ ¹èÆ÷ ¸í·É¿¡¼­ ¿¡·¯°¡ ³­ °Í °°¾Æ." -ForegroundColor Red
     exit 1
 }
 
-Write-Host "`n=== ë°°í¬ ì™„ë£Œ! ìœ ë©” ìµœì‹  ë²„ì „ì´ ì„œë²„ê¹Œì§€ ë°˜ì˜ëì–´. ìœ¼í—¤~ ===" -ForegroundColor Cyan
+Write-Host "`n=== ¹èÆ÷ ¿Ï·á! À¯¸Ş ÃÖ½Å ¹öÀüÀÌ ¼­¹ö±îÁö ¹İ¿µµÆ¾î. À¸Çì~ ===" -ForegroundColor Cyan
