@@ -7,18 +7,13 @@ param(
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
-# 서버 접속 정보 (네 환경에 맞게 수정)
-$serverUser = "root"
-$serverHost = "vmi2949508"        # 또는 vmi2949508.yourhost.com / IP 등등
-$server = "$serverUser@$serverHost"
-
-# 서버에서 실행할 명령
-# - /opt/yume 로 이동
-# - git pull 로 최신 코드 받기
-# - (필요하면 아래 systemctl 줄을 네가 쓰는 방식에 맞게 수정)
+# yssh 사용 가정:
+#  - PowerShell에서 yssh만 치면 비밀번호 없이 서버 접속됨
+#  - 하지만 yssh "명령"은 인자로 안 먹고, 그냥 ssh만 여는 형태
+# => 그래서 원격 명령은 파이프로 넘겨서 실행한다.
 $remoteCommand = @"
-cd /opt/yume && \
-git pull && \
+cd /opt/yume
+git pull
 systemctl restart yume.service
 "@
 
@@ -59,12 +54,12 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "`nGitHub push 완료!" -ForegroundColor Green
 
-# ==== 5) 서버로 SSH 접속해서 git pull + 재시작 ====
-Write-Host "`n--- 서버로 SSH 접속: $server ---" -ForegroundColor Yellow
-Write-Host "서버 비밀번호 또는 SSH 키 패스프레이즈를 입력하라는 창이 뜰 수 있어." -ForegroundColor DarkGray
+# ==== 5) yssh로 서버에서 git pull + 재시작 ====
+Write-Host "`n--- 서버로 SSH 접속 (yssh + 파이프 사용) ---" -ForegroundColor Yellow
+Write-Host "yssh를 열고, 표준입력으로 배포 명령을 흘려보낼게." -ForegroundColor DarkGray
 
-# Windows 10/11 기본 ssh 클라이언트를 사용
-ssh $server "$remoteCommand"
+# 여기서 $remoteCommand 문자열이 yssh를 통해 원격 셸에서 실행됨
+$remoteCommand | yssh
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "서버 쪽 배포 명령에서 에러가 난 것 같아." -ForegroundColor Red
