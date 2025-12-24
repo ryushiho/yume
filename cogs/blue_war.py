@@ -16,13 +16,7 @@ import discord
 from discord.ext import commands
 
 from words_core import WORDS_SET, WORDS_BY_FIRST
-from records_core import (
-    ensure_records,
-    load_records,
-    save_records,
-    add_match_record,
-    calc_rankings,
-)
+from records_core import ensure_records, load_records, save_records, add_match_record, calc_rankings
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +105,6 @@ DEFAULT_DOOUM_MAP: Dict[str, Set[str]] = {
     "립": {"입"},
     "릿": {"잇"},
     "링": {"잉"},
-    "리": {"이"},
 }
 
 def _normalize_word(w: str) -> str:
@@ -249,6 +242,8 @@ def _valid_follow(prev_word: str, next_word: str) -> bool:
     return first in _allowed_first_chars(last)
 
 def _has_any_move_from_last(last_char: str, used: Set[str]) -> bool:
+    if not last_char:
+        return False
     for ch in _allowed_first_chars(last_char):
         for cand in WORDS_BY_FIRST.get(ch, []):
             if cand not in used:
@@ -273,7 +268,6 @@ def _load_or_build_graph() -> Dict[str, Set[str]]:
                 return pickle.load(f)
     except Exception as e:
         logger.warning("[BlueWar] 그래프 캐시 로드 실패: %s", e)
-
     graph = _build_graph(WORDS_SET)
     try:
         os.makedirs(os.path.dirname(GRAPH_CACHE_FILE), exist_ok=True)
@@ -361,7 +355,6 @@ class BlueWarCog(commands.Cog):
     ) -> None:
         total_rounds = len(word_history)
         review_log = self._build_review_log_text(word_history)
-
         payload: Dict[str, Any] = {
             "mode": mode,
             "status": "finished",
@@ -395,7 +388,6 @@ class BlueWarCog(commands.Cog):
                 },
             ],
         }
-
         try:
             sender = getattr(self.bot, "admin_sender", None)
             if sender and hasattr(sender, "send_bluewar_match"):
@@ -408,7 +400,6 @@ class BlueWarCog(commands.Cog):
             if user_is_winner:
                 return f"{user.display_name}, 오늘은 네가 이겼네. 잘했어, 으헤~"
             return f"{user.display_name}, 다음엔 더 잘할 수 있을 거야. 유메가 응원할게, 으헤~"
-
         tone = "neutral"
         try:
             core = getattr(self.bot, "yume_core", None)
@@ -416,7 +407,6 @@ class BlueWarCog(commands.Cog):
                 tone = core.get_tone_for_user(user)
         except Exception:
             tone = "neutral"
-
         prompt = f"""
 상황: 디스코드 끝말잇기 연습 모드(블루전). 유저 vs 유메(AI).
 유저: {user.display_name}
@@ -443,163 +433,6 @@ class BlueWarCog(commands.Cog):
                 return f"{user.display_name}, 오늘은 네가 이겼네. 잘했어, 으헤~"
             return f"{user.display_name}, 다음엔 더 잘할 수 있을 거야. 유메가 응원할게, 으헤~"
 
-    async def _run_practice_game(self, ctx: commands.Context, user: discord.Member, game_no: int):
-        channel = ctx.channel
-        guild = ctx.guild
-
-        start_word = random.choice(self.suggestions) if self.suggestions else random.choice(list(WORDS_SET))
-        used_words: Set[str] = set()
-        word_history: List[str] = []
-
-        current_word = start_word
-        used_words.add(current_word)
-        word_history.append(current_word)
-
-        await channel.send(
-            f"연습 모드 시작! (#{game_no})\n"
-            f"첫 단어는 **{start_word}**\n"
-            f"다음 단어는 `{_last_char(start_word)}`(또는 두음법칙)로 시작해야 해."
-        )
-
-        user_turn = True
-        start_time = datetime.now(timezone.utc)
-        user_is_winner = False
-        end_reason = "unknown"
-
-        while True:
-            if user_turn:
-                try:
-                    msg: discord.Message = await self.bot.wait_for(
-                        "message",
-                        timeout=25.0,
-                        check=lambda m: (
-                            m.author.id == user.id
-                            and m.channel.id == channel.id
-                            and (m.content or "").strip() != ""
-                        ),
-                    )
-                except asyncio.TimeoutError:
-                    await channel.send(
-                        f"{user.display_name}, 시간이 초과됐어.\n"
-                        "이번 판은 유메가 이긴 걸로 할게… 으헤~"
-                    )
-                    user_is_winner = False
-                    end_reason = "timeout"
-                    break
-
-                w = _normalize_word(msg.content)
-                if w in used_words:
-                    await channel.send("이미 나온 단어야. 다른 단어로 해줘.")
-                    continue
-                if w not in WORDS_SET:
-                    await channel.send("그 단어는 유메 사전에 없네… 다른 걸로 해줘.")
-                    continue
-                if not _valid_follow(current_word, w):
-                    last = _last_char(current_word)
-                    allowed = _allowed_first_chars(last)
-                    await channel.send(f"규칙 위반! `{current_word}` 다음은 `{', '.join(sorted(allowed))}` 로 시작해야 해.")
-                    continue
-
-                current_word = w
-                used_words.add(w)
-                word_history.append(w)
-
-                if not _has_any_move_from_last(_last_char(current_word), used_words):
-                    await channel.send(
-                        "으으… 다음으로 이어질 단어가 없어졌네.\n"
-                        f"이번 판은 **{user.display_name}** 의 승리야. 잘했어, 으헤~"
-                    )
-                    user_is_winner = True
-                    end_reason = "ai_no_move"
-                    break
-
-                user_turn = False
-
-            else:
-                last = _last_char(current_word)
-                candidates: List[str] = []
-                for ch in _allowed_first_chars(last):
-                    candidates.extend(list(WORDS_BY_FIRST.get(ch, [])))
-                candidates = [c for c in candidates if c not in used_words]
-
-                ai_word = None
-                random.shuffle(candidates)
-                for c in candidates:
-                    if _has_any_move_from_last(_last_char(c), used_words | {c}):
-                        ai_word = c
-                        break
-                if ai_word is None and candidates:
-                    ai_word = candidates[0]
-
-                if not ai_word:
-                    await channel.send(
-                        "으으… 이어지는 단어가 더 이상 떠오르지 않아.\n"
-                        f"이번 판은 **{user.display_name}** 의 승리야. 잘했어, 으헤~"
-                    )
-                    user_is_winner = True
-                    end_reason = "ai_no_word"
-                    break
-
-                await channel.send(f"**{ai_word}**")
-                current_word = ai_word
-                used_words.add(ai_word)
-                word_history.append(ai_word)
-
-                if not _has_any_move_from_last(_last_char(current_word), used_words):
-                    await channel.send(
-                        f"다음으로 이어질 단어가 없네.\n"
-                        "이번 판은 유메가 이긴 걸로 할게… 으헤~"
-                    )
-                    user_is_winner = False
-                    end_reason = "user_no_move"
-                    break
-
-                user_turn = True
-
-        end_time = datetime.now(timezone.utc)
-
-        ensure_records()
-        records = load_records()
-        add_match_record(
-            records,
-            mode="practice",
-            winner_id=str(user.id) if user_is_winner else "yume",
-            loser_id="yume" if user_is_winner else str(user.id),
-            winner_name=user.display_name if user_is_winner else "유메",
-            loser_name="유메" if user_is_winner else user.display_name,
-            win_gap=None,
-            total_rounds=len(word_history),
-            history=word_history,
-        )
-        save_records(records)
-
-        try:
-            if user_is_winner:
-                self._note_event("bluewar_practice_win", user=user, guild=guild, weight=1.2 if guild else 1.0)
-            else:
-                self._note_event("bluewar_practice_lose", user=user, guild=guild, weight=0.8 if guild else 1.0)
-        except Exception:
-            pass
-
-        try:
-            await self._report_practice_result_to_admin(
-                user=user,
-                user_is_winner=user_is_winner,
-                word_history=word_history,
-                start_time=start_time,
-                end_time=end_time,
-                reason=end_reason,
-            )
-        except Exception:
-            pass
-
-        try:
-            result_text = await self._speak_practice_result(user, user_is_winner, word_history)
-            if result_text:
-                await channel.send(result_text)
-        except Exception:
-            pass
-
     async def _report_practice_result_to_admin(
         self,
         *,
@@ -612,17 +445,14 @@ class BlueWarCog(commands.Cog):
     ) -> None:
         total_rounds = len(word_history)
         review_log = self._build_review_log_text(word_history)
-
         winner_discord_id: Optional[str]
         loser_discord_id: Optional[str]
-
         if user_is_winner:
             winner_discord_id = str(user.id)
             loser_discord_id = None
         else:
             winner_discord_id = None
             loser_discord_id = str(user.id)
-
         payload: Dict[str, Any] = {
             "mode": "practice",
             "status": "finished",
@@ -656,7 +486,6 @@ class BlueWarCog(commands.Cog):
                 },
             ],
         }
-
         try:
             sender = getattr(self.bot, "admin_sender", None)
             if sender and hasattr(sender, "send_bluewar_match"):
@@ -664,18 +493,153 @@ class BlueWarCog(commands.Cog):
         except Exception as e:
             logger.warning("[BlueWar] practice 관리자 웹 전송 실패: %s", e)
 
+    async def _run_practice_game(self, ctx: commands.Context, user: discord.Member, game_no: int):
+        channel = ctx.channel
+        guild = ctx.guild
+        start_word = random.choice(self.suggestions) if self.suggestions else random.choice(list(WORDS_SET))
+        used_words: Set[str] = set()
+        word_history: List[str] = []
+        current_word = start_word
+        used_words.add(current_word)
+        word_history.append(current_word)
+        allowed0 = ", ".join(sorted(_allowed_first_chars(_last_char(start_word))))
+        await channel.send(
+            f"연습 모드 시작! (#{game_no})\n"
+            f"첫 단어는 **{start_word}**\n"
+            f"다음 단어 시작 글자: `{allowed0}`"
+        )
+        user_turn = True
+        start_time = datetime.now(timezone.utc)
+        user_is_winner = False
+        end_reason = "unknown"
+        while True:
+            if user_turn:
+                try:
+                    msg: discord.Message = await self.bot.wait_for(
+                        "message",
+                        timeout=25.0,
+                        check=lambda m: (
+                            m.author.id == user.id
+                            and m.channel.id == channel.id
+                            and (m.content or "").strip() != ""
+                        ),
+                    )
+                except asyncio.TimeoutError:
+                    await channel.send(
+                        f"{user.display_name}, 시간이 초과됐어.\n"
+                        "이번 판은 유메가 이긴 걸로 할게… 으헤~"
+                    )
+                    user_is_winner = False
+                    end_reason = "timeout"
+                    break
+                w = _normalize_word(msg.content)
+                if w in used_words:
+                    await channel.send("이미 나온 단어야. 다른 단어로 해줘.")
+                    continue
+                if w not in WORDS_SET:
+                    await channel.send("그 단어는 유메 사전에 없네… 다른 걸로 해줘.")
+                    continue
+                if not _valid_follow(current_word, w):
+                    last = _last_char(current_word)
+                    allowed = ", ".join(sorted(_allowed_first_chars(last)))
+                    await channel.send(f"규칙 위반! `{current_word}` 다음은 `{allowed}` 로 시작해야 해.")
+                    continue
+                current_word = w
+                used_words.add(w)
+                word_history.append(w)
+                if not _has_any_move_from_last(_last_char(current_word), used_words):
+                    await channel.send(
+                        "으으… 다음으로 이어질 단어가 없어졌네.\n"
+                        f"이번 판은 **{user.display_name}** 의 승리야. 잘했어, 으헤~"
+                    )
+                    user_is_winner = True
+                    end_reason = "ai_no_move"
+                    break
+                user_turn = False
+            else:
+                last = _last_char(current_word)
+                candidates: List[str] = []
+                for ch in _allowed_first_chars(last):
+                    candidates.extend(list(WORDS_BY_FIRST.get(ch, [])))
+                candidates = [c for c in candidates if c not in used_words]
+                ai_word = None
+                random.shuffle(candidates)
+                for c in candidates:
+                    if _has_any_move_from_last(_last_char(c), used_words | {c}):
+                        ai_word = c
+                        break
+                if ai_word is None and candidates:
+                    ai_word = candidates[0]
+                if not ai_word:
+                    await channel.send(
+                        "으으… 이어지는 단어가 더 이상 떠오르지 않아.\n"
+                        f"이번 판은 **{user.display_name}** 의 승리야. 잘했어, 으헤~"
+                    )
+                    user_is_winner = True
+                    end_reason = "ai_no_word"
+                    break
+                await channel.send(f"**{ai_word}**")
+                current_word = ai_word
+                used_words.add(ai_word)
+                word_history.append(ai_word)
+                if not _has_any_move_from_last(_last_char(current_word), used_words):
+                    await channel.send(
+                        f"다음으로 이어질 단어가 없네.\n"
+                        "이번 판은 유메가 이긴 걸로 할게… 으헤~"
+                    )
+                    user_is_winner = False
+                    end_reason = "user_no_move"
+                    break
+                user_turn = True
+        end_time = datetime.now(timezone.utc)
+        ensure_records()
+        records = load_records()
+        add_match_record(
+            records,
+            mode="practice",
+            winner_id=str(user.id) if user_is_winner else "yume",
+            loser_id="yume" if user_is_winner else str(user.id),
+            winner_name=user.display_name if user_is_winner else "유메",
+            loser_name="유메" if user_is_winner else user.display_name,
+            win_gap=None,
+            total_rounds=len(word_history),
+            history=word_history,
+        )
+        save_records(records)
+        try:
+            if user_is_winner:
+                self._note_event("bluewar_practice_win", user=user, guild=guild, weight=1.2 if guild else 1.0)
+            else:
+                self._note_event("bluewar_practice_lose", user=user, guild=guild, weight=0.8 if guild else 1.0)
+        except Exception:
+            pass
+        try:
+            await self._report_practice_result_to_admin(
+                user=user,
+                user_is_winner=user_is_winner,
+                word_history=word_history,
+                start_time=start_time,
+                end_time=end_time,
+                reason=end_reason,
+            )
+        except Exception:
+            pass
+        try:
+            result_text = await self._speak_practice_result(user, user_is_winner, word_history)
+            if result_text:
+                await channel.send(result_text)
+        except Exception:
+            pass
+
     async def _run_pvp_game(self, ctx: commands.Context, host: discord.Member, opponent: discord.Member):
         channel = ctx.channel
         guild = ctx.guild
-
         start_word = random.choice(self.suggestions) if self.suggestions else random.choice(list(WORDS_SET))
         used_words: Set[str] = {start_word}
         word_history: List[str] = [start_word]
         current_word = start_word
-
         starter = host
         turn = host
-
         key = (guild.id if guild else 0, channel.id)
         self.sessions[key] = BlueWarSession(
             guild_id=guild.id if guild else 0,
@@ -689,20 +653,18 @@ class BlueWarCog(commands.Cog):
             user_turn=True,
             started_at=datetime.now(timezone.utc),
         )
-
+        allowed0 = ", ".join(sorted(_allowed_first_chars(_last_char(start_word))))
         await channel.send(
             f"PVP 블루전 시작!\n"
             f"{host.mention} vs {opponent.mention}\n"
             f"첫 단어는 **{start_word}**\n"
             f"첫 턴: {turn.mention}\n"
-            f"다음 단어는 `{_last_char(start_word)}`(또는 두음법칙)로 시작해야 해."
+            f"다음 단어 시작 글자: `{allowed0}`"
         )
-
         start_time = datetime.now(timezone.utc)
         winner: Optional[discord.Member] = None
         loser: Optional[discord.Member] = None
         end_reason = "unknown"
-
         try:
             while True:
                 try:
@@ -721,10 +683,8 @@ class BlueWarCog(commands.Cog):
                     end_reason = "timeout"
                     await channel.send(f"{loser.display_name}, 시간이 초과됐어.\n이번 판 승자는 **{winner.display_name}**!")
                     break
-
                 if msg.author.id != turn.id:
                     continue
-
                 raw = _normalize_word(msg.content)
                 if raw.lower() in ("gg", "기권", "항복", "포기"):
                     winner = opponent if turn.id == host.id else host
@@ -732,7 +692,6 @@ class BlueWarCog(commands.Cog):
                     end_reason = "forfeit"
                     await channel.send(f"{loser.display_name} 기권!\n이번 판 승자는 **{winner.display_name}**!")
                     break
-
                 w = raw
                 if w in used_words:
                     await channel.send("이미 나온 단어야. 다른 단어로 해줘.")
@@ -742,29 +701,23 @@ class BlueWarCog(commands.Cog):
                     continue
                 if not _valid_follow(current_word, w):
                     last = _last_char(current_word)
-                    allowed = _allowed_first_chars(last)
-                    await channel.send(f"규칙 위반! `{current_word}` 다음은 `{', '.join(sorted(allowed))}` 로 시작해야 해.")
+                    allowed = ", ".join(sorted(_allowed_first_chars(last)))
+                    await channel.send(f"규칙 위반! `{current_word}` 다음은 `{allowed}` 로 시작해야 해.")
                     continue
-
                 current_word = w
                 used_words.add(w)
                 word_history.append(w)
-
                 if not _has_any_move_from_last(_last_char(current_word), used_words):
                     winner = turn
                     loser = opponent if turn.id == host.id else host
                     end_reason = "no_move"
                     await channel.send(f"다음으로 이어질 단어가 없어졌어.\n이번 판 승자는 **{winner.display_name}**!")
                     break
-
                 turn = opponent if turn.id == host.id else host
                 await channel.send(f"다음 턴: {turn.mention}")
-
         finally:
             self.sessions.pop(key, None)
-
         end_time = datetime.now(timezone.utc)
-
         if winner and loser:
             ensure_records()
             records = load_records()
@@ -780,14 +733,12 @@ class BlueWarCog(commands.Cog):
                 history=word_history,
             )
             save_records(records)
-
             try:
                 if guild is not None:
                     self._note_event("bluewar_pvp_win", user=winner, guild=guild, weight=1.2)
                     self._note_event("bluewar_pvp_lose", user=loser, guild=guild, weight=0.8)
             except Exception:
                 pass
-
             try:
                 await self._report_match_to_admin(
                     mode="pvp",
@@ -807,32 +758,25 @@ class BlueWarCog(commands.Cog):
         if ctx.guild is None:
             await ctx.send("PVP 블루전은 서버 채널에서만 할 수 있어.")
             return
-
         key = (ctx.guild.id, ctx.channel.id)
         if key in self.sessions:
             await ctx.send("이 채널에서 이미 블루전이 진행 중이야.")
             return
-
         host = ctx.author
         view = BlueWarJoinView(host=host, timeout=60.0)
         msg = await ctx.send(f"{host.display_name}의 PVP 블루전 모집!\n버튼으로 참가하고, 호스트가 닫으면 시작해.", view=view)
-
         await view.wait()
-
         try:
             await msg.edit(view=None)
         except Exception:
             pass
-
         if view.opponent is None:
             await ctx.send("모집이 종료됐어. 참가자가 없어서 취소할게.")
             return
-
         opponent = view.opponent
         if opponent.bot:
             await ctx.send("봇은 참가할 수 없어.")
             return
-
         await self._run_pvp_game(ctx, host, opponent)
 
     @commands.command(name="블루전연습", help="유메와 1:1 연습 블루전을 합니다.")
