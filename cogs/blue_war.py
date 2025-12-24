@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import ast
 import logging
+import json
 import os
+import urllib.request
+import urllib.error
 import pickle
 import random
 import time
@@ -120,6 +123,76 @@ def _first_char(word: str) -> str:
 
 def _last_char(word: str) -> str:
     return word[-1] if word else ""
+
+def post_bluewar_match_to_admin(payload: Dict[str, Any]) -> bool:
+    """
+    Yume Admin 웹 패널로 블루전 매치 전적을 전송한다.
+
+    - URL: {YUME_ADMIN_URL}/bluewar/matches
+    - Header: X-API-Token: {YUME_ADMIN_API_TOKEN}
+
+    성공하면 True, 실패하면 False.
+    """
+    base_url = (os.getenv("YUME_ADMIN_URL") or "").rstrip("/")
+    token = (os.getenv("YUME_ADMIN_API_TOKEN") or "").strip()
+
+    if not base_url:
+        return False
+
+    # ---- payload sanitize (웹 스키마 호환) ----
+    try:
+        send_payload = json.loads(json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        send_payload = dict(payload)
+
+    try:
+        parts = send_payload.get("participants") or []
+        fixed_parts = []
+        for i, p in enumerate(parts):
+            if not isinstance(p, dict):
+                continue
+            pp = dict(p)
+            side = pp.get("side")
+            if isinstance(side, str):
+                s = side.lower().strip()
+                if s in ("user", "human", "player", "p1"):
+                    pp["side"] = 0
+                elif s in ("ai", "bot", "yume", "p2"):
+                    pp["side"] = 1
+                else:
+                    pp["side"] = i
+            elif side is None:
+                pp["side"] = i
+            fixed_parts.append(pp)
+        send_payload["participants"] = fixed_parts
+    except Exception:
+        pass
+
+    url = f"{base_url}/bluewar/matches"
+    data = json.dumps(send_payload, ensure_ascii=False).encode("utf-8")
+
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "yumebot-bluewar/1.0",
+    }
+    if token:
+        headers["X-API-Token"] = token
+
+    req = urllib.request.Request(url=url, data=data, headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return 200 <= int(getattr(resp, "status", 0) or 0) < 300
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        logger.warning("[BlueWar->Admin] HTTPError %s: %s", getattr(e, "code", "?"), body[:500])
+        return False
+    except Exception as e:
+        logger.warning("[BlueWar->Admin] Error: %s", e)
+        return False
 
 def _load_suggestions() -> List[str]:
     if not os.path.exists(SUGGESTION_FILE):
@@ -489,11 +562,11 @@ class BlueWarCog(commands.Cog):
             "review_log": review_log,
             "participants": [
                 {
-                    "discord_id": str(starter.id),
-                    "name": starter.display_name,
+                    "discord_id": str(winner.id),
+                    "name": winner.display_name,
                     "ai_name": None,
-                    "side": "user",
-                    "is_winner": (starter.id == winner.id),
+                    "side": 0,
+                    "is_winner": True,
                     "score": None,
                     "turns": None,
                 },
@@ -501,8 +574,8 @@ class BlueWarCog(commands.Cog):
                     "discord_id": str(loser.id),
                     "name": loser.display_name,
                     "ai_name": None,
-                    "side": "user",
-                    "is_winner": (loser.id == winner.id),
+                    "side": 1,
+                    "is_winner": False,
                     "score": None,
                     "turns": None,
                 },
@@ -512,6 +585,10 @@ class BlueWarCog(commands.Cog):
             sender = getattr(self.bot, "admin_sender", None)
             if sender and hasattr(sender, "send_bluewar_match"):
                 await sender.send_bluewar_match(payload)
+            else:
+                ok = await asyncio.to_thread(post_bluewar_match_to_admin, payload)
+                if not ok:
+                    logger.warning("[BlueWar] 관리자 웹 전송 실패: upload failed")
         except Exception as e:
             logger.warning("[BlueWar] 관리자 웹 전송 실패: %s", e)
 
@@ -547,7 +624,7 @@ class BlueWarCog(commands.Cog):
                     "discord_id": str(user.id),
                     "name": user.display_name,
                     "ai_name": None,
-                    "side": "user",
+                    "side": 0,
                     "is_winner": user_is_winner,
                     "score": None,
                     "turns": None,
@@ -556,7 +633,7 @@ class BlueWarCog(commands.Cog):
                     "discord_id": None,
                     "name": "유메",
                     "ai_name": "yume",
-                    "side": "ai",
+                    "side": 1,
                     "is_winner": (not user_is_winner),
                     "score": None,
                     "turns": None,
@@ -568,6 +645,10 @@ class BlueWarCog(commands.Cog):
             sender = getattr(self.bot, "admin_sender", None)
             if sender and hasattr(sender, "send_bluewar_match"):
                 await sender.send_bluewar_match(payload)
+            else:
+                ok = await asyncio.to_thread(post_bluewar_match_to_admin, payload)
+                if not ok:
+                    logger.warning("[BlueWar] practice 관리자 웹 전송 실패: upload failed")
         except Exception as e:
             logger.warning("[BlueWar] practice 관리자 웹 전송 실패: %s", e)
 
