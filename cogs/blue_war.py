@@ -255,20 +255,38 @@ def _parse_dooum_text_as_literal(text: str) -> Dict[str, Set[str]]:
         return {}
 
 def _load_dooum_map() -> Dict[str, Set[str]]:
+    """두음법칙 맵을 로드한다.
+
+    ✅ 안전장치:
+    - dooum_rules.txt가 **부분 규칙만** 들어있더라도 기본(DEFAULT_DOOUM_MAP)은 항상 유지한다.
+      (파일이 존재하는 순간 기본 규칙이 통째로 덮여서 '두음법칙이 하나도 적용 안 됨' 같은 현상을 방지)
+    """
+    base: Dict[str, Set[str]] = {k: set(v) for k, v in DEFAULT_DOOUM_MAP.items()}
+
     if not os.path.exists(DOOUM_RULES_FILE):
-        return {k: set(v) for k, v in DEFAULT_DOOUM_MAP.items()}
+        return base
+
     try:
         with open(DOOUM_RULES_FILE, "r", encoding="utf-8") as f:
             text = f.read()
-        m = _parse_dooum_text_as_lines(text)
-        if not m:
-            m = _parse_dooum_text_as_literal(text)
-        if not m:
-            m = {k: set(v) for k, v in DEFAULT_DOOUM_MAP.items()}
-        return m
+
+        extra = _parse_dooum_text_as_lines(text)
+        if not extra:
+            extra = _parse_dooum_text_as_literal(text)
+
+        # 파일 내용이 비었거나 파싱 실패해도 기본 규칙은 유지
+        if extra:
+            for k, vs in extra.items():
+                if not k:
+                    continue
+                base.setdefault(k, set()).update(set(vs or []))
+
+        return base
     except Exception as e:
         logger.warning("[BlueWar] 두음법칙 파일 로드 실패: %s", e)
-        return {k: set(v) for k, v in DEFAULT_DOOUM_MAP.items()}
+        return base
+
+
 
 def _build_equiv_map(dooum: Dict[str, Set[str]]) -> Dict[str, Set[str]]:
     adj: Dict[str, Set[str]] = defaultdict(set)
@@ -564,6 +582,53 @@ class BlueWarPracticeDifficultyView(discord.ui.View):
     @discord.ui.button(label="Hard", style=discord.ButtonStyle.danger)
     async def hard(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._select(interaction, "Hard", 20)
+
+
+class BlueWarPvpStartModeView(discord.ui.View):
+    """PVP 시작 방식 선택 View.
+
+    - 랜덤 제시어(기존): 유메가 제시어를 랜덤으로 뽑고, 선플레이어부터 시작.
+    - 선플레이어 제시어: 선플레이어가 첫 단어(=제시어)를 직접 입력하고, 그 다음 턴부터 진행.
+    """
+
+    def __init__(self, author_id: int, *, timeout: float = 30.0):
+        super().__init__(timeout=timeout)
+        self.author_id = author_id
+        self.mode: Optional[str] = None  # "random" | "starter_word"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user and interaction.user.id == self.author_id:
+            return True
+        try:
+            await interaction.response.send_message("이 선택은 명령을 실행한 사람만 할 수 있어.", ephemeral=True)
+        except Exception:
+            pass
+        return False
+
+    async def _select(self, interaction: discord.Interaction, label: str, mode: str) -> None:
+        self.mode = mode
+        for child in self.children:
+            if not isinstance(child, discord.ui.Button):
+                continue
+            if child.label == label:
+                child.style = discord.ButtonStyle.success
+            else:
+                child.style = discord.ButtonStyle.secondary
+            child.disabled = True
+
+        try:
+            await interaction.response.edit_message(content=f"PVP 시작: **{label}**", view=self)
+        except Exception:
+            pass
+        self.stop()
+
+    @discord.ui.button(label="랜덤 제시어", style=discord.ButtonStyle.primary)
+    async def random_mode(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._select(interaction, "랜덤 제시어", "random")
+
+    @discord.ui.button(label="선플레이어 제시어", style=discord.ButtonStyle.secondary)
+    async def starter_word_mode(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._select(interaction, "선플레이어 제시어", "starter_word")
 
 class BlueWarCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -994,21 +1059,82 @@ class BlueWarCog(commands.Cog):
         except Exception:
             pass
 
-    async def _run_pvp_game(self, ctx: commands.Context, host: discord.Member, opponent: discord.Member, *, key: Tuple[int, int]):
+    async def _run_pvp_game(
+        self,
+        ctx: commands.Context,
+        host: discord.Member,
+        opponent: discord.Member,
+        *,
+        key: Tuple[int, int],
+        start_mode: str = "random",  # "random" | "starter_word"
+    ):
         channel = ctx.channel
         guild = ctx.guild
 
-        start_word = random.choice(self.suggestions) if self.suggestions else random.choice(list(WORDS_SET))
-        used_words: Set[str] = {start_word}
-        word_history: List[str] = [start_word]
-        current_word = start_word
+        # 선플레이어는 랜덤
+        starter = random.choice([host, opponent])
 
-        starter = host
-        turn = host
+        async def _ask_starter_word(timeout: float = 60.0) -> Optional[str]:
+            await channel.send(
+                f"제시어 선택 모드야. {starter.mention} 선플레이어가 첫 단어(제시어)를 입력해줘."
+                f" (제한 {int(timeout)}초)"
+            )
+            while True:
+                try:
+                    msg: discord.Message = await self.bot.wait_for(
+                        "message",
+                        timeout=timeout,
+                        check=lambda m: (
+                            m.channel.id == channel.id
+                            and m.author.id == starter.id
+                            and (m.content or "").strip() != ""
+                        ),
+                    )
+                except asyncio.TimeoutError:
+                    return None
+
+                w = _normalize_word(msg.content)
+                if not w:
+                    continue
+                if w.lower() in ("gg", "기권", "항복", "포기", "취소"):
+                    return None
+                if w not in WORDS_SET:
+                    await channel.send("그 단어는 유메 사전에 없네… 다른 걸로 해줘.")
+                    continue
+                return w
+
+        start_word: str
+        used_words: Set[str]
+        word_history: List[str]
+        current_word: str
+
+        start_mode = (start_mode or "random").strip().lower()
+        if start_mode == "starter_word":
+            chosen = await _ask_starter_word(timeout=60.0)
+            if not chosen:
+                await channel.send("제시어 입력이 없어서… 이번엔 랜덤 제시어로 갈게. 으헤~")
+                start_mode = "random"
+            else:
+                start_word = chosen
+                used_words = {start_word}
+                word_history = [start_word]
+                current_word = start_word
+        if start_mode != "starter_word":
+            start_word = random.choice(self.suggestions) if self.suggestions else random.choice(list(WORDS_SET))
+            used_words = {start_word}
+            word_history = [start_word]
+            current_word = start_word
+
+        # 첫 턴 결정
+        if start_mode == "starter_word":
+            turn = opponent if starter.id == host.id else host
+        else:
+            turn = starter
 
         await channel.send(
             f"PVP 블루전 시작!\n"
             f"{host.mention} vs {opponent.mention}\n"
+            f"선플레이어: {starter.mention}\n"
             f"첫 단어는 **{start_word}**\n"
             f"첫 턴: {turn.mention}\n"
             f"다음 단어는 `{_last_char(start_word)}`(또는 두음법칙)로 시작해야 해."
@@ -1165,6 +1291,18 @@ class BlueWarCog(commands.Cog):
             await ctx.send("봇은 참가할 수 없어.")
             return
 
+        # PVP 시작 방식 선택 (기본: 랜덤 제시어 = 기존 동작)
+        start_mode_view = BlueWarPvpStartModeView(author_id=host.id, timeout=30.0)
+        mode_msg = await ctx.send("PVP 시작 방식을 골라줘.", view=start_mode_view)
+        await start_mode_view.wait()
+
+        start_mode = start_mode_view.mode or "random"  # "random" | "starter_word"
+        try:
+            # 버튼 제거 (채팅 정리)
+            await mode_msg.edit(view=None)
+        except Exception:
+            pass
+
         async with self._sessions_lock:
             if key in self.sessions:
                 await ctx.send("이 채널에서 이미 블루전이 진행 중이야.")
@@ -1185,7 +1323,7 @@ class BlueWarCog(commands.Cog):
         await ctx.send(f"{opponent.mention} 후배가 참여했어.")
         await asyncio.sleep(5)
 
-        await self._run_pvp_game(ctx, host, opponent, key=key)
+        await self._run_pvp_game(ctx, host, opponent, key=key, start_mode=start_mode)
 
     @commands.command(name="블루전연습", help="유메와 1:1 연습 블루전을 합니다.")
     async def cmd_bluewar_practice(self, ctx: commands.Context):
