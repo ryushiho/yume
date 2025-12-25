@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import discord
 from discord.ext import commands
@@ -15,16 +17,25 @@ logger = logging.getLogger(__name__)
 # ==============================
 # YouTube / ffmpeg 설정
 # ==============================
+#
+# ⚠️ 재생이 안 되는 주요 원인:
+# - yt_dlp 검색 결과(entry)에서 entry["url"]을 바로 쓰면 "직접 스트림 URL"이 아닌 경우가 많다.
+# - 그래서 "검색/추가 단계"에서는 webpage_url만 확보하고,
+#   "재생 직전"에 webpage_url로 다시 extract 해서 bestaudio 스트림 URL을 해상(resolution)한다.
+#
+# 이 구조가 실서버에서 가장 안정적이다.
 
 YTDL_OPTS = {
     "format": "bestaudio/best",
     "quiet": True,
     "default_search": "ytsearch",
     "noplaylist": True,
+    "nocheckcertificate": True,
 }
 
 FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 FFMPEG_OPTIONS = "-vn"
+FFMPEG_EXECUTABLE = os.getenv("YUME_FFMPEG_PATH", "ffmpeg")
 
 _ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
 
@@ -33,13 +44,15 @@ _ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
 # 내부 데이터 구조
 # ==============================
 
-
 @dataclass
 class _Track:
     title: str
     webpage_url: str
-    stream_url: str
     requester_id: Optional[int] = None
+
+    # 재생 직전에 해상한 실제 스트림 URL (짧은 시간만 유효할 수 있어서 캐시하되 과신 금지)
+    _resolved_stream_url: Optional[str] = None
+    _resolved_at: float = 0.0
 
 
 async def _extract_info(query: str) -> dict:
@@ -62,9 +75,52 @@ def _pick_entry(info: dict) -> dict:
     return info
 
 
+def _select_best_audio_url(entry: dict) -> Optional[str]:
+    """
+    yt_dlp 결과(entry)에서 ffmpeg가 재생 가능한 bestaudio URL을 고른다.
+    """
+    # 1) formats에서 audio-only 후보 선별
+    formats = entry.get("formats") or []
+    audio_only = []
+    for f in formats:
+        try:
+            if not f:
+                continue
+            if f.get("url") is None:
+                continue
+            # audio-only
+            if f.get("vcodec") != "none":
+                continue
+            if f.get("acodec") in (None, "none"):
+                continue
+            audio_only.append(f)
+        except Exception:
+            continue
+
+    # 2) 품질(abr/tbr)을 기준으로 best 선택
+    def _score(f: dict) -> Tuple[float, float]:
+        abr = f.get("abr")
+        tbr = f.get("tbr")
+        bitrate = float(abr if abr is not None else (tbr if tbr is not None else 0.0))
+        fs = f.get("filesize") or f.get("filesize_approx") or 0
+        return (bitrate, float(fs))
+
+    if audio_only:
+        best = max(audio_only, key=_score)
+        return str(best.get("url"))
+
+    # 3) fallback: entry["url"] (가끔 여기만 있는 경우)
+    url = entry.get("url")
+    if url:
+        return str(url)
+
+    return None
+
+
 def _ffmpeg_source(stream_url: str, volume: float) -> discord.AudioSource:
     src = discord.FFmpegPCMAudio(
         stream_url,
+        executable=FFMPEG_EXECUTABLE,
         before_options=FFMPEG_BEFORE,
         options=FFMPEG_OPTIONS,
     )
@@ -77,17 +133,21 @@ class MusicState:
         self.now_playing: Optional[_Track] = None
         self.player_task: Optional[asyncio.Task] = None
 
-        self.volume: float = 0.35
+        # 0~2.0 (0~200%)
+        self.volume: float = 1.0
         self.loop_all: bool = False
 
         # 버튼 액션으로 트랙을 멈췄을 때(스킵/정지) 루프 재큐잉을 한 번 막는다.
         self._suppress_requeue_once: bool = False
 
+        # 마지막 오류(패널에 짧게 표시)
+        self.last_error: Optional[str] = None
+        self.last_error_at: float = 0.0
+
 
 # ==============================
 # UI (패널 / 버튼)
 # ==============================
-
 
 class MusicAddModal(discord.ui.Modal):
     def __init__(self, cog: "MusicCog"):
@@ -164,10 +224,9 @@ class MusicPanelView(discord.ui.View):
 # Cog
 # ==============================
 
-
 class MusicCog(commands.Cog):
     """
-    음악은 이제 **!음악** 하나로만 연다.
+    음악은 **!음악** 하나로만 연다.
     - !음악: 유메 음성채널 입장 + 음악 패널(임베드 + 버튼) 표시
     - 노래 추가/컨트롤은 전부 패널 버튼으로 처리
     """
@@ -188,6 +247,11 @@ class MusicCog(commands.Cog):
             st = MusicState()
             self._states[guild_id] = st
         return st
+
+    def _set_error(self, guild_id: int, msg: str):
+        st = self._state(guild_id)
+        st.last_error = msg[:160]
+        st.last_error_at = time.time()
 
     # -------------------------------
     # Voice connect helpers
@@ -216,8 +280,6 @@ class MusicCog(commands.Cog):
 
     async def _ensure_voice_interaction(self, interaction: discord.Interaction) -> Optional[discord.VoiceClient]:
         if interaction.guild is None:
-            # 상위 호출부에서 응답(또는 defer) 여부가 달라질 수 있으니,
-            # 여기서는 조용히 None만 반환하고 메시지는 호출부에서 처리한다.
             return None
 
         if not isinstance(interaction.user, discord.Member) or interaction.user.voice is None or interaction.user.voice.channel is None:
@@ -238,6 +300,32 @@ class MusicCog(commands.Cog):
         return vc
 
     # -------------------------------
+    # Stream resolve (핵심)
+    # -------------------------------
+    async def _resolve_stream_url(self, track: _Track) -> Optional[str]:
+        """
+        track.webpage_url로 yt_dlp를 다시 돌려 "진짜 재생 가능한 오디오 스트림 URL"을 얻는다.
+        """
+        # 짧은 캐시(30초): 스킵/재시작 같은 경우만 이득. 너무 길게 잡으면 URL 만료 위험.
+        if track._resolved_stream_url and (time.time() - track._resolved_at) < 30:
+            return track._resolved_stream_url
+
+        try:
+            info = await _extract_info(track.webpage_url)
+            entry = _pick_entry(info)
+            if not entry:
+                return None
+            url = _select_best_audio_url(entry)
+            if not url:
+                return None
+            track._resolved_stream_url = url
+            track._resolved_at = time.time()
+            return url
+        except Exception as e:
+            logger.warning("[Music] resolve error: %s", e)
+            return None
+
+    # -------------------------------
     # Player loop
     # -------------------------------
     async def _player_loop(self, guild_id: int, text_channel_id: int):
@@ -250,6 +338,7 @@ class MusicCog(commands.Cog):
                 return
 
             st.now_playing = track
+            st.last_error = None
 
             guild = self.bot.get_guild(guild_id)
             vc = guild.voice_client if guild else None
@@ -259,26 +348,36 @@ class MusicCog(commands.Cog):
                 st.now_playing = None
                 continue
 
+            # 재생 직전: 스트림 URL 해상
+            stream_url = await self._resolve_stream_url(track)
+            if not stream_url:
+                self._set_error(guild_id, "재생 URL을 해상하지 못했어(yt-dlp).")
+                st.now_playing = None
+                await self._try_refresh_panel(text_channel_id)
+                continue
+
             # 패널 업데이트(재생 시작)
             await self._try_refresh_panel(text_channel_id)
 
+            done = asyncio.Event()
+
+            def _after(err: Optional[Exception]):
+                if err:
+                    logger.warning("[Music] playback error: %s", err)
+                    self._set_error(guild_id, f"ffmpeg 재생 오류: {err}")
+                try:
+                    self.bot.loop.call_soon_threadsafe(done.set)
+                except Exception:
+                    pass
+
             try:
-                src = _ffmpeg_source(track.stream_url, volume=st.volume)
-                done = asyncio.Event()
-
-                def _after(err: Optional[Exception]):
-                    if err:
-                        logger.warning("[Music] playback error: %s", err)
-                    try:
-                        self.bot.loop.call_soon_threadsafe(done.set)
-                    except Exception:
-                        pass
-
+                src = _ffmpeg_source(stream_url, volume=st.volume)
                 vc.play(src, after=_after)
                 await done.wait()
 
             except Exception as e:
                 logger.warning("[Music] play error: %s", e)
+                self._set_error(guild_id, f"재생 예외: {e}")
 
             finally:
                 finished = st.now_playing
@@ -340,6 +439,10 @@ class MusicCog(commands.Cog):
         else:
             embed.add_field(name="음성 채널", value="(연결 안 됨)", inline=False)
 
+        # 최근 오류가 있으면 짧게 표시 (5분)
+        if st.last_error and (time.time() - st.last_error_at) < 300:
+            embed.add_field(name="⚠️ 상태", value=st.last_error, inline=False)
+
         return embed
 
     async def _try_refresh_panel(self, channel_id: int):
@@ -347,13 +450,13 @@ class MusicCog(commands.Cog):
         ch = self.bot.get_channel(channel_id)
         if not isinstance(ch, (discord.TextChannel, discord.Thread)):
             return
-        guild = ch.guild
-        embed = self._build_embed(guild)
-
-        # 최근 메시지 20개 안에서 "유메 음악 패널"을 찾아 갱신 (패널 중복 방지용)
         if not self.bot.user:
             return
 
+        guild = ch.guild
+        embed = self._build_embed(guild)
+
+        # 최근 메시지 20개 안에서 "유메 음악 패널"을 찾아 갱신
         try:
             async for msg in ch.history(limit=20):
                 if msg.author.id != self.bot.user.id:
@@ -381,7 +484,6 @@ class MusicCog(commands.Cog):
         try:
             await interaction.response.defer(ephemeral=True)
         except Exception:
-            # 이미 응답된 경우 등은 무시
             pass
 
         if interaction.guild is None:
@@ -397,8 +499,11 @@ class MusicCog(commands.Cog):
 
         vc = await self._ensure_voice_interaction(interaction)
         if not vc:
+            # 유저가 음성에 없거나 / 연결 실패
+            in_voice = isinstance(interaction.user, discord.Member) and interaction.user.voice and interaction.user.voice.channel
+            msg = "먼저 음성 채널에 들어가줘." if not in_voice else "음성 채널에 연결하지 못했어."
             try:
-                await interaction.followup.send("먼저 음성 채널에 들어가줘.", ephemeral=True)
+                await interaction.followup.send(msg, ephemeral=True)
             except Exception:
                 pass
             return
@@ -412,12 +517,9 @@ class MusicCog(commands.Cog):
 
             title = str(entry.get("title") or "제목 없음")
             webpage_url = str(entry.get("webpage_url") or entry.get("original_url") or q)
-            stream_url = str(entry.get("url") or "")
-            if not stream_url:
-                await interaction.followup.send("스트림 주소를 못 찾았어.", ephemeral=True)
-                return
 
-            track = _Track(title=title, webpage_url=webpage_url, stream_url=stream_url, requester_id=interaction.user.id)
+            # 핵심: 여기서는 stream_url을 저장하지 않는다(불안정).
+            track = _Track(title=title, webpage_url=webpage_url, requester_id=interaction.user.id)
 
             st = self._state(interaction.guild.id)
             await st.queue.put(track)
@@ -427,6 +529,7 @@ class MusicCog(commands.Cog):
             await self._refresh_from_interaction(interaction)
         except Exception as e:
             logger.warning("[Music] extract error: %s", e)
+            self._set_error(interaction.guild.id, f"추가 실패: {e}")
             try:
                 await interaction.followup.send("그건 재생하기가 어려워…", ephemeral=True)
             except Exception:
@@ -448,7 +551,8 @@ class MusicCog(commands.Cog):
                 await interaction.response.send_message("다시 재생할게. 으헤~", ephemeral=True)
             else:
                 await interaction.response.send_message("지금 재생 중이 아니야.", ephemeral=True)
-        except Exception:
+        except Exception as e:
+            self._set_error(interaction.guild.id, f"토글 오류: {e}")
             try:
                 await interaction.response.send_message("지금은 조작이 잘 안 돼…", ephemeral=True)
             except Exception:
@@ -525,7 +629,6 @@ class MusicCog(commands.Cog):
             return
         st = self._state(interaction.guild.id)
 
-        # asyncio.Queue는 직접 섞을 수 없어서 잠깐 빼서 섞고 다시 넣는다.
         items: List[_Track] = []
         try:
             while not st.queue.empty():
@@ -538,7 +641,6 @@ class MusicCog(commands.Cog):
             return
 
         import random
-
         random.shuffle(items)
         for t in items:
             await st.queue.put(t)
@@ -553,7 +655,7 @@ class MusicCog(commands.Cog):
         if interaction.guild is None:
             return
         st = self._state(interaction.guild.id)
-        st.volume = max(0.0, min(1.0, st.volume + delta))
+        st.volume = max(0.0, min(2.0, st.volume + delta))
 
         vc = interaction.guild.voice_client
         if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
@@ -590,6 +692,7 @@ class MusicCog(commands.Cog):
         if st.player_task and not st.player_task.done():
             st.player_task.cancel()
 
+        # 큐 비우기
         try:
             while not st.queue.empty():
                 st.queue.get_nowait()

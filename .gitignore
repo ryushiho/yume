@@ -6,4 +6,3 @@ yumebot.env
 data/system/
 data/user_state/
 data/storage/*.json
-.env.*
