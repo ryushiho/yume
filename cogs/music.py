@@ -5,6 +5,7 @@ import logging
 import os
 import json
 import time
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote
@@ -144,6 +145,12 @@ class MusicState:
         self.queue: asyncio.Queue[_Track] = asyncio.Queue()
         self.now_playing: Optional[_Track] = None
         self.player_task: Optional[asyncio.Task] = None
+
+        # 길드별 큐/상태 조작 보호
+        self.lock: asyncio.Lock = asyncio.Lock()
+
+        # 자동 퇴장(유메만 남았을 때) 예약 태스크
+        self.auto_leave_task: Optional[asyncio.Task] = None
 
         # 0~2.0 (0~200%)
         self.volume: float = 1.0
@@ -317,16 +324,129 @@ class MusicPanelView(discord.ui.View):
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._stop(interaction)
 
-    # 🚪 나가기
+    # 🧰 큐 관리
     @discord.ui.button(
-        label="나가기",
+        label="큐 관리",
         style=discord.ButtonStyle.secondary,
-        emoji="🚪",
-        custom_id="yume_music_leave",
+        emoji="🧰",
+        custom_id="yume_music_queue",
         row=1,
     )
-    async def leave_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
-        await self.cog._leave(interaction)
+    async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        await self.cog._open_queue_manage(interaction)
+
+
+
+class QueueDeleteModal(discord.ui.Modal):
+    title = "큐 삭제"
+
+    def __init__(self, cog: "MusicCog"):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.target = discord.ui.TextInput(
+            label="삭제할 번호(들)",
+            placeholder="예) 3  |  3,5,7  |  2-6",
+            required=True,
+            max_length=100,
+        )
+        self.add_item(self.target)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.cog._queue_delete_from_modal(interaction, str(self.target.value))
+
+
+class QueuePriorityModal(discord.ui.Modal):
+    title = "맨 위로 올리기"
+
+    def __init__(self, cog: "MusicCog"):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.target = discord.ui.TextInput(
+            label="맨 위로 올릴 번호",
+            placeholder="예) 2",
+            required=True,
+            max_length=10,
+        )
+        self.add_item(self.target)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.cog._queue_priority_from_modal(interaction, str(self.target.value))
+
+
+class QueueManageView(discord.ui.View):
+    """큐 관리(토글 메뉴)."""
+
+    def __init__(self, cog: "MusicCog"):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    # 🔀 큐 셔플
+    @discord.ui.button(
+        label="큐 셔플",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔀",
+        custom_id="yume_music_q_shuffle",
+        row=0,
+    )
+    async def q_shuffle(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        await self.cog._queue_manage_shuffle(interaction)
+
+    # 🗑️ 큐 삭제(번호 입력)
+    @discord.ui.button(
+        label="큐 삭제",
+        style=discord.ButtonStyle.danger,
+        emoji="🗑️",
+        custom_id="yume_music_q_delete",
+        row=0,
+    )
+    async def q_delete(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        try:
+            await interaction.response.send_modal(QueueDeleteModal(self.cog))
+        except Exception:
+            # modal 실패 시 안내
+            try:
+                await interaction.response.send_message("지금은 입력창을 열 수 없어…", ephemeral=True)
+            except Exception:
+                pass
+
+    # ⏫ 맨 위로
+    @discord.ui.button(
+        label="맨 위로",
+        style=discord.ButtonStyle.secondary,
+        emoji="⏫",
+        custom_id="yume_music_q_priority",
+        row=0,
+    )
+    async def q_priority(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        try:
+            await interaction.response.send_modal(QueuePriorityModal(self.cog))
+        except Exception:
+            try:
+                await interaction.response.send_message("지금은 입력창을 열 수 없어…", ephemeral=True)
+            except Exception:
+                pass
+
+    # 🧹 중복 정리
+    @discord.ui.button(
+        label="중복정리",
+        style=discord.ButtonStyle.secondary,
+        emoji="🧹",
+        custom_id="yume_music_q_dedupe",
+        row=0,
+    )
+    async def q_dedupe(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        await self.cog._queue_dedupe(interaction)
+
+    # ↩️ 돌아가기
+    @discord.ui.button(
+        label="돌아가기",
+        style=discord.ButtonStyle.primary,
+        emoji="↩️",
+        custom_id="yume_music_q_back",
+        row=0,
+    )
+    async def q_back(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        await self.cog._back_to_main_panel(interaction)
 
 
 # ==============================
@@ -351,6 +471,7 @@ class MusicCog(commands.Cog):
 
         # 재부팅 후에도 버튼이 살아있도록 등록할 퍼시스턴트 뷰
         self.panel_view = MusicPanelView(self)
+        self.queue_view = QueueManageView(self)
 
     async def cog_load(self):
         # 봇이 준비된 뒤, 지정된 음악 채널에 패널을 복구한다.
@@ -359,6 +480,19 @@ class MusicCog(commands.Cog):
     async def cog_unload(self):
         if self._restore_task and not self._restore_task.done():
             self._restore_task.cancel()
+
+        # 남아있는 자동퇴장/플레이어 태스크 정리
+        for st in self._states.values():
+            try:
+                if st.auto_leave_task and not st.auto_leave_task.done():
+                    st.auto_leave_task.cancel()
+            except Exception:
+                pass
+            try:
+                if st.player_task and not st.player_task.done():
+                    st.player_task.cancel()
+            except Exception:
+                pass
 
     # -------------------------------
     # State
@@ -1052,6 +1186,431 @@ class MusicCog(commands.Cog):
         await self._refresh_from_interaction(interaction)
 
     # -------------------------------
+    # Auto leave (유메만 남았을 때 자동 퇴장 + 큐 정리)
+    # -------------------------------
+    def _human_count(self, channel: Optional[discord.VoiceChannel]) -> int:
+        if not channel:
+            return 0
+        try:
+            return sum(1 for m in channel.members if not getattr(m, "bot", False))
+        except Exception:
+            return 0
+
+    def _cancel_auto_leave(self, guild_id: int):
+        st = self._state(guild_id)
+        if st.auto_leave_task and not st.auto_leave_task.done():
+            st.auto_leave_task.cancel()
+        st.auto_leave_task = None
+
+    def _schedule_auto_leave(self, guild_id: int, *, delay: float = 8.0):
+        st = self._state(guild_id)
+        # 이미 예약돼 있으면 그대로 둔다.
+        if st.auto_leave_task and not st.auto_leave_task.done():
+            return
+        st.auto_leave_task = asyncio.create_task(self._auto_leave_runner(guild_id, delay))
+
+    async def _auto_leave_runner(self, guild_id: int, delay: float):
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+
+        guild = self.bot.get_guild(guild_id)
+        if not guild:
+            return
+        vc = guild.voice_client
+        if not vc or not vc.is_connected():
+            return
+
+        channel = getattr(vc, "channel", None)
+        if self._human_count(channel) > 0:
+            return
+
+        await self._disconnect_and_cleanup(guild_id, reason="아무도 없어서 유메가 나갈게. 큐도 정리했어. 으헤~")
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ):
+        guild = member.guild
+        vc = guild.voice_client
+        if not vc or not vc.is_connected():
+            return
+
+        channel = getattr(vc, "channel", None)
+        if not channel:
+            return
+
+        # 이 채널과 무관한 이동은 무시
+        if before.channel != channel and after.channel != channel:
+            return
+
+        humans = self._human_count(channel)
+        if humans <= 0:
+            self._schedule_auto_leave(guild.id, delay=8.0)
+        else:
+            self._cancel_auto_leave(guild.id)
+
+    async def _disconnect_and_cleanup(self, guild_id: int, *, reason: Optional[str] = None):
+        guild = self.bot.get_guild(guild_id)
+        if not guild:
+            return
+        vc = guild.voice_client
+        st = self._state(guild_id)
+
+        # 자동퇴장 예약은 여기서 끝낸다.
+        self._cancel_auto_leave(guild_id)
+
+        # 재생/큐 정리
+        async with st.lock:
+            st._suppress_requeue_once = True
+
+            try:
+                if vc and vc.is_connected():
+                    vc.stop()
+            except Exception:
+                pass
+
+            if st.player_task and not st.player_task.done():
+                try:
+                    st.player_task.cancel()
+                except Exception:
+                    pass
+            st.player_task = None
+
+            # 큐 비우기
+            try:
+                while not st.queue.empty():
+                    st.queue.get_nowait()
+            except Exception:
+                pass
+
+            st.now_playing = None
+
+            if reason:
+                self._set_error(guild_id, reason)
+
+        # 보이스 나가기
+        try:
+            if vc and vc.is_connected():
+                await vc.disconnect()
+        except Exception:
+            pass
+
+        # 패널 갱신(고정 패널이 있으면 거기로)
+        try:
+            await self._refresh_panel(guild_id)
+        except Exception:
+            pass
+
+    # -------------------------------
+    # Queue manage (토글 메뉴)
+    # -------------------------------
+    def _build_queue_embed(self, guild: discord.Guild) -> discord.Embed:
+        st = self._state(guild.id)
+        vc = guild.voice_client
+
+        embed = discord.Embed(
+            title="유메 - 큐 관리",
+            description="번호로 삭제/정리할 수 있어. (예: 3,5,7 / 2-6)",
+            color=discord.Color.blurple(),
+        )
+
+        if st.now_playing and st.now_playing.webpage_url:
+            embed.add_field(
+                name="🎧 지금 재생",
+                value=f"[{st.now_playing.title}]({st.now_playing.webpage_url})",
+                inline=False,
+            )
+        elif st.now_playing:
+            embed.add_field(name="🎧 지금 재생", value=st.now_playing.title, inline=False)
+        else:
+            embed.add_field(name="🎧 지금 재생", value="없음", inline=False)
+
+        # 큐 미리보기
+        items: List[_Track] = []
+        try:
+            # asyncio.Queue 내부는 deque라 보통 _queue가 존재한다(읽기만)
+            items = list(getattr(st.queue, "_queue", []))  # type: ignore[arg-type]
+        except Exception:
+            items = []
+
+        total = len(items)
+        if total <= 0:
+            q_text = "비어있음"
+        else:
+            lines: List[str] = []
+            for i, t in enumerate(items[:15], start=1):
+                if t.webpage_url:
+                    lines.append(f"{i}. [{t.title}]({t.webpage_url})")
+                else:
+                    lines.append(f"{i}. {t.title}")
+            if total > 15:
+                lines.append(f"... (+{total-15}곡 더)")
+            q_text = "\n".join(lines)
+
+        embed.add_field(name=f"📜 대기열 (총 {total}곡)", value=q_text, inline=False)
+
+        if vc and vc.is_connected() and getattr(vc, "channel", None):
+            embed.add_field(name="🔊 음성 채널", value=vc.channel.name, inline=False)
+        else:
+            embed.add_field(name="🔊 음성 채널", value="(연결 안 됨)", inline=False)
+
+        if st.last_error and (time.time() - st.last_error_at) < 300:
+            embed.add_field(name="⚠️ 상태", value=st.last_error, inline=False)
+
+        embed.set_footer(text="큐 관리는 여기서. ↩️ 돌아가기 누르면 메인 패널로 돌아가.")
+        return embed
+
+    async def _edit_panel_message(
+        self,
+        guild_id: int,
+        *,
+        embed: discord.Embed,
+        view: discord.ui.View,
+        interaction: Optional[discord.Interaction] = None,
+    ) -> bool:
+        # 버튼 인터랙션이면 그 메시지를 바로 수정
+        if interaction is not None and getattr(interaction, "message", None) is not None:
+            try:
+                await interaction.response.edit_message(embed=embed, view=view)
+                return True
+            except Exception:
+                pass
+
+        # 모달 제출 등: 저장된 패널 메시지를 찾아 편집
+        fixed_ch, fixed_mid = self._fixed_panel(guild_id)
+        st = self._state(guild_id)
+        ch_id = fixed_ch or st.temp_panel_channel_id
+        mid = fixed_mid or st.temp_panel_message_id
+        if not ch_id or not mid:
+            return False
+
+        ch = self.bot.get_channel(int(ch_id))
+        if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+            return False
+        try:
+            msg = await ch.fetch_message(int(mid))
+            await msg.edit(embed=embed, view=view)
+            return True
+        except Exception:
+            return False
+
+    async def _open_queue_manage(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return
+        gid = interaction.guild.id
+        embed = self._build_queue_embed(interaction.guild)
+        await self._edit_panel_message(gid, embed=embed, view=self.queue_view, interaction=interaction)
+
+    async def _back_to_main_panel(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return
+        gid = interaction.guild.id
+        embed = self._build_embed(interaction.guild)
+        await self._edit_panel_message(gid, embed=embed, view=self.panel_view, interaction=interaction)
+
+    def _parse_index_spec(self, spec: str, *, max_n: int) -> List[int]:
+        """'3', '3,5,7', '2-6' 같은 입력을 0-based 인덱스 리스트로 변환."""
+        s = (spec or "").strip()
+        if not s or max_n <= 0:
+            return []
+        out: List[int] = []
+        parts = re.split(r"[\s,]+", s)
+        for p in parts:
+            p = p.strip()
+            if not p:
+                continue
+            if "-" in p:
+                a, b = p.split("-", 1)
+                try:
+                    ia = int(a)
+                    ib = int(b)
+                except Exception:
+                    continue
+                if ia > ib:
+                    ia, ib = ib, ia
+                for k in range(ia, ib + 1):
+                    if 1 <= k <= max_n:
+                        out.append(k - 1)
+            else:
+                try:
+                    k = int(p)
+                except Exception:
+                    continue
+                if 1 <= k <= max_n:
+                    out.append(k - 1)
+        # 중복 제거 + 정렬
+        return sorted(set(out))
+
+    async def _queue_manage_shuffle(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return
+        gid = interaction.guild.id
+        st = self._state(gid)
+
+        async with st.lock:
+            items: List[_Track] = []
+            try:
+                while not st.queue.empty():
+                    items.append(st.queue.get_nowait())
+            except Exception:
+                pass
+
+            if not items:
+                try:
+                    await interaction.response.send_message("셔플할 큐가 비어있어.", ephemeral=True)
+                except Exception:
+                    pass
+                return
+
+            import random
+            random.shuffle(items)
+            for t in items:
+                try:
+                    st.queue.put_nowait(t)
+                except Exception:
+                    pass
+
+        # 큐 화면 갱신
+        embed = self._build_queue_embed(interaction.guild)
+        await self._edit_panel_message(gid, embed=embed, view=self.queue_view, interaction=interaction)
+
+    async def _queue_delete_from_modal(self, interaction: discord.Interaction, spec: str):
+        if interaction.guild is None:
+            return
+        gid = interaction.guild.id
+        st = self._state(gid)
+
+        removed = 0
+        async with st.lock:
+            items: List[_Track] = []
+            try:
+                while not st.queue.empty():
+                    items.append(st.queue.get_nowait())
+            except Exception:
+                pass
+
+            idxs = self._parse_index_spec(spec, max_n=len(items))
+            if idxs:
+                keep: List[_Track] = [t for i, t in enumerate(items) if i not in set(idxs)]
+                removed = len(items) - len(keep)
+                for t in keep:
+                    try:
+                        st.queue.put_nowait(t)
+                    except Exception:
+                        pass
+            else:
+                # 원복
+                for t in items:
+                    try:
+                        st.queue.put_nowait(t)
+                    except Exception:
+                        pass
+
+        try:
+            await interaction.response.send_message(
+                "삭제할 번호를 제대로 못 읽었어…" if removed == 0 else f"큐에서 {removed}곡을 삭제했어.",
+                ephemeral=True,
+            )
+        except Exception:
+            pass
+
+        # 패널(큐화면) 갱신
+        try:
+            await self._edit_panel_message(gid, embed=self._build_queue_embed(interaction.guild), view=self.queue_view)
+        except Exception:
+            pass
+
+    async def _queue_priority_from_modal(self, interaction: discord.Interaction, spec: str):
+        if interaction.guild is None:
+            return
+        gid = interaction.guild.id
+        st = self._state(gid)
+
+        moved = False
+        async with st.lock:
+            items: List[_Track] = []
+            try:
+                while not st.queue.empty():
+                    items.append(st.queue.get_nowait())
+            except Exception:
+                pass
+
+            idxs = self._parse_index_spec(spec, max_n=len(items))
+            if idxs:
+                i = idxs[0]
+                t = items.pop(i)
+                items.insert(0, t)
+                moved = True
+
+            for t in items:
+                try:
+                    st.queue.put_nowait(t)
+                except Exception:
+                    pass
+
+        try:
+            await interaction.response.send_message(
+                "맨 위로 올릴 번호가 없었어…" if not moved else "맨 위로 올렸어.",
+                ephemeral=True,
+            )
+        except Exception:
+            pass
+
+        try:
+            await self._edit_panel_message(gid, embed=self._build_queue_embed(interaction.guild), view=self.queue_view)
+        except Exception:
+            pass
+
+    async def _queue_dedupe(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return
+        gid = interaction.guild.id
+        st = self._state(gid)
+
+        removed = 0
+        async with st.lock:
+            items: List[_Track] = []
+            try:
+                while not st.queue.empty():
+                    items.append(st.queue.get_nowait())
+            except Exception:
+                pass
+
+            seen: set[str] = set()
+            keep: List[_Track] = []
+            for t in items:
+                key = (t.webpage_url or t.title).strip()
+                if key in seen:
+                    removed += 1
+                    continue
+                seen.add(key)
+                keep.append(t)
+
+            for t in keep:
+                try:
+                    st.queue.put_nowait(t)
+                except Exception:
+                    pass
+
+        try:
+            await interaction.response.send_message(
+                f"중복 {removed}곡을 정리했어." if removed > 0 else "중복이 없었어.",
+                ephemeral=True,
+            )
+        except Exception:
+            pass
+
+        embed = self._build_queue_embed(interaction.guild)
+        await self._edit_panel_message(gid, embed=embed, view=self.queue_view, interaction=interaction)
+
+
+
+    # -------------------------------
     # Command
     # -------------------------------
     @commands.command(name="음악채널지정")
@@ -1122,5 +1681,6 @@ async def setup(bot: commands.Bot):
     # 퍼시스턴트 뷰 등록 (재부팅 후에도 버튼이 동작)
     try:
         bot.add_view(cog.panel_view)
+        bot.add_view(cog.queue_view)
     except Exception:
         pass
