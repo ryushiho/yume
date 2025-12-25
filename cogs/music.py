@@ -3,15 +3,27 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import json
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import discord
 from discord.ext import commands
 import yt_dlp
+import aiohttp
 
 logger = logging.getLogger(__name__)
+
+
+# ==============================
+# 패널 고정 설정 저장소
+# ==============================
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+STORAGE_DIR = os.path.join(ROOT_DIR, "data", "storage")
+PANEL_CFG_PATH = os.path.join(STORAGE_DIR, "music_panel.json")
 
 
 # ==============================
@@ -144,18 +156,22 @@ class MusicState:
         self.last_error: Optional[str] = None
         self.last_error_at: float = 0.0
 
+        # 패널 메시지(서버 설정이 없을 때 임시로 사용)
+        self.temp_panel_channel_id: Optional[int] = None
+        self.temp_panel_message_id: Optional[int] = None
+
 
 # ==============================
 # UI (패널 / 버튼)
 # ==============================
 
-class MusicAddModal(discord.ui.Modal):
+class YouTubeAddModal(discord.ui.Modal):
     def __init__(self, cog: "MusicCog"):
-        super().__init__(title="🎵 노래 추가")
+        super().__init__(title="🔴 YouTube 추가")
         self.cog = cog
 
         self.query = discord.ui.TextInput(
-            label="유튜브 검색어 또는 URL",
+            label="검색어 또는 URL",
             placeholder="예: Blue Archive OST / https://youtu.be/...",
             required=True,
             max_length=200,
@@ -167,6 +183,42 @@ class MusicAddModal(discord.ui.Modal):
         await self.cog._enqueue_from_interaction(interaction, q)
 
 
+class SpotifyAddModal(discord.ui.Modal):
+    def __init__(self, cog: "MusicCog"):
+        super().__init__(title="🟢 Spotify 추가")
+        self.cog = cog
+
+        self.query = discord.ui.TextInput(
+            label="Spotify 트랙 URL 또는 검색어",
+            placeholder="예: https://open.spotify.com/track/...",
+            required=True,
+            max_length=200,
+        )
+        self.add_item(self.query)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        q = (self.query.value or "").strip()
+        await self.cog._enqueue_spotify_from_interaction(interaction, q)
+
+
+class VolumeModal(discord.ui.Modal):
+    def __init__(self, cog: "MusicCog", current_percent: int):
+        super().__init__(title="🔊 음량 설정")
+        self.cog = cog
+
+        self.value = discord.ui.TextInput(
+            label="0~200 (기본 100)",
+            placeholder=str(current_percent),
+            required=True,
+            max_length=3,
+        )
+        self.add_item(self.value)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = (self.value.value or "").strip()
+        await self.cog._set_volume_from_interaction(interaction, raw)
+
+
 class MusicPanelView(discord.ui.View):
     """패널은 재부팅 이후에도 버튼이 살아있도록(퍼시스턴트) timeout=None로 유지."""
 
@@ -174,48 +226,105 @@ class MusicPanelView(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
 
-    # ➕ 추가
-    @discord.ui.button(label="추가", style=discord.ButtonStyle.primary, emoji="➕", custom_id="yume_music_add")
-    async def add_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
-        await interaction.response.send_modal(MusicAddModal(self.cog))
+    # 🔴 YouTube 추가 (빨간색)
+    @discord.ui.button(
+        label="YouTube",
+        style=discord.ButtonStyle.danger,
+        emoji="🔴",
+        custom_id="yume_music_add_yt",
+        row=0,
+    )
+    async def youtube_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        await interaction.response.send_modal(YouTubeAddModal(self.cog))
 
-    # ⏯ 일시정지/재개
-    @discord.ui.button(label="재생/일시정지", style=discord.ButtonStyle.secondary, emoji="⏯", custom_id="yume_music_toggle")
+    # 🟢 Spotify 추가 (연두색)
+    @discord.ui.button(
+        label="Spotify",
+        style=discord.ButtonStyle.success,
+        emoji="🟢",
+        custom_id="yume_music_add_sp",
+        row=0,
+    )
+    async def spotify_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        await interaction.response.send_modal(SpotifyAddModal(self.cog))
+
+    # ⏯ 재생/일시정지
+    @discord.ui.button(
+        label="재생/일시정지",
+        style=discord.ButtonStyle.secondary,
+        emoji="⏯",
+        custom_id="yume_music_toggle",
+        row=0,
+    )
     async def toggle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._toggle_pause(interaction)
 
     # ⏭ 스킵
-    @discord.ui.button(label="스킵", style=discord.ButtonStyle.secondary, emoji="⏭", custom_id="yume_music_skip")
+    @discord.ui.button(
+        label="스킵",
+        style=discord.ButtonStyle.secondary,
+        emoji="⏭",
+        custom_id="yume_music_skip",
+        row=0,
+    )
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._skip(interaction)
 
-    # ⏹ 정지
-    @discord.ui.button(label="정지", style=discord.ButtonStyle.danger, emoji="⏹", custom_id="yume_music_stop")
-    async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
-        await self.cog._stop(interaction)
+    # 🔊 음량 모달
+    @discord.ui.button(
+        label="음량",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔊",
+        custom_id="yume_music_volume",
+        row=0,
+    )
+    async def volume_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        if interaction.guild is None:
+            return
+        st = self.cog._state(interaction.guild.id)
+        await interaction.response.send_modal(VolumeModal(self.cog, int(st.volume * 100)))
 
     # 🔁 반복 토글
-    @discord.ui.button(label="반복", style=discord.ButtonStyle.secondary, emoji="🔁", custom_id="yume_music_loop")
+    @discord.ui.button(
+        label="반복",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔁",
+        custom_id="yume_music_loop",
+        row=1,
+    )
     async def loop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._toggle_loop(interaction)
 
     # 🔀 셔플
-    @discord.ui.button(label="셔플", style=discord.ButtonStyle.secondary, emoji="🔀", custom_id="yume_music_shuffle")
+    @discord.ui.button(
+        label="셔플",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔀",
+        custom_id="yume_music_shuffle",
+        row=1,
+    )
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._shuffle(interaction)
 
-    # 🔉 볼륨 -
-    @discord.ui.button(label="-", style=discord.ButtonStyle.secondary, emoji="🔉", custom_id="yume_music_voldown")
-    async def voldown_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
-        await self.cog._change_volume(interaction, delta=-0.05)
-
-    # 🔊 볼륨 +
-    @discord.ui.button(label="+", style=discord.ButtonStyle.secondary, emoji="🔊", custom_id="yume_music_volup")
-    async def volup_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
-        await self.cog._change_volume(interaction, delta=+0.05)
+    # ⏹ 정지
+    @discord.ui.button(
+        label="정지",
+        style=discord.ButtonStyle.danger,
+        emoji="⏹",
+        custom_id="yume_music_stop",
+        row=1,
+    )
+    async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        await self.cog._stop(interaction)
 
     # 🚪 나가기
-    @discord.ui.button(label="나가기", style=discord.ButtonStyle.secondary, emoji="🚪", custom_id="yume_music_leave")
+    @discord.ui.button(
+        label="나가기",
+        style=discord.ButtonStyle.secondary,
+        emoji="🚪",
+        custom_id="yume_music_leave",
+        row=1,
+    )
     async def leave_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._leave(interaction)
 
@@ -235,8 +344,21 @@ class MusicCog(commands.Cog):
         self.bot = bot
         self._states: Dict[int, MusicState] = {}
 
+        # 길드별 패널 고정 설정(guild_id -> {channel_id, message_id})
+        self._panel_cfg: Dict[str, Dict[str, int]] = self._load_panel_config()
+        self._panel_cfg_lock = asyncio.Lock()
+        self._restore_task: Optional[asyncio.Task] = None
+
         # 재부팅 후에도 버튼이 살아있도록 등록할 퍼시스턴트 뷰
         self.panel_view = MusicPanelView(self)
+
+    async def cog_load(self):
+        # 봇이 준비된 뒤, 지정된 음악 채널에 패널을 복구한다.
+        self._restore_task = asyncio.create_task(self._restore_fixed_panels())
+
+    async def cog_unload(self):
+        if self._restore_task and not self._restore_task.done():
+            self._restore_task.cancel()
 
     # -------------------------------
     # State
@@ -252,6 +374,108 @@ class MusicCog(commands.Cog):
         st = self._state(guild_id)
         st.last_error = msg[:160]
         st.last_error_at = time.time()
+
+    # -------------------------------
+    # Fixed panel config (guild-level)
+    # -------------------------------
+    def _load_panel_config(self) -> Dict[str, Dict[str, int]]:
+        try:
+            if not os.path.exists(PANEL_CFG_PATH):
+                return {}
+            with open(PANEL_CFG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {}
+            out: Dict[str, Dict[str, int]] = {}
+            for k, v in data.items():
+                if not isinstance(k, str) or not isinstance(v, dict):
+                    continue
+                try:
+                    gid = int(k)
+                    ch = int(v.get("channel_id", 0))
+                    mid = int(v.get("message_id", 0))
+                except Exception:
+                    continue
+                if gid <= 0 or ch <= 0:
+                    continue
+                out[str(gid)] = {"channel_id": ch, "message_id": max(0, mid)}
+            return out
+        except Exception:
+            return {}
+
+    def _save_panel_config_unlocked(self) -> None:
+        try:
+            os.makedirs(STORAGE_DIR, exist_ok=True)
+            tmp = PANEL_CFG_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._panel_cfg, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, PANEL_CFG_PATH)
+        except Exception as e:
+            logger.warning("[Music] failed to save panel cfg: %s", e)
+
+    def _fixed_panel(self, guild_id: int) -> Tuple[Optional[int], Optional[int]]:
+        v = self._panel_cfg.get(str(guild_id))
+        if not v:
+            return (None, None)
+        try:
+            return (int(v.get("channel_id", 0)) or None, int(v.get("message_id", 0)) or None)
+        except Exception:
+            return (None, None)
+
+    async def _set_fixed_panel(self, guild_id: int, channel_id: int, message_id: int):
+        async with self._panel_cfg_lock:
+            self._panel_cfg[str(guild_id)] = {
+                "channel_id": int(channel_id),
+                "message_id": int(message_id),
+            }
+            self._save_panel_config_unlocked()
+
+    async def _clear_fixed_panel(self, guild_id: int):
+        async with self._panel_cfg_lock:
+            self._panel_cfg.pop(str(guild_id), None)
+            self._save_panel_config_unlocked()
+
+    async def _restore_fixed_panels(self):
+        await self.bot.wait_until_ready()
+        # 캐시가 안정될 시간을 살짝 준다.
+        await asyncio.sleep(1)
+
+        for gid_str, v in list(self._panel_cfg.items()):
+            try:
+                gid = int(gid_str)
+                channel_id = int(v.get("channel_id", 0))
+                message_id = int(v.get("message_id", 0))
+            except Exception:
+                continue
+
+            guild = self.bot.get_guild(gid)
+            if not guild:
+                continue
+
+            ch = guild.get_channel(channel_id)
+            if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                continue
+
+            embed = self._build_embed(guild)
+
+            msg: Optional[discord.Message] = None
+            if message_id:
+                try:
+                    msg = await ch.fetch_message(message_id)
+                except discord.NotFound:
+                    msg = None
+                except Exception as e:
+                    logger.warning("[Music] panel fetch error: %s", e)
+                    msg = None
+
+            try:
+                if msg:
+                    await msg.edit(embed=embed, view=self.panel_view)
+                else:
+                    msg = await ch.send(embed=embed, view=self.panel_view)
+                    await self._set_fixed_panel(gid, channel_id, msg.id)
+            except Exception as e:
+                logger.warning("[Music] panel restore error: %s", e)
 
     # -------------------------------
     # Voice connect helpers
@@ -328,7 +552,7 @@ class MusicCog(commands.Cog):
     # -------------------------------
     # Player loop
     # -------------------------------
-    async def _player_loop(self, guild_id: int, text_channel_id: int):
+    async def _player_loop(self, guild_id: int):
         st = self._state(guild_id)
 
         while True:
@@ -353,11 +577,11 @@ class MusicCog(commands.Cog):
             if not stream_url:
                 self._set_error(guild_id, "재생 URL을 해상하지 못했어(yt-dlp).")
                 st.now_playing = None
-                await self._try_refresh_panel(text_channel_id)
+                await self._refresh_panel(guild_id)
                 continue
 
             # 패널 업데이트(재생 시작)
-            await self._try_refresh_panel(text_channel_id)
+            await self._refresh_panel(guild_id)
 
             done = asyncio.Event()
 
@@ -391,18 +615,19 @@ class MusicCog(commands.Cog):
                         pass
                 st._suppress_requeue_once = False
 
-                await self._try_refresh_panel(text_channel_id)
+                await self._refresh_panel(guild_id)
 
-    def _start_player_if_needed(self, guild_id: int, text_channel_id: int):
+    def _start_player_if_needed(self, guild_id: int):
         st = self._state(guild_id)
         if st.player_task and not st.player_task.done():
             return
-        st.player_task = asyncio.create_task(self._player_loop(guild_id, text_channel_id))
+        st.player_task = asyncio.create_task(self._player_loop(guild_id))
 
     # -------------------------------
     # Panel render/update
     # -------------------------------
     def _build_embed(self, guild: discord.Guild) -> discord.Embed:
+        """음악 패널 임베드(깔끔/고정용)."""
         st = self._state(guild.id)
         vc = guild.voice_client
 
@@ -410,71 +635,107 @@ class MusicCog(commands.Cog):
         now_url = st.now_playing.webpage_url if st.now_playing else None
 
         embed = discord.Embed(
-            title="🎵 유메 음악 패널",
-            description=(
-                "버튼으로 조작해줘.\n"
-                "- ➕ **추가**: 유튜브 검색어/URL로 큐에 넣기\n"
-                "- ⏯: 재생/일시정지\n"
-                "- ⏭: 다음 곡\n"
-                "- ⏹: 정지(큐 비움)\n"
-                "- 🔁: 큐 반복 토글\n"
-                "- 🔀: 큐 셔플\n"
-                "- 🔉/🔊: 볼륨 조절\n"
-                "- 🚪: 나가기"
-            ),
+            title="유메 - 음악채널",
+            description="🔴 YouTube / 🟢 Spotify 버튼으로 곡을 추가해줘.",
             color=discord.Color.blurple(),
         )
 
         if now_url:
-            embed.add_field(name="지금 재생", value=f"[{now_title}]({now_url})", inline=False)
+            embed.add_field(name="🎧 지금 재생", value=f"[{now_title}]({now_url})", inline=False)
         else:
-            embed.add_field(name="지금 재생", value=now_title, inline=False)
+            embed.add_field(name="🎧 지금 재생", value=now_title, inline=False)
 
-        embed.add_field(name="큐 길이", value=str(st.queue.qsize()), inline=True)
-        embed.add_field(name="반복", value="ON" if st.loop_all else "OFF", inline=True)
-        embed.add_field(name="볼륨", value=f"{int(st.volume * 100)}%", inline=True)
+        embed.add_field(name="📃 큐", value=f"{st.queue.qsize()}곡", inline=True)
+        embed.add_field(name="🔁 반복", value="ON" if st.loop_all else "OFF", inline=True)
+        embed.add_field(name="🔊 볼륨", value=f"{int(st.volume * 100)}%", inline=True)
 
         if vc and vc.is_connected() and vc.channel:
-            embed.add_field(name="음성 채널", value=vc.channel.name, inline=False)
+            embed.add_field(name="🔊 음성 채널", value=vc.channel.name, inline=False)
         else:
-            embed.add_field(name="음성 채널", value="(연결 안 됨)", inline=False)
+            embed.add_field(name="🔊 음성 채널", value="(연결 안 됨)", inline=False)
 
-        # 최근 오류가 있으면 짧게 표시 (5분)
         if st.last_error and (time.time() - st.last_error_at) < 300:
             embed.add_field(name="⚠️ 상태", value=st.last_error, inline=False)
 
+        embed.set_footer(text="버튼으로 조작해줘. 으헤~")
         return embed
 
-    async def _try_refresh_panel(self, channel_id: int):
-        """패널 메시지들(최근 1개)만 찾아서 갱신한다. 실패해도 조용히 무시."""
+    async def _ensure_panel_message(
+        self,
+        guild_id: int,
+        channel_id: int,
+        *,
+        fixed: bool,
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """패널 메시지가 없으면 생성하고 (channel_id, message_id)를 돌려준다."""
         ch = self.bot.get_channel(channel_id)
         if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-            return
-        if not self.bot.user:
-            return
+            return (None, None)
 
         guild = ch.guild
         embed = self._build_embed(guild)
 
-        # 최근 메시지 20개 안에서 "유메 음악 패널"을 찾아 갱신
+        # 현재 저장된 message_id
+        msg_id: Optional[int] = None
+        if fixed:
+            _, msg_id = self._fixed_panel(guild_id)
+        else:
+            st = self._state(guild_id)
+            msg_id = st.temp_panel_message_id
+
+        msg: Optional[discord.Message] = None
+        if msg_id:
+            try:
+                msg = await ch.fetch_message(msg_id)
+            except discord.NotFound:
+                msg = None
+            except Exception:
+                msg = None
+
         try:
-            async for msg in ch.history(limit=20):
-                if msg.author.id != self.bot.user.id:
-                    continue
-                if msg.embeds and msg.embeds[0].title == "🎵 유메 음악 패널":
-                    await msg.edit(embed=embed, view=self.panel_view)
-                    break
+            if msg:
+                await msg.edit(embed=embed, view=self.panel_view)
+                return (channel_id, msg.id)
+
+            msg = await ch.send(embed=embed, view=self.panel_view)
+            if fixed:
+                await self._set_fixed_panel(guild_id, channel_id, msg.id)
+            else:
+                st = self._state(guild_id)
+                st.temp_panel_channel_id = channel_id
+                st.temp_panel_message_id = msg.id
+            return (channel_id, msg.id)
         except Exception:
-            pass
+            return (None, None)
+
+    async def _refresh_panel(
+        self,
+        guild_id: int,
+        *,
+        hint_channel_id: Optional[int] = None,
+        force_create_when_transient: bool = False,
+    ):
+        """고정 패널이 있으면 그걸 갱신, 없으면 힌트/임시 패널을 갱신."""
+        fixed_channel_id, fixed_msg_id = self._fixed_panel(guild_id)
+        if fixed_channel_id:
+            await self._ensure_panel_message(guild_id, fixed_channel_id, fixed=True)
+            return
+
+        st = self._state(guild_id)
+        channel_id = st.temp_panel_channel_id or hint_channel_id
+        if not channel_id:
+            return
+
+        if not st.temp_panel_message_id and not force_create_when_transient:
+            return
+
+        await self._ensure_panel_message(guild_id, channel_id, fixed=False)
 
     async def _refresh_from_interaction(self, interaction: discord.Interaction):
+        """예전 코드 호환용: 버튼/모달에서 패널 갱신."""
         if interaction.guild is None:
             return
-        embed = self._build_embed(interaction.guild)
-        try:
-            await interaction.message.edit(embed=embed, view=self.panel_view)
-        except Exception:
-            pass
+        await self._refresh_panel(interaction.guild.id, hint_channel_id=interaction.channel_id)
 
     # -------------------------------
     # Queue operations
@@ -523,7 +784,7 @@ class MusicCog(commands.Cog):
 
             st = self._state(interaction.guild.id)
             await st.queue.put(track)
-            self._start_player_if_needed(interaction.guild.id, interaction.channel_id)
+            self._start_player_if_needed(interaction.guild.id)
 
             await interaction.followup.send(f"큐에 추가: **{title}**", ephemeral=True)
             await self._refresh_from_interaction(interaction)
@@ -534,6 +795,89 @@ class MusicCog(commands.Cog):
                 await interaction.followup.send("그건 재생하기가 어려워…", ephemeral=True)
             except Exception:
                 pass
+
+    async def _resolve_spotify_to_query(self, q: str) -> str:
+        """Spotify 트랙 URL이면 oEmbed로 제목을 가져와 YouTube 검색어로 변환한다.
+
+        - Spotify API 키 없이도 되는 방식(oEmbed)이라 운영이 간단하다.
+        - 실패하면 원문(q)을 그대로 반환해서 ytsearch에 태운다.
+        """
+        s = (q or "").strip()
+        if not s:
+            return s
+
+        # spotify:track:ID -> https://open.spotify.com/track/ID
+        if s.startswith("spotify:track:"):
+            tid = s.split(":")[-1].strip()
+            if tid:
+                s = f"https://open.spotify.com/track/{tid}"
+
+        if "open.spotify.com/track/" not in s:
+            return s
+
+        oembed = f"https://open.spotify.com/oembed?url={quote(s, safe='')}"
+        try:
+            timeout = aiohttp.ClientTimeout(total=8)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(oembed, headers={"User-Agent": "YumeBot"}) as r:
+                    if r.status != 200:
+                        return s
+                    data = await r.json()
+        except Exception:
+            return s
+
+        title = str(data.get("title") or "").strip()
+        author = str(data.get("author_name") or "").strip()
+        if not title:
+            return s
+
+        # title에 이미 아티스트가 들어있을 때가 많아서, author는 보조로만.
+        if author and author.lower() not in title.lower():
+            return f"{title} {author}"
+        return title
+
+    async def _enqueue_spotify_from_interaction(self, interaction: discord.Interaction, query: str):
+        # Spotify URL -> (가능하면) 제목 추출 -> YouTube 검색으로 큐 추가
+        resolved = await self._resolve_spotify_to_query(query)
+        await self._enqueue_from_interaction(interaction, resolved)
+
+    async def _set_volume_from_interaction(self, interaction: discord.Interaction, raw: str):
+        # 모달 제출이므로 defer 후 followup
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+        if interaction.guild is None:
+            return
+
+        s = (raw or "").strip()
+        try:
+            value = int(s)
+        except Exception:
+            try:
+                await interaction.followup.send("숫자(0~200)로 입력해줘.", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        value = max(0, min(200, value))
+        st = self._state(interaction.guild.id)
+        st.volume = value / 100.0
+
+        vc = interaction.guild.voice_client
+        if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
+            try:
+                vc.source.volume = st.volume
+            except Exception:
+                pass
+
+        try:
+            await interaction.followup.send(f"볼륨을 {value}%로 맞췄어.", ephemeral=True)
+        except Exception:
+            pass
+
+        await self._refresh_from_interaction(interaction)
 
     # -------------------------------
     # Button actions
@@ -710,6 +1054,39 @@ class MusicCog(commands.Cog):
     # -------------------------------
     # Command
     # -------------------------------
+    @commands.command(name="음악채널지정")
+    @commands.has_permissions(manage_guild=True)
+    async def set_music_channel(self, ctx: commands.Context, channel: discord.TextChannel):
+        """!음악채널지정 <채널ID>: 지정한 채널에 음악 패널을 항상 고정한다."""
+        if ctx.guild is None:
+            await ctx.send("서버 채널에서만 쓸 수 있어.")
+            return
+
+        # 패널 생성/복구
+        cid, mid = await self._ensure_panel_message(ctx.guild.id, channel.id, fixed=True)
+        if not cid or not mid:
+            await ctx.send("그 채널에 패널을 만들 수 없었어(권한을 확인해줘).")
+            return
+
+        await ctx.send(f"음악 패널 채널을 {channel.mention}로 지정했어. 이제 여기만 갱신할게.")
+
+    @set_music_channel.error
+    async def set_music_channel_error(self, ctx: commands.Context, error: Exception):
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.send("이건 서버 관리 권한(서버 관리)이 필요해.")
+            return
+        await ctx.send("사용법: `!음악채널지정 <채널ID>`")
+
+    @commands.command(name="음악채널해제")
+    @commands.has_permissions(manage_guild=True)
+    async def clear_music_channel(self, ctx: commands.Context):
+        """!음악채널해제: 고정 패널 설정을 지운다."""
+        if ctx.guild is None:
+            await ctx.send("서버 채널에서만 쓸 수 있어.")
+            return
+        await self._clear_fixed_panel(ctx.guild.id)
+        await ctx.send("고정 음악 패널 설정을 지웠어. 이제 `!음악`을 누른 채널에 임시 패널이 떠.")
+
     @commands.command(name="음악")
     async def music_panel(self, ctx: commands.Context):
         """!음악: 유메를 음성 채널로 부르고 음악 패널을 띄운다."""
@@ -717,10 +1094,25 @@ class MusicCog(commands.Cog):
         if not vc or ctx.guild is None:
             return
 
-        self._start_player_if_needed(ctx.guild.id, ctx.channel.id)
+        self._start_player_if_needed(ctx.guild.id)
 
+        fixed_channel_id, _ = self._fixed_panel(ctx.guild.id)
+        if fixed_channel_id:
+            # 고정 패널이 있으면 그 채널만 갱신한다.
+            await self._ensure_panel_message(ctx.guild.id, fixed_channel_id, fixed=True)
+            await self._refresh_panel(ctx.guild.id)
+            try:
+                await ctx.send(f"패널은 <#{fixed_channel_id}>에 있어.", delete_after=5)
+            except Exception:
+                pass
+            return
+
+        # 고정이 없으면 현재 채널에 임시 패널을 띄워둔다.
         embed = self._build_embed(ctx.guild)
-        await ctx.send(embed=embed, view=self.panel_view)
+        msg = await ctx.send(embed=embed, view=self.panel_view)
+        st = self._state(ctx.guild.id)
+        st.temp_panel_channel_id = ctx.channel.id
+        st.temp_panel_message_id = msg.id
 
 
 async def setup(bot: commands.Bot):
