@@ -242,6 +242,9 @@ class MusicState:
         self.temp_panel_channel_id: Optional[int] = None
         self.temp_panel_message_id: Optional[int] = None
 
+        # panel mode: 'main' | 'queue' | 'sound'
+        self.panel_mode: str = 'main'
+
         self.lyrics_enabled: bool = False
         self.lyrics_task: Optional[asyncio.Task] = None
         self.lyrics_channel_id: Optional[int] = None
@@ -467,7 +470,7 @@ class MusicPanelView(discord.ui.View):
         style=discord.ButtonStyle.secondary,
         emoji="⏯",
         custom_id="yume_music_toggle",
-        row=0,
+        row=1,
     )
     async def toggle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._toggle_pause(interaction)
@@ -477,7 +480,7 @@ class MusicPanelView(discord.ui.View):
         style=discord.ButtonStyle.secondary,
         emoji="⏭",
         custom_id="yume_music_skip",
-        row=0,
+        row=1,
     )
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._skip(interaction)
@@ -487,7 +490,7 @@ class MusicPanelView(discord.ui.View):
         style=discord.ButtonStyle.secondary,
         emoji="🔊",
         custom_id="yume_music_volume",
-        row=0,
+        row=1,
     )
     async def volume_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         if interaction.guild is None:
@@ -520,7 +523,7 @@ class MusicPanelView(discord.ui.View):
         style=discord.ButtonStyle.danger,
         emoji="⏹",
         custom_id="yume_music_stop",
-        row=1,
+        row=2,
     )
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._stop(interaction)
@@ -530,10 +533,21 @@ class MusicPanelView(discord.ui.View):
         style=discord.ButtonStyle.secondary,
         emoji="🧰",
         custom_id="yume_music_queue",
-        row=1,
+        row=2,
     )
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._open_queue_manage(interaction)
+
+
+    @discord.ui.button(
+        label="음향 관리",
+        style=discord.ButtonStyle.secondary,
+        emoji="🎛️",
+        custom_id="yume_music_sound",
+        row=2,
+    )
+    async def sound_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        await self.cog._open_sound_manage(interaction)
 
 
 class QueueDeleteModal(discord.ui.Modal):
@@ -634,11 +648,29 @@ class QueueManageView(discord.ui.View):
         await self.cog._queue_dedupe(interaction)
 
     @discord.ui.button(
+        label="돌아가기",
+        style=discord.ButtonStyle.primary,
+        emoji="↩️",
+        custom_id="yume_music_q_back",
+        row=0,
+    )
+    async def q_back(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        await self.cog._back_to_main_panel(interaction)
+
+
+class SoundManageView(discord.ui.View):
+    """음향 관리(토글 메뉴)."""
+
+    def __init__(self, cog: "MusicCog"):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(
         label="가사",
         style=discord.ButtonStyle.secondary,
         emoji="🎤",
         custom_id="yume_music_lyrics",
-        row=1,
+        row=0,
     )
     async def lyrics_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._toggle_lyrics(interaction)
@@ -648,7 +680,7 @@ class QueueManageView(discord.ui.View):
         style=discord.ButtonStyle.secondary,
         emoji="🎚️",
         custom_id="yume_music_fx",
-        row=1,
+        row=0,
     )
     async def fx_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._toggle_eq(interaction)
@@ -658,7 +690,7 @@ class QueueManageView(discord.ui.View):
         style=discord.ButtonStyle.secondary,
         emoji="⚙️",
         custom_id="yume_music_eq_settings",
-        row=1,
+        row=0,
     )
     async def eq_settings_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         guild = interaction.guild
@@ -681,7 +713,7 @@ class QueueManageView(discord.ui.View):
         style=discord.ButtonStyle.secondary,
         emoji="🌊",
         custom_id="yume_music_reverb",
-        row=1,
+        row=0,
     )
     async def reverb_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._toggle_reverb(interaction)
@@ -691,7 +723,7 @@ class QueueManageView(discord.ui.View):
         style=discord.ButtonStyle.secondary,
         emoji="⚙️",
         custom_id="yume_music_reverb_settings",
-        row=1,
+        row=0,
     )
     async def reverb_settings_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         guild = interaction.guild
@@ -714,7 +746,7 @@ class QueueManageView(discord.ui.View):
         style=discord.ButtonStyle.secondary,
         emoji="🎛️",
         custom_id="yume_music_tune",
-        row=2,
+        row=1,
     )
     async def tune_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._toggle_tune(interaction)
@@ -724,7 +756,7 @@ class QueueManageView(discord.ui.View):
         style=discord.ButtonStyle.secondary,
         emoji="⚙️",
         custom_id="yume_music_tune_settings",
-        row=2,
+        row=1,
     )
     async def tune_settings_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         guild = interaction.guild
@@ -747,18 +779,19 @@ class QueueManageView(discord.ui.View):
         style=discord.ButtonStyle.danger,
         emoji="🧼",
         custom_id="yume_music_fx_reset",
-        row=2,
+        row=1,
     )
     async def fx_reset_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._reset_fx(interaction)
+
     @discord.ui.button(
         label="돌아가기",
         style=discord.ButtonStyle.primary,
         emoji="↩️",
-        custom_id="yume_music_q_back",
-        row=0,
+        custom_id="yume_music_sound_back",
+        row=1,
     )
-    async def q_back(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+    async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._back_to_main_panel(interaction)
 
 
@@ -783,6 +816,7 @@ class MusicCog(commands.Cog):
 
         self.panel_view = MusicPanelView(self)
         self.queue_view = QueueManageView(self)
+        self.sound_view = SoundManageView(self)
 
         self._spotify_client_id = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
         self._spotify_client_secret = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
@@ -1061,9 +1095,9 @@ class MusicCog(commands.Cog):
 
             try:
                 if msg:
-                    await msg.edit(embed=embed, view=self.panel_view)
+                    await msg.edit(embed=embed, view=view)
                 else:
-                    msg = await ch.send(embed=embed, view=self.panel_view)
+                    msg = await ch.send(embed=embed, view=view)
                     await self._set_fixed_panel(gid, channel_id, msg.id)
             except Exception as e:
                 logger.warning("[Music] panel restore error: %s", e)
@@ -1438,7 +1472,18 @@ class MusicCog(commands.Cog):
             return (None, None)
 
         guild = ch.guild
-        embed = self._build_embed(guild)
+        st = self._state(guild_id)
+
+        mode = getattr(st, 'panel_mode', 'main')
+        if mode == 'queue':
+            embed = self._build_queue_embed(guild)
+            view = self.queue_view
+        elif mode == 'sound':
+            embed = self._build_sound_embed(guild)
+            view = self.sound_view
+        else:
+            embed = self._build_embed(guild)
+            view = self.panel_view
 
         msg_id: Optional[int] = None
         if fixed:
@@ -1458,14 +1503,13 @@ class MusicCog(commands.Cog):
 
         try:
             if msg:
-                await msg.edit(embed=embed, view=self.panel_view)
+                await msg.edit(embed=embed, view=view)
                 return (channel_id, msg.id)
 
-            msg = await ch.send(embed=embed, view=self.panel_view)
+            msg = await ch.send(embed=embed, view=view)
             if fixed:
                 await self._set_fixed_panel(guild_id, channel_id, msg.id)
             else:
-                st = self._state(guild_id)
                 st.temp_panel_channel_id = channel_id
                 st.temp_panel_message_id = msg.id
             return (channel_id, msg.id)
@@ -1860,6 +1904,7 @@ class MusicCog(commands.Cog):
             return
         gid = interaction.guild.id
         st = self._state(gid)
+        st.panel_mode = 'sound'
         async with st.lock:
             st.fx_eq_enabled = not bool(st.fx_eq_enabled)
             await self._persist_fx_cfg_from_state(gid, st)
@@ -1880,6 +1925,7 @@ class MusicCog(commands.Cog):
             return
         gid = interaction.guild.id
         st = self._state(gid)
+        st.panel_mode = 'sound'
         async with st.lock:
             st.fx_reverb_enabled = not bool(st.fx_reverb_enabled)
             await self._persist_fx_cfg_from_state(gid, st)
@@ -1900,6 +1946,7 @@ class MusicCog(commands.Cog):
             return
         gid = interaction.guild.id
         st = self._state(gid)
+        st.panel_mode = 'sound'
         async with st.lock:
             st.fx_tune_enabled = not bool(st.fx_tune_enabled)
             await self._persist_fx_cfg_from_state(gid, st)
@@ -1917,6 +1964,7 @@ class MusicCog(commands.Cog):
 
     async def _set_eq_settings(self, interaction: discord.Interaction, *, guild_id: int, bass: float, mid: float, treble: float, preamp: float):
         st = self._state(guild_id)
+        st.panel_mode = 'sound'
         async with st.lock:
             st.fx_bass_db = float(bass)
             st.fx_mid_db = float(mid)
@@ -1938,6 +1986,7 @@ class MusicCog(commands.Cog):
 
     async def _set_reverb_settings(self, interaction: discord.Interaction, *, guild_id: int, mix: int, room: int):
         st = self._state(guild_id)
+        st.panel_mode = 'sound'
         async with st.lock:
             st.fx_reverb_mix = int(mix)
             st.fx_reverb_room = int(room)
@@ -1957,6 +2006,7 @@ class MusicCog(commands.Cog):
 
     async def _set_tune_settings(self, interaction: discord.Interaction, *, guild_id: int, semitones: float):
         st = self._state(guild_id)
+        st.panel_mode = 'sound'
         async with st.lock:
             st.fx_tune_semitones = float(semitones)
             st.fx_tune_enabled = True
@@ -1978,6 +2028,7 @@ class MusicCog(commands.Cog):
             return
         gid = interaction.guild.id
         st = self._state(gid)
+        st.panel_mode = 'sound'
         async with st.lock:
             st.fx_eq_enabled = False
             st.fx_bass_db = 0.0
@@ -2191,6 +2242,48 @@ class MusicCog(commands.Cog):
         embed.set_footer(text="큐 관리는 여기서. ↩️ 돌아가기 누르면 메인 패널로 돌아가.")
         return embed
 
+    def _build_sound_embed(self, guild: discord.Guild) -> discord.Embed:
+        st = self._state(guild.id)
+        vc = guild.voice_client
+
+        embed = discord.Embed(
+            title="유메 - 음향 관리",
+            description="EQ/리버브/튠/가사 표시를 조절해.",
+            color=discord.Color.blurple(),
+        )
+
+        if st.now_playing and st.now_playing.webpage_url and st.now_playing.webpage_url.startswith("http"):
+            embed.add_field(
+                name="🎧 지금 재생",
+                value=f"[{st.now_playing.title}]({st.now_playing.webpage_url})",
+                inline=False,
+            )
+        elif st.now_playing:
+            embed.add_field(name="🎧 지금 재생", value=st.now_playing.title, inline=False)
+        else:
+            embed.add_field(name="🎧 지금 재생", value="없음", inline=False)
+
+        lyrics = "ON" if st.lyrics_enabled else "OFF"
+        if st.lyrics_enabled and st.lyrics_channel_id:
+            lyrics += f" (채널 <#{st.lyrics_channel_id}>)"
+        embed.add_field(name="🎤 가사", value=lyrics, inline=False)
+
+        eq = f"{('ON' if st.fx_eq_enabled else 'OFF')} ({st.fx_eq_preset})"
+        rvb = f"{('ON' if st.fx_reverb_enabled else 'OFF')} (레벨 {st.fx_reverb_level})"
+        tune = f"{('ON' if st.fx_tune_enabled else 'OFF')} ({st.fx_tune_semitones:+.1f})"
+        embed.add_field(name="🎚️ FX", value=f"EQ {eq} | RVB {rvb} | TUNE {tune}", inline=False)
+
+        if vc and vc.is_connected() and getattr(vc, 'channel', None):
+            embed.add_field(name="🔊 음성 채널", value=vc.channel.name, inline=False)
+        else:
+            embed.add_field(name="🔊 음성 채널", value="(연결 안 됨)", inline=False)
+
+        if st.last_error and (time.time() - st.last_error_at) < 300:
+            embed.add_field(name="⚠️ 상태", value=st.last_error, inline=False)
+
+        embed.set_footer(text="음향 관리는 여기서. 가사는 곡마다 없을 수도 있어. ↩️ 돌아가기 누르면 메인 패널로 돌아가.")
+        return embed
+
     async def _edit_panel_message(
         self,
         guild_id: int,
@@ -2227,13 +2320,26 @@ class MusicCog(commands.Cog):
         if interaction.guild is None:
             return
         gid = interaction.guild.id
+        st = self._state(gid)
+        st.panel_mode = 'queue'
         embed = self._build_queue_embed(interaction.guild)
         await self._edit_panel_message(gid, embed=embed, view=self.queue_view, interaction=interaction)
+
+    async def _open_sound_manage(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return
+        gid = interaction.guild.id
+        st = self._state(gid)
+        st.panel_mode = 'sound'
+        embed = self._build_sound_embed(interaction.guild)
+        await self._edit_panel_message(gid, embed=embed, view=self.sound_view, interaction=interaction)
 
     async def _back_to_main_panel(self, interaction: discord.Interaction):
         if interaction.guild is None:
             return
         gid = interaction.guild.id
+        st = self._state(gid)
+        st.panel_mode = 'main'
         embed = self._build_embed(interaction.guild)
         await self._edit_panel_message(gid, embed=embed, view=self.panel_view, interaction=interaction)
 
@@ -2285,6 +2391,7 @@ class MusicCog(commands.Cog):
             return
         gid = interaction.guild.id
         st = self._state(gid)
+        st.panel_mode = 'sound'
 
         if st.lyrics_enabled:
             await self._disable_lyrics(gid, delete_message=True)
@@ -2499,6 +2606,7 @@ class MusicCog(commands.Cog):
             return
         gid = interaction.guild.id
         st = self._state(gid)
+        st.panel_mode = 'queue'
 
         async with st.lock:
             items: List[_Track] = []
@@ -2531,6 +2639,7 @@ class MusicCog(commands.Cog):
             return
         gid = interaction.guild.id
         st = self._state(gid)
+        st.panel_mode = 'queue'
 
         removed = 0
         async with st.lock:
@@ -2575,6 +2684,7 @@ class MusicCog(commands.Cog):
             return
         gid = interaction.guild.id
         st = self._state(gid)
+        st.panel_mode = 'queue'
 
         moved = False
         async with st.lock:
@@ -2616,6 +2726,7 @@ class MusicCog(commands.Cog):
             return
         gid = interaction.guild.id
         st = self._state(gid)
+        st.panel_mode = 'queue'
 
         removed = 0
         async with st.lock:
@@ -2718,5 +2829,6 @@ async def setup(bot: commands.Bot):
     try:
         bot.add_view(cog.panel_view)
         bot.add_view(cog.queue_view)
+        bot.add_view(cog.sound_view)
     except Exception:
         pass
