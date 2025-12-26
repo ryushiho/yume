@@ -857,6 +857,154 @@ class MusicCog(commands.Cog):
         except Exception as e:
             logger.warning("[Music] failed to save panel cfg: %s", e)
 
+
+    # =========================
+    # FX config (per-guild)
+    # =========================
+
+    def _load_fx_cfg(self) -> Dict[str, Dict[str, object]]:
+        """
+        data/storage/music_fx.json 에서 길드별 FX 설정을 읽어온다.
+        - 파일이 없거나 깨져 있으면 빈 dict를 반환한다.
+        - 값은 최소한으로 검증/클램프해서 저장한다.
+        """
+        try:
+            if not os.path.exists(FX_CFG_PATH):
+                return {}
+            with open(FX_CFG_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {}
+
+            out: Dict[str, Dict[str, object]] = {}
+            for k, v in data.items():
+                if not isinstance(k, str) or not isinstance(v, dict):
+                    continue
+                try:
+                    gid = int(k)
+                except Exception:
+                    continue
+                if gid <= 0:
+                    continue
+
+                def _bf(x: object, default: bool) -> bool:
+                    try:
+                        return bool(x)
+                    except Exception:
+                        return default
+
+                def _ff(x: object, default: float, lo: float, hi: float) -> float:
+                    try:
+                        return _clamp_float(float(x), lo, hi)
+                    except Exception:
+                        return default
+
+                def _ii(x: object, default: int, lo: int, hi: int) -> int:
+                    try:
+                        return _clamp_int(int(x), lo, hi)
+                    except Exception:
+                        return default
+
+                out[str(gid)] = {
+                    'eq_enabled': _bf(v.get('eq_enabled', False), False),
+                    'bass_db': _ff(v.get('bass_db', 0.0), 0.0, -24.0, 24.0),
+                    'mid_db': _ff(v.get('mid_db', 0.0), 0.0, -24.0, 24.0),
+                    'treble_db': _ff(v.get('treble_db', 0.0), 0.0, -24.0, 24.0),
+                    'preamp_db': _ff(v.get('preamp_db', 0.0), 0.0, -24.0, 24.0),
+
+                    'reverb_enabled': _bf(v.get('reverb_enabled', False), False),
+                    'reverb_mix': _ii(v.get('reverb_mix', 0), 0, 0, 100),
+                    'reverb_room': _ii(v.get('reverb_room', 50), 50, 0, 100),
+
+                    'tune_enabled': _bf(v.get('tune_enabled', False), False),
+                    'tune_semitones': _ff(v.get('tune_semitones', 0.0), 0.0, -12.0, 12.0),
+                }
+
+            return out
+        except Exception:
+            return {}
+
+    def _save_fx_cfg_unlocked(self) -> None:
+        try:
+            os.makedirs(STORAGE_DIR, exist_ok=True)
+            tmp = FX_CFG_PATH + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(self._fx_cfg, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, FX_CFG_PATH)
+        except Exception as e:
+            logger.warning('[Music] failed to save fx cfg: %s', e)
+
+    def _apply_fx_cfg_to_state(self, guild_id: int, st: MusicState) -> None:
+        cfg = self._fx_cfg.get(str(guild_id))
+        if not cfg:
+            return
+        try:
+            st.fx_eq_enabled = bool(cfg.get('eq_enabled', False))
+            st.fx_bass_db = float(cfg.get('bass_db', 0.0))
+            st.fx_mid_db = float(cfg.get('mid_db', 0.0))
+            st.fx_treble_db = float(cfg.get('treble_db', 0.0))
+            st.fx_preamp_db = float(cfg.get('preamp_db', 0.0))
+
+            st.fx_reverb_enabled = bool(cfg.get('reverb_enabled', False))
+            st.fx_reverb_mix = int(cfg.get('reverb_mix', 0))
+            st.fx_reverb_room = int(cfg.get('reverb_room', 50))
+
+            st.fx_tune_enabled = bool(cfg.get('tune_enabled', False))
+            st.fx_tune_semitones = float(cfg.get('tune_semitones', 0.0))
+        except Exception:
+            # 값이 깨져있어도 봇이 죽으면 안 된다.
+            return
+
+    async def _persist_fx_cfg_from_state(self, guild_id: int, st: MusicState) -> None:
+        async with self._fx_cfg_lock:
+            self._fx_cfg[str(guild_id)] = {
+                'eq_enabled': bool(st.fx_eq_enabled),
+                'bass_db': float(_clamp_float(st.fx_bass_db, -24.0, 24.0)),
+                'mid_db': float(_clamp_float(st.fx_mid_db, -24.0, 24.0)),
+                'treble_db': float(_clamp_float(st.fx_treble_db, -24.0, 24.0)),
+                'preamp_db': float(_clamp_float(st.fx_preamp_db, -24.0, 24.0)),
+
+                'reverb_enabled': bool(st.fx_reverb_enabled),
+                'reverb_mix': int(_clamp_int(int(st.fx_reverb_mix), 0, 100)),
+                'reverb_room': int(_clamp_int(int(st.fx_reverb_room), 0, 100)),
+
+                'tune_enabled': bool(st.fx_tune_enabled),
+                'tune_semitones': float(_clamp_float(float(st.fx_tune_semitones), -12.0, 12.0)),
+            }
+            self._save_fx_cfg_unlocked()
+
+    def _detect_ffmpeg_filters(self) -> Optional[set[str]]:
+        """
+        ffmpeg -filters 결과에서 필터 이름을 추출한다.
+        실패하면 None을 반환한다. (보수적으로 동작하도록)
+        """
+        try:
+            import subprocess
+
+            proc = subprocess.run(
+                [FFMPEG_EXECUTABLE, "-hide_banner", "-filters"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            blob = (proc.stdout or "") + "\n" + (proc.stderr or "")
+
+            names: set[str] = set()
+            for ln in blob.splitlines():
+                ln = ln.strip()
+                if (not ln) or ln.startswith("Filters:") or ln.startswith("---"):
+                    continue
+                # 보통: " T.. equalizer         A->A       Apply two-pole ..."
+                parts = ln.split()
+                if len(parts) >= 2 and len(parts[0]) >= 3:
+                    cand = parts[1].strip()
+                    if re.match(r"^[A-Za-z0-9_]+$", cand):
+                        names.add(cand)
+
+            return names if names else None
+        except Exception:
+            return None
+
     def _fixed_panel(self, guild_id: int) -> Tuple[Optional[int], Optional[int]]:
         v = self._panel_cfg.get(str(guild_id))
         if not v:
@@ -1654,7 +1802,7 @@ class MusicCog(commands.Cog):
         if st.fx_eq_enabled:
             if abs(st.fx_bass_db) > 0.01:
                 chain.append(f"bass=g={float(st.fx_bass_db)}:f=100:w=0.5")
-            if abs(st.fx_mid_db) > 0.01 and (not self._ffmpeg_filters or ('equalizer' in self._ffmpeg_filters)):
+            if abs(st.fx_mid_db) > 0.01 and (self._ffmpeg_filters is not None and 'equalizer' in self._ffmpeg_filters):
                 chain.append(f"equalizer=f=1000:t=q:w=1:g={float(st.fx_mid_db)}")
             if abs(st.fx_treble_db) > 0.01:
                 chain.append(f"treble=g={float(st.fx_treble_db)}:f=3500:w=0.5")
