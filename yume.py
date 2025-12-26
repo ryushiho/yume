@@ -8,9 +8,6 @@ from typing import Optional, Literal
 import discord
 from discord.ext import commands
 
-# --------------------------------
-# 로깅 설정
-# --------------------------------
 logger = logging.getLogger("yume")
 
 if not logger.handlers:
@@ -24,9 +21,6 @@ if not logger.handlers:
 
 logger.setLevel(logging.INFO)
 
-# --------------------------------
-# .env / yumebot.env 로딩 유틸
-# --------------------------------
 _ENV_LOADED = False
 
 
@@ -48,7 +42,6 @@ def _load_env_from_dotenv() -> None:
 
     loaded_any = False
 
-    # 1) python-dotenv 시도
     try:
         from dotenv import load_dotenv  # type: ignore
 
@@ -65,7 +58,6 @@ def _load_env_from_dotenv() -> None:
             )
 
     except ImportError:
-        # 2) 수동 파싱
         for path in env_paths:
             if not os.path.exists(path):
                 continue
@@ -108,16 +100,11 @@ def resolve_discord_token() -> Optional[str]:
     return None
 
 
-# ⚠ 중요: yume_ai 를 import 하기 전에 .env 를 먼저 읽어야
-#         yume_ai / YumeBrain 쪽에서 OPENAI_API_KEY 등을 제대로 볼 수 있다.
 _load_env_from_dotenv()
 
 from yume_ai import setup_yume_ai  # type: ignore
 
 
-# --------------------------------
-# Bot 설정
-# --------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -225,7 +212,6 @@ async def main():
 
     logger.info("로드할 Cog 확장 목록: %s", EXTENSIONS)
 
-    # 유메 감정/말투/일기 엔진 초기화
     setup_yume_ai(bot)
 
     async with bot:

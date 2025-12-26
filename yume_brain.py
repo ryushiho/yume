@@ -5,15 +5,11 @@ from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 try:
-    # 최신 openai 파이썬 클라이언트 방식 (2024 이후)
     from openai import OpenAI
 except ImportError:
     OpenAI = None  # 나중에 오류 메시지로 안내
 
 
-# =========================
-# .env 로딩 유틸
-# =========================
 
 _ENV_LOADED = False
 
@@ -29,15 +25,12 @@ def _load_env_from_dotenv() -> None:
     root_dir = os.path.dirname(os.path.abspath(__file__))
     env_path = os.path.join(root_dir, ".env")
 
-    # 1) python-dotenv 시도
     try:
         from dotenv import load_dotenv  # type: ignore
 
         if os.path.exists(env_path):
             load_dotenv(env_path, override=True)
-        # 없으면 조용히 넘어감
     except ImportError:
-        # 2) 수동 파싱
         if os.path.exists(env_path):
             try:
                 with open(env_path, "r", encoding="utf-8") as f:
@@ -58,9 +51,6 @@ def _load_env_from_dotenv() -> None:
     _ENV_LOADED = True
 
 
-# =========================
-# 데이터 클래스 / 설정 구조
-# =========================
 
 @dataclass
 class YumeLLMPrice:
@@ -75,11 +65,8 @@ class YumeLLMPrice:
 @dataclass
 class YumeLLMConfig:
     api_key: str
-    # 기본 모델: gpt-4o-mini
     model: str = "gpt-4o-mini"
-    # 기본 한도는 10달러, .env 의 YUME_OPENAI_LIMIT_USD 로 override 가능
     hard_limit_usd: float = 10.0
-    # 🔧 mutable default → default_factory 로 변경
     price: YumeLLMPrice = field(default_factory=YumeLLMPrice)
     usage_path: str = "data/system/llm_usage.json"
 
@@ -96,9 +83,6 @@ class YumeLLMMonthUsage:
     total_calls: int = 0
 
 
-# =========================
-# 유틸 함수
-# =========================
 
 def _get_current_month_str() -> str:
     now = datetime.datetime.now()
@@ -121,9 +105,6 @@ def _safe_save_json(path: str, data: Any) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-# =========================
-# YumeBrain 본체
-# =========================
 
 class YumeBrain:
     """
@@ -139,10 +120,8 @@ class YumeBrain:
     """
 
     def __init__(self, config: Optional[YumeLLMConfig] = None):
-        # .env 로딩 (단 한 번만)
         _load_env_from_dotenv()
 
-        # 환경변수 기준 기본값 구성
         if config is None:
             api_key = os.getenv("OPENAI_API_KEY", "").strip()
             if not api_key:
@@ -187,19 +166,14 @@ class YumeBrain:
 
         self.client = OpenAI(api_key=self.config.api_key)
 
-        # 사용량 캐시
         self._month_usage = self._load_month_usage()
 
-    # -------------------------
-    # 사용량 관리
-    # -------------------------
 
     def _load_month_usage(self) -> YumeLLMMonthUsage:
         raw = _safe_load_json(self.config.usage_path, {})
         current_month = _get_current_month_str()
 
         if not raw or raw.get("month") != current_month:
-            # 새로운 달이면 리셋
             usage = YumeLLMMonthUsage(month=current_month)
             self._save_month_usage(usage)
             return usage
@@ -254,9 +228,6 @@ class YumeBrain:
             ),
         }
 
-    # -------------------------
-    # 프롬프트 빌더
-    # -------------------------
 
     def _build_system_prompt(
         self,
@@ -276,7 +247,6 @@ class YumeBrain:
         loneliness = (yume_state or {}).get("loneliness", "normal")
         focus = (yume_state or {}).get("focus", "normal")
 
-        # bond는 user 단위/서버 단위 둘 다 들어올 수 있음
         bond_level = (user_profile or {}).get("bond_level", "normal")
         user_nick = (user_profile or {}).get("nickname", "후배")
 
@@ -373,15 +343,11 @@ class YumeBrain:
                     continue
                 messages.append({"role": role, "content": content})
 
-        # 마지막 유저 발화
         if user_message:
             messages.append({"role": "user", "content": user_message})
 
         return messages
 
-    # -------------------------
-    # 공개 API
-    # -------------------------
 
     def chat(
         self,
@@ -423,8 +389,6 @@ class YumeBrain:
                 temperature=temperature,
             )
         except Exception as e:
-            # 여기서는 유메 말투로 fallback 하지 않고,
-            # 상위 레이어가 처리할 수 있도록 ok=False + 에러 정보만 넘긴다.
             return {
                 "ok": False,
                 "reason": "error",
@@ -438,7 +402,6 @@ class YumeBrain:
 
         usage = getattr(response, "usage", None)
         if usage is None:
-            # usage가 안 들어오는 이상 상황 (이 경우 비용 추적 불가 → 그냥 ok 처리)
             return {
                 "ok": True,
                 "reason": "ok",
@@ -453,11 +416,8 @@ class YumeBrain:
         completion_tokens = getattr(usage, "completion_tokens", 0)
         total_tokens = getattr(usage, "total_tokens", prompt_tokens + completion_tokens)
 
-        # 먼저 비용 추정해서 상한 체크
         estimated_cost = self._estimate_cost_usd(prompt_tokens, completion_tokens)
         if not self._can_spend(estimated_cost):
-            # 상한 초과 → 이번 응답은 사용량에 반영하지 않고,
-            # 유저 대사는 비워 둔 채 상위 레이어에게 limit_exceeded 상태만 알려준다.
             return {
                 "ok": False,
                 "reason": "limit_exceeded",
@@ -465,7 +425,6 @@ class YumeBrain:
                 "usage": self.get_usage_summary(),
             }
 
-        # 상한 안 넘으면 실제로 사용량 반영
         cost = self._update_usage(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
@@ -490,9 +449,6 @@ class YumeBrain:
         }
 
 
-# =========================
-# 예시: 단독 테스트용
-# =========================
 
 if __name__ == "__main__":
     print("[YumeBrain] 간단 테스트를 시작합니다.")

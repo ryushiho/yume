@@ -1,12 +1,3 @@
-# social.py
-# FeedbackCog + HelpCog + ReactionsCog 통합 파일
-# - 유저 건의사항
-# - 유메 도움말
-# - 멘션/키워드 리액션, 바보 놀리기, 육포 패널티, 자동 "으헤~"
-#
-# ※ 프리토킹(LLM)은 cogs.yume_chat 에서 처리
-#   여기서는 프리토킹 활성 채널에서는 멘션 대화(_handle_mention_chat)를 비활성화하고,
-#   육포 처리 등만 유지한다.
 
 from __future__ import annotations
 
@@ -21,16 +12,11 @@ from discord.ext import commands
 
 logger = logging.getLogger(__name__)
 
-# 개발자(너) 디스코드 사용자 ID
 DEV_USER_ID = 1433962010785349634
 
-# 유메가 자발적으로 "으헤~"를 보내는 채널
 HEHE_CHANNEL_ID = 1445819862713893046
 
 
-# ==============================
-# 1) FeedbackCog
-# ==============================
 
 class FeedbackModal(discord.ui.Modal):
     """슬래시 버전 건의사항 입력 UI"""
@@ -69,9 +55,6 @@ class FeedbackCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    # -------------------------------
-    # yume_ai 연동 헬퍼
-    # -------------------------------
     def _core(self):
         """YumeAI 코어 (감정/관계 엔진). 없으면 None."""
         return getattr(self.bot, "yume_core", None)
@@ -93,9 +76,6 @@ class FeedbackCog(commands.Cog):
         except Exception:
             return None
 
-    # -------------------------------
-    # YumeSpeaker 대사 생성
-    # -------------------------------
     def _speak_feedback_received(
         self,
         user: discord.abc.User,
@@ -223,9 +203,6 @@ class FeedbackCog(commands.Cog):
             ephemeral=True,
         )
 
-    # -------------------------------
-    # 텍스트 명령어: !건의사항
-    # -------------------------------
     @commands.command(name="건의사항")
     async def text_feedback(self, ctx: commands.Context, *, content: str = None):
         """!건의사항 [내용]"""
@@ -275,9 +252,6 @@ class FeedbackCog(commands.Cog):
         await ctx.send(reply_text)
 
 
-# ==============================
-# 2) HelpCog
-# ==============================
 
 class HelpCog(commands.Cog):
     """유메 도움말 Cog"""
@@ -383,7 +357,6 @@ class HelpCog(commands.Cog):
         except discord.Forbidden:
             pass
 
-        # DM으로도 보내주기 시도 (실패해도 조용히 무시)
         try:
             dm = await ctx.author.create_dm()
             await dm.send(embed=embed)
@@ -391,9 +364,6 @@ class HelpCog(commands.Cog):
             pass
 
 
-# ==============================
-# 3) ReactionsCog
-# ==============================
 
 class ReactionsCog(commands.Cog):
     """유메 리액션 / 바보 놀리기 / 육포 패널티 / 랜덤 '으헤~'"""
@@ -402,16 +372,12 @@ class ReactionsCog(commands.Cog):
         self.bot = bot
         self._yukpo_block_until: dict[int, datetime.datetime] = {}
 
-        # 자동 "으헤~" 태스크
         self._hehe_task = self.bot.loop.create_task(self._hehe_loop())
 
     def cog_unload(self):
         if self._hehe_task:
             self._hehe_task.cancel()
 
-    # -------------------------------
-    # 육포 패널티 관련
-    # -------------------------------
     def _is_yukpo_blocked(self, user_id: int) -> bool:
         now = datetime.datetime.utcnow()
         until = self._yukpo_block_until.get(user_id)
@@ -427,9 +393,6 @@ class ReactionsCog(commands.Cog):
         until = now + datetime.timedelta(minutes=minutes)
         self._yukpo_block_until[user_id] = until
 
-    # -------------------------------
-    # 바보 놀리기 공통 로직
-    # -------------------------------
     def _pick_random_member(self, guild: discord.Guild) -> Optional[discord.Member]:
         members = [
             m for m in guild.members
@@ -440,13 +403,9 @@ class ReactionsCog(commands.Cog):
         return random.choice(members)
 
     def _build_babo_message(self, target: discord.Member) -> str:
-        # 멘션(핑)하면 안 되니까, 닉네임(표시 이름)만 부른다.
         name = discord.utils.escape_mentions(target.display_name or target.name)
         return f"{name} 바보. (…라고 누가 그러더라, 유메가 그런 거 아냐. 으헤~)"
 
-    # -------------------------------
-    # 텍스트 명령어: !바보
-    # -------------------------------
     @commands.command(name="바보")
     async def babo_text(self, ctx: commands.Context):
         if ctx.guild is None:
@@ -479,7 +438,6 @@ class ReactionsCog(commands.Cog):
         if self.bot.user:
             raw = raw.replace(self.bot.user.mention, "").strip()
 
-        # 프리토킹 활성 채널에서는 여기서 멘션 대화를 하지 않는다.
         ychat = getattr(self.bot, "yume_chat", None)
         if ychat is not None:
             if hasattr(ychat, "is_active_channel"):
@@ -516,16 +474,11 @@ class ReactionsCog(commands.Cog):
 
         await message.channel.send(reply)
 
-    # -------------------------------
-    # 이벤트 리스너
-    # -------------------------------
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        # 자기 자신, 봇들 무시
         if message.author.bot:
             return
 
-        # 육포 감지
         lowered = message.content.lower()
         if "육포" in lowered or "육포 " in lowered:
             self._block_yukpo(message.author.id, minutes=5)
@@ -538,7 +491,6 @@ class ReactionsCog(commands.Cog):
                 pass
             return
 
-        # 멘션 대화
         if self.bot.user and self.bot.user.mention in message.content:
             await self._handle_mention_chat(message)
 

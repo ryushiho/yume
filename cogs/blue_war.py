@@ -140,7 +140,6 @@ def post_bluewar_match_to_admin(payload: Dict[str, Any]) -> bool:
     if not base_url:
         return False
 
-    # ---- payload sanitize (웹 스키마 호환) ----
     try:
         send_payload = json.loads(json.dumps(payload, ensure_ascii=False))
     except Exception:
@@ -274,7 +273,6 @@ def _load_dooum_map() -> Dict[str, Set[str]]:
         if not extra:
             extra = _parse_dooum_text_as_literal(text)
 
-        # 파일 내용이 비었거나 파싱 실패해도 기본 규칙은 유지
         if extra:
             for k, vs in extra.items():
                 if not k:
@@ -555,7 +553,6 @@ class BlueWarPracticeDifficultyView(discord.ui.View):
         self.selected = label
         self.depth = depth
 
-        # 버튼 토글 표시
         for child in self.children:
             if not isinstance(child, discord.ui.Button):
                 continue
@@ -1071,7 +1068,6 @@ class BlueWarCog(commands.Cog):
         channel = ctx.channel
         guild = ctx.guild
 
-        # 선플레이어는 랜덤
         starter = random.choice([host, opponent])
 
         async def _ask_starter_word(timeout: float = 60.0) -> Optional[str]:
@@ -1125,7 +1121,6 @@ class BlueWarCog(commands.Cog):
             word_history = [start_word]
             current_word = start_word
 
-        # 첫 턴 결정
         if start_mode == "starter_word":
             turn = opponent if starter.id == host.id else host
         else:
@@ -1291,14 +1286,12 @@ class BlueWarCog(commands.Cog):
             await ctx.send("봇은 참가할 수 없어.")
             return
 
-        # PVP 시작 방식 선택 (기본: 랜덤 제시어 = 기존 동작)
         start_mode_view = BlueWarPvpStartModeView(author_id=host.id, timeout=30.0)
         mode_msg = await ctx.send("PVP 시작 방식을 골라줘.", view=start_mode_view)
         await start_mode_view.wait()
 
         start_mode = start_mode_view.mode or "random"  # "random" | "starter_word"
         try:
-            # 버튼 제거 (채팅 정리)
             await mode_msg.edit(view=None)
         except Exception:
             pass

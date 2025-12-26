@@ -17,7 +17,6 @@ def load_words():
             w = line.strip()
             if not w:
                 continue
-            # 한 글자 단어는 사용하지 않음
             if len(w) < 2:
                 continue
             words_set.add(w)
@@ -25,7 +24,6 @@ def load_words():
     for w in words_set:
         words_by_first[w[0]].append(w)
 
-    # 길이 긴 단어 우선 정렬
     for k in words_by_first:
         words_by_first[k].sort(key=len, reverse=True)
 
@@ -33,7 +31,6 @@ def load_words():
     return words_set, words_by_first
 
 
-# 모듈 import 시점에 한 번만 로딩
 WORDS_SET, WORDS_BY_FIRST = load_words()
 
 

@@ -7,8 +7,6 @@ from discord.ext import commands, tasks
 from yume_brain import YumeBrain
 
 
-# KST=UTC+9 기준, 매일 23:59(KST)에 자동 피드백을 보내기 위해
-# 23:59 KST == 14:59 UTC
 DAILY_FEEDBACK_TIME_UTC = datetime.time(hour=14, minute=59)
 
 DAILY_FEEDBACK_CHANNEL_ID = 1438804132613066833  # 요청한 채널 ID
@@ -29,22 +27,17 @@ class YumeDiaryCog(commands.Cog):
         self.bot = bot
         self.brain: Optional[YumeBrain] = None
 
-        # YumeBrain 초기화 시도 (실패해도 Cog은 살아있게)
         try:
             self.brain = YumeBrain()
         except Exception as e:
             print(f"[YumeDiaryCog] YumeBrain 초기화 실패: {e}")
             self.brain = None
 
-        # 자동 피드백 루프 시작
         self.daily_feedback.start()
 
     def cog_unload(self):
         self.daily_feedback.cancel()
 
-    # -----------------------
-    # 내부 헬퍼
-    # -----------------------
 
     def _ensure_brain(self) -> Optional[YumeBrain]:
         if self.brain is not None:
@@ -57,7 +50,6 @@ class YumeDiaryCog(commands.Cog):
         return self.brain
 
     def _get_memory(self):
-        # 감정 코어는 없고, 일기/로그용 메모리만 남아 있을 수 있음
         return getattr(self.bot, "yume_memory", None)
 
     def _short_say(
@@ -113,9 +105,6 @@ class YumeDiaryCog(commands.Cog):
             print(f"[YumeDiaryCog] _short_say 실패(kind={kind}): {e}")
             return fallback
 
-    # -----------------------
-    # 접두어 커맨드들
-    # -----------------------
 
     @commands.command(name="유메일기", help="유메가 오늘 하루를 일기처럼 정리해줘요.")
     async def cmd_yume_diary(self, ctx: commands.Context):
@@ -343,9 +332,6 @@ class YumeDiaryCog(commands.Cog):
 
         await ctx.send(reply)
 
-    # -----------------------
-    # 매일 자동 피드백 (KST 23:59)
-    # -----------------------
 
     @tasks.loop(time=DAILY_FEEDBACK_TIME_UTC)
     async def daily_feedback(self):

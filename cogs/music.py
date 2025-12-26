@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import json
 import time
 import re
+import bisect
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote
@@ -18,25 +21,13 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 
-# ==============================
-# 패널 고정 설정 저장소
-# ==============================
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 STORAGE_DIR = os.path.join(ROOT_DIR, "data", "storage")
 PANEL_CFG_PATH = os.path.join(STORAGE_DIR, "music_panel.json")
+FX_CFG_PATH = os.path.join(STORAGE_DIR, "music_fx.json")
 
 
-# ==============================
-# YouTube / ffmpeg 설정
-# ==============================
-#
-# ⚠️ 재생이 안 되는 주요 원인:
-# - yt_dlp 검색 결과(entry)에서 entry["url"]을 바로 쓰면 "직접 스트림 URL"이 아닌 경우가 많다.
-# - 그래서 "검색/추가 단계"에서는 webpage_url만 확보하고,
-#   "재생 직전"에 webpage_url로 다시 extract 해서 bestaudio 스트림 URL을 해상(resolution)한다.
-#
-# 이 구조가 실서버에서 가장 안정적이다.
 
 YTDL_OPTS = {
     "format": "bestaudio/best",
@@ -53,9 +44,6 @@ FFMPEG_EXECUTABLE = os.getenv("YUME_FFMPEG_PATH", "ffmpeg")
 _ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
 
 
-# ==============================
-# 내부 데이터 구조
-# ==============================
 
 @dataclass
 class _Track:
@@ -63,7 +51,6 @@ class _Track:
     webpage_url: str
     requester_id: Optional[int] = None
 
-    # 재생 직전에 해상한 실제 스트림 URL (짧은 시간만 유효할 수 있어서 캐시하되 과신 금지)
     _resolved_stream_url: Optional[str] = None
     _resolved_at: float = 0.0
 
@@ -92,7 +79,6 @@ def _select_best_audio_url(entry: dict) -> Optional[str]:
     """
     yt_dlp 결과(entry)에서 ffmpeg가 재생 가능한 bestaudio URL을 고른다.
     """
-    # 1) formats에서 audio-only 후보 선별
     formats = entry.get("formats") or []
     audio_only = []
     for f in formats:
@@ -101,7 +87,6 @@ def _select_best_audio_url(entry: dict) -> Optional[str]:
                 continue
             if f.get("url") is None:
                 continue
-            # audio-only
             if f.get("vcodec") != "none":
                 continue
             if f.get("acodec") in (None, "none"):
@@ -110,7 +95,6 @@ def _select_best_audio_url(entry: dict) -> Optional[str]:
         except Exception:
             continue
 
-    # 2) 품질(abr/tbr)을 기준으로 best 선택
     def _score(f: dict) -> Tuple[float, float]:
         abr = f.get("abr")
         tbr = f.get("tbr")
@@ -122,7 +106,6 @@ def _select_best_audio_url(entry: dict) -> Optional[str]:
         best = max(audio_only, key=_score)
         return str(best.get("url"))
 
-    # 3) fallback: entry["url"] (가끔 여기만 있는 경우)
     url = entry.get("url")
     if url:
         return str(url)
@@ -130,14 +113,92 @@ def _select_best_audio_url(entry: dict) -> Optional[str]:
     return None
 
 
-def _ffmpeg_source(stream_url: str, volume: float) -> discord.AudioSource:
+def _ffmpeg_source(stream_url: str, volume: float, *, af_filters: Optional[str] = None) -> discord.AudioSource:
+    """FFmpeg 오디오 소스 생성.
+
+    af_filters가 주어지면 -af로 필터 체인을 적용한다.
+    (이퀄라이저/리버브 같은 FX는 여기서 처리)
+    """
+    options = FFMPEG_OPTIONS
+    if af_filters:
+        options = f"{options} -af {af_filters}"
+
     src = discord.FFmpegPCMAudio(
         stream_url,
         executable=FFMPEG_EXECUTABLE,
         before_options=FFMPEG_BEFORE,
-        options=FFMPEG_OPTIONS,
+        options=options,
     )
     return discord.PCMVolumeTransformer(src, volume=volume)
+
+
+
+LRCLIB_API_BASE = "https://lrclib.net/api/get"
+
+_TAG_LINE_RE = re.compile(r"^\s*\[(ar|ti|al|by|offset):", re.IGNORECASE)
+_TS_RE = re.compile(r"\[(\d+):(\d+)(?:\.(\d+))?\]")
+
+def _clean_title(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s*\[[^\]]+\]\s*$", "", s)
+    s = re.sub(r"\s*\([^\)]+\)\s*$", "", s)
+    s = re.sub(r"\s*(official|mv|m/v|audio|video|lyrics?)\s*$", "", s, flags=re.IGNORECASE)
+    return s.strip()
+
+def _guess_artist_title(raw_title: str) -> Tuple[str, Optional[str]]:
+    """
+    LRCLIB 검색에 쓸 (track_name, artist_name)를 최대한 그럴듯하게 뽑는다.
+    - 'Artist - Title' 형태를 우선으로 본다.
+    - 없으면 track_name만 반환.
+    """
+    t = _clean_title(raw_title)
+    for sep in (" - ", " — ", " – ", " | ", " · "):
+        if sep in t:
+            left, right = t.split(sep, 1)
+            left = left.strip()
+            right = right.strip()
+            if 1 <= len(left) <= 40 and len(right) >= 1:
+                return (_clean_title(right), _clean_title(left) or None)
+            return (_clean_title(left), _clean_title(right) or None)
+    return (t, None)
+
+def _parse_lrc(lrc_text: str) -> List[Tuple[float, str]]:
+    """
+    LRC 텍스트 -> [(sec, line), ...] 로 파싱.
+    - 한 줄에 여러 timestamp가 있으면 각각 분해해서 동일 가사를 매핑한다.
+    """
+    out: List[Tuple[float, str]] = []
+    if not lrc_text:
+        return out
+
+    for raw_line in lrc_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if _TAG_LINE_RE.match(line):
+            continue
+
+        stamps = list(_TS_RE.finditer(line))
+        if not stamps:
+            continue
+
+        lyric = _TS_RE.sub("", line).strip()
+        if not lyric:
+            continue
+
+        for m in stamps:
+            mm = int(m.group(1))
+            ss = int(m.group(2))
+            frac = m.group(3)
+            ms = 0.0
+            if frac:
+                denom = 10 ** len(frac)
+                ms = int(frac) / denom
+            sec = float(mm * 60 + ss) + ms
+            out.append((sec, lyric))
+
+    out.sort(key=lambda x: x[0])
+    return out
 
 
 class MusicState:
@@ -146,31 +207,50 @@ class MusicState:
         self.now_playing: Optional[_Track] = None
         self.player_task: Optional[asyncio.Task] = None
 
-        # 길드별 큐/상태 조작 보호
+        self.play_started_at: float = 0.0  # loop.time() 기준
+        self.paused_at: Optional[float] = None
+        self.paused_total: float = 0.0
+
         self.lock: asyncio.Lock = asyncio.Lock()
 
-        # 자동 퇴장(유메만 남았을 때) 예약 태스크
         self.auto_leave_task: Optional[asyncio.Task] = None
 
-        # 0~2.0 (0~200%)
         self.volume: float = 1.0
         self.loop_all: bool = False
 
-        # 버튼 액션으로 트랙을 멈췄을 때(스킵/정지) 루프 재큐잉을 한 번 막는다.
+        self.fx_eq_enabled: bool = False
+        self.fx_bass_db: float = 0.0
+        self.fx_mid_db: float = 0.0
+        self.fx_treble_db: float = 0.0
+        self.fx_preamp_db: float = 0.0
+
+        self.fx_reverb_enabled: bool = False
+        self.fx_reverb_mix: int = 0      # 0~100
+        self.fx_reverb_room: int = 50    # 0~100
+
+        self.fx_tune_enabled: bool = False
+        self.fx_tune_semitones: float = 0.0  # -12.0 ~ +12.0 (소수 허용)
+
+        self.fx_eq_preset: str = "off"
+        self.fx_reverb_level: int = 0
+
         self._suppress_requeue_once: bool = False
 
-        # 마지막 오류(패널에 짧게 표시)
         self.last_error: Optional[str] = None
         self.last_error_at: float = 0.0
 
-        # 패널 메시지(서버 설정이 없을 때 임시로 사용)
         self.temp_panel_channel_id: Optional[int] = None
         self.temp_panel_message_id: Optional[int] = None
 
+        self.lyrics_enabled: bool = False
+        self.lyrics_task: Optional[asyncio.Task] = None
+        self.lyrics_channel_id: Optional[int] = None
+        self.lyrics_message_id: Optional[int] = None
+        self.lyrics_cache: Dict[str, List[Tuple[float, str]]] = {}
+        self._lyrics_last_track_key: Optional[str] = None
+        self._lyrics_last_render_key: Optional[str] = None
 
-# ==============================
-# UI (패널 / 버튼)
-# ==============================
+
 
 class YouTubeAddModal(discord.ui.Modal):
     def __init__(self, cog: "MusicCog"):
@@ -196,8 +276,8 @@ class SpotifyAddModal(discord.ui.Modal):
         self.cog = cog
 
         self.query = discord.ui.TextInput(
-            label="Spotify 트랙 URL 또는 검색어",
-            placeholder="예: https://open.spotify.com/track/...",
+            label="Spotify 트랙/플레이리스트 URL 또는 검색어",
+            placeholder="예: https://open.spotify.com/playlist/... 또는 track/...",
             required=True,
             max_length=200,
         )
@@ -226,6 +306,135 @@ class VolumeModal(discord.ui.Modal):
         await self.cog._set_volume_from_interaction(interaction, raw)
 
 
+
+
+def _clamp_float(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def _clamp_int(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, v))
+
+
+def _parse_float(s: str, *, default: float, lo: float, hi: float) -> float:
+    try:
+        v = float(str(s).strip())
+    except Exception:
+        v = float(default)
+    return _clamp_float(v, lo, hi)
+
+
+def _parse_int(s: str, *, default: int, lo: int, hi: int) -> int:
+    try:
+        v = int(float(str(s).strip()))
+    except Exception:
+        v = int(default)
+    return _clamp_int(v, lo, hi)
+
+
+class EQSettingsModal(discord.ui.Modal):
+    title = "EQ 설정"
+
+    def __init__(self, cog: "MusicCog", guild_id: int):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.guild_id = guild_id
+
+        st = cog._state(guild_id)
+        self.bass = discord.ui.TextInput(
+            label="Bass dB (-12 ~ +12)",
+            placeholder="예) 6",
+            required=False,
+            default=str(st.fx_bass_db),
+            max_length=16,
+        )
+        self.mid = discord.ui.TextInput(
+            label="Mid dB (-12 ~ +12)",
+            placeholder="예) 0",
+            required=False,
+            default=str(st.fx_mid_db),
+            max_length=16,
+        )
+        self.treble = discord.ui.TextInput(
+            label="Treble dB (-12 ~ +12)",
+            placeholder="예) 2",
+            required=False,
+            default=str(st.fx_treble_db),
+            max_length=16,
+        )
+        self.preamp = discord.ui.TextInput(
+            label="Preamp dB (-12 ~ +12)",
+            placeholder="예) -1",
+            required=False,
+            default=str(st.fx_preamp_db),
+            max_length=16,
+        )
+        self.add_item(self.bass)
+        self.add_item(self.mid)
+        self.add_item(self.treble)
+        self.add_item(self.preamp)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        bass = _parse_float(self.bass.value, default=0.0, lo=-12.0, hi=12.0)
+        mid = _parse_float(self.mid.value, default=0.0, lo=-12.0, hi=12.0)
+        treble = _parse_float(self.treble.value, default=0.0, lo=-12.0, hi=12.0)
+        preamp = _parse_float(self.preamp.value, default=0.0, lo=-12.0, hi=12.0)
+        await self.cog._set_eq_settings(interaction, guild_id=self.guild_id, bass=bass, mid=mid, treble=treble, preamp=preamp)
+
+
+class ReverbSettingsModal(discord.ui.Modal):
+    title = "리버브 설정"
+
+    def __init__(self, cog: "MusicCog", guild_id: int):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.guild_id = guild_id
+
+        st = cog._state(guild_id)
+        self.mix = discord.ui.TextInput(
+            label="Mix (0~100)",
+            placeholder="예) 20",
+            required=False,
+            default=str(st.fx_reverb_mix),
+            max_length=16,
+        )
+        self.room = discord.ui.TextInput(
+            label="Room (0~100)",
+            placeholder="예) 60",
+            required=False,
+            default=str(st.fx_reverb_room),
+            max_length=16,
+        )
+        self.add_item(self.mix)
+        self.add_item(self.room)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        mix = _parse_int(self.mix.value, default=0, lo=0, hi=100)
+        room = _parse_int(self.room.value, default=50, lo=0, hi=100)
+        await self.cog._set_reverb_settings(interaction, guild_id=self.guild_id, mix=mix, room=room)
+
+
+class TuneSettingsModal(discord.ui.Modal):
+    title = "튠(피치) 설정"
+
+    def __init__(self, cog: "MusicCog", guild_id: int):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.guild_id = guild_id
+
+        st = cog._state(guild_id)
+        self.semi = discord.ui.TextInput(
+            label="Semitone (-12.0 ~ +12.0)",
+            placeholder="예) 2  /  -3.5",
+            required=False,
+            default=str(st.fx_tune_semitones),
+            max_length=16,
+        )
+        self.add_item(self.semi)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        semi = _parse_float(self.semi.value, default=0.0, lo=-12.0, hi=12.0)
+        await self.cog._set_tune_settings(interaction, guild_id=self.guild_id, semitones=semi)
 class MusicPanelView(discord.ui.View):
     """패널은 재부팅 이후에도 버튼이 살아있도록(퍼시스턴트) timeout=None로 유지."""
 
@@ -233,7 +442,6 @@ class MusicPanelView(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
 
-    # 🔴 YouTube 추가 (빨간색)
     @discord.ui.button(
         label="YouTube",
         style=discord.ButtonStyle.danger,
@@ -244,7 +452,6 @@ class MusicPanelView(discord.ui.View):
     async def youtube_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await interaction.response.send_modal(YouTubeAddModal(self.cog))
 
-    # 🟢 Spotify 추가 (연두색)
     @discord.ui.button(
         label="Spotify",
         style=discord.ButtonStyle.success,
@@ -255,7 +462,6 @@ class MusicPanelView(discord.ui.View):
     async def spotify_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await interaction.response.send_modal(SpotifyAddModal(self.cog))
 
-    # ⏯ 재생/일시정지
     @discord.ui.button(
         label="재생/일시정지",
         style=discord.ButtonStyle.secondary,
@@ -266,7 +472,6 @@ class MusicPanelView(discord.ui.View):
     async def toggle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._toggle_pause(interaction)
 
-    # ⏭ 스킵
     @discord.ui.button(
         label="스킵",
         style=discord.ButtonStyle.secondary,
@@ -277,7 +482,6 @@ class MusicPanelView(discord.ui.View):
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._skip(interaction)
 
-    # 🔊 음량 모달
     @discord.ui.button(
         label="음량",
         style=discord.ButtonStyle.secondary,
@@ -291,7 +495,6 @@ class MusicPanelView(discord.ui.View):
         st = self.cog._state(interaction.guild.id)
         await interaction.response.send_modal(VolumeModal(self.cog, int(st.volume * 100)))
 
-    # 🔁 반복 토글
     @discord.ui.button(
         label="반복",
         style=discord.ButtonStyle.secondary,
@@ -302,7 +505,6 @@ class MusicPanelView(discord.ui.View):
     async def loop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._toggle_loop(interaction)
 
-    # 🔀 셔플
     @discord.ui.button(
         label="셔플",
         style=discord.ButtonStyle.secondary,
@@ -313,7 +515,6 @@ class MusicPanelView(discord.ui.View):
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._shuffle(interaction)
 
-    # ⏹ 정지
     @discord.ui.button(
         label="정지",
         style=discord.ButtonStyle.danger,
@@ -324,7 +525,6 @@ class MusicPanelView(discord.ui.View):
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._stop(interaction)
 
-    # 🧰 큐 관리
     @discord.ui.button(
         label="큐 관리",
         style=discord.ButtonStyle.secondary,
@@ -334,7 +534,6 @@ class MusicPanelView(discord.ui.View):
     )
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._open_queue_manage(interaction)
-
 
 
 class QueueDeleteModal(discord.ui.Modal):
@@ -373,6 +572,8 @@ class QueuePriorityModal(discord.ui.Modal):
         await self.cog._queue_priority_from_modal(interaction, str(self.target.value))
 
 
+
+
 class QueueManageView(discord.ui.View):
     """큐 관리(토글 메뉴)."""
 
@@ -380,7 +581,6 @@ class QueueManageView(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
 
-    # 🔀 큐 셔플
     @discord.ui.button(
         label="큐 셔플",
         style=discord.ButtonStyle.secondary,
@@ -391,7 +591,6 @@ class QueueManageView(discord.ui.View):
     async def q_shuffle(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._queue_manage_shuffle(interaction)
 
-    # 🗑️ 큐 삭제(번호 입력)
     @discord.ui.button(
         label="큐 삭제",
         style=discord.ButtonStyle.danger,
@@ -403,13 +602,11 @@ class QueueManageView(discord.ui.View):
         try:
             await interaction.response.send_modal(QueueDeleteModal(self.cog))
         except Exception:
-            # modal 실패 시 안내
             try:
                 await interaction.response.send_message("지금은 입력창을 열 수 없어…", ephemeral=True)
             except Exception:
                 pass
 
-    # ⏫ 맨 위로
     @discord.ui.button(
         label="맨 위로",
         style=discord.ButtonStyle.secondary,
@@ -426,7 +623,6 @@ class QueueManageView(discord.ui.View):
             except Exception:
                 pass
 
-    # 🧹 중복 정리
     @discord.ui.button(
         label="중복정리",
         style=discord.ButtonStyle.secondary,
@@ -437,7 +633,124 @@ class QueueManageView(discord.ui.View):
     async def q_dedupe(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._queue_dedupe(interaction)
 
-    # ↩️ 돌아가기
+    @discord.ui.button(
+        label="가사",
+        style=discord.ButtonStyle.secondary,
+        emoji="🎤",
+        custom_id="yume_music_lyrics",
+        row=1,
+    )
+    async def lyrics_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        await self.cog._toggle_lyrics(interaction)
+
+    @discord.ui.button(
+        label="EQ",
+        style=discord.ButtonStyle.secondary,
+        emoji="🎚️",
+        custom_id="yume_music_fx",
+        row=1,
+    )
+    async def fx_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        await self.cog._toggle_eq(interaction)
+
+    @discord.ui.button(
+        label="EQ 설정",
+        style=discord.ButtonStyle.secondary,
+        emoji="⚙️",
+        custom_id="yume_music_eq_settings",
+        row=1,
+    )
+    async def eq_settings_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        guild = interaction.guild
+        if guild is None:
+            try:
+                await interaction.response.send_message("서버에서만 사용할 수 있어.", ephemeral=True)
+            except Exception:
+                pass
+            return
+        try:
+            await interaction.response.send_modal(EQSettingsModal(self.cog, guild.id))
+        except Exception:
+            try:
+                await interaction.followup.send("지금은 입력창을 열 수 없어…", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(
+        label="리버브",
+        style=discord.ButtonStyle.secondary,
+        emoji="🌊",
+        custom_id="yume_music_reverb",
+        row=1,
+    )
+    async def reverb_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        await self.cog._toggle_reverb(interaction)
+
+    @discord.ui.button(
+        label="리버브 설정",
+        style=discord.ButtonStyle.secondary,
+        emoji="⚙️",
+        custom_id="yume_music_reverb_settings",
+        row=1,
+    )
+    async def reverb_settings_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        guild = interaction.guild
+        if guild is None:
+            try:
+                await interaction.response.send_message("서버에서만 사용할 수 있어.", ephemeral=True)
+            except Exception:
+                pass
+            return
+        try:
+            await interaction.response.send_modal(ReverbSettingsModal(self.cog, guild.id))
+        except Exception:
+            try:
+                await interaction.followup.send("지금은 입력창을 열 수 없어…", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(
+        label="튠",
+        style=discord.ButtonStyle.secondary,
+        emoji="🎛️",
+        custom_id="yume_music_tune",
+        row=2,
+    )
+    async def tune_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        await self.cog._toggle_tune(interaction)
+
+    @discord.ui.button(
+        label="튠 설정",
+        style=discord.ButtonStyle.secondary,
+        emoji="⚙️",
+        custom_id="yume_music_tune_settings",
+        row=2,
+    )
+    async def tune_settings_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        guild = interaction.guild
+        if guild is None:
+            try:
+                await interaction.response.send_message("서버에서만 사용할 수 있어.", ephemeral=True)
+            except Exception:
+                pass
+            return
+        try:
+            await interaction.response.send_modal(TuneSettingsModal(self.cog, guild.id))
+        except Exception:
+            try:
+                await interaction.followup.send("지금은 입력창을 열 수 없어…", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(
+        label="FX 초기화",
+        style=discord.ButtonStyle.danger,
+        emoji="🧼",
+        custom_id="yume_music_fx_reset",
+        row=2,
+    )
+    async def fx_reset_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        await self.cog._reset_fx(interaction)
     @discord.ui.button(
         label="돌아가기",
         style=discord.ButtonStyle.primary,
@@ -449,9 +762,6 @@ class QueueManageView(discord.ui.View):
         await self.cog._back_to_main_panel(interaction)
 
 
-# ==============================
-# Cog
-# ==============================
 
 class MusicCog(commands.Cog):
     """
@@ -464,24 +774,29 @@ class MusicCog(commands.Cog):
         self.bot = bot
         self._states: Dict[int, MusicState] = {}
 
-        # 길드별 패널 고정 설정(guild_id -> {channel_id, message_id})
         self._panel_cfg: Dict[str, Dict[str, int]] = self._load_panel_config()
         self._panel_cfg_lock = asyncio.Lock()
+        self._fx_cfg = self._load_fx_cfg()
+        self._fx_cfg_lock = asyncio.Lock()
+        self._ffmpeg_filters = self._detect_ffmpeg_filters()
         self._restore_task: Optional[asyncio.Task] = None
 
-        # 재부팅 후에도 버튼이 살아있도록 등록할 퍼시스턴트 뷰
         self.panel_view = MusicPanelView(self)
         self.queue_view = QueueManageView(self)
 
+        self._spotify_client_id = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
+        self._spotify_client_secret = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
+        self._spotify_token: Optional[str] = None
+        self._spotify_token_exp: float = 0.0
+        self._spotify_token_lock: asyncio.Lock = asyncio.Lock()
+
     async def cog_load(self):
-        # 봇이 준비된 뒤, 지정된 음악 채널에 패널을 복구한다.
         self._restore_task = asyncio.create_task(self._restore_fixed_panels())
 
     async def cog_unload(self):
         if self._restore_task and not self._restore_task.done():
             self._restore_task.cancel()
 
-        # 남아있는 자동퇴장/플레이어 태스크 정리
         for st in self._states.values():
             try:
                 if st.auto_leave_task and not st.auto_leave_task.done():
@@ -494,13 +809,11 @@ class MusicCog(commands.Cog):
             except Exception:
                 pass
 
-    # -------------------------------
-    # State
-    # -------------------------------
     def _state(self, guild_id: int) -> MusicState:
         st = self._states.get(guild_id)
         if st is None:
             st = MusicState()
+            self._apply_fx_cfg_to_state(guild_id, st)
             self._states[guild_id] = st
         return st
 
@@ -509,9 +822,6 @@ class MusicCog(commands.Cog):
         st.last_error = msg[:160]
         st.last_error_at = time.time()
 
-    # -------------------------------
-    # Fixed panel config (guild-level)
-    # -------------------------------
     def _load_panel_config(self) -> Dict[str, Dict[str, int]]:
         try:
             if not os.path.exists(PANEL_CFG_PATH):
@@ -571,7 +881,6 @@ class MusicCog(commands.Cog):
 
     async def _restore_fixed_panels(self):
         await self.bot.wait_until_ready()
-        # 캐시가 안정될 시간을 살짝 준다.
         await asyncio.sleep(1)
 
         for gid_str, v in list(self._panel_cfg.items()):
@@ -611,9 +920,6 @@ class MusicCog(commands.Cog):
             except Exception as e:
                 logger.warning("[Music] panel restore error: %s", e)
 
-    # -------------------------------
-    # Voice connect helpers
-    # -------------------------------
     async def _ensure_voice_ctx(self, ctx: commands.Context) -> Optional[discord.VoiceClient]:
         if ctx.guild is None:
             await ctx.send("서버 채널에서만 쓸 수 있어.")
@@ -646,7 +952,6 @@ class MusicCog(commands.Cog):
         vc = interaction.guild.voice_client
         try:
             if vc and vc.is_connected():
-                # 버튼 누른 사람이 다른 채널이면 그 채널로 이동
                 if vc.channel and vc.channel.id != interaction.user.voice.channel.id:
                     await vc.move_to(interaction.user.voice.channel)
             else:
@@ -657,14 +962,153 @@ class MusicCog(commands.Cog):
 
         return vc
 
-    # -------------------------------
-    # Stream resolve (핵심)
-    # -------------------------------
+    def _parse_spotify(self, s: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        return: (kind, id)  kind in {"track","playlist"}.
+        지원:
+          - https://open.spotify.com/track/{id}
+          - https://open.spotify.com/playlist/{id}
+          - spotify:track:{id}
+          - spotify:playlist:{id}
+        """
+        s = (s or "").strip()
+        if not s:
+            return (None, None)
+
+        if s.startswith("spotify:track:"):
+            return ("track", s.split(":")[-1].strip() or None)
+        if s.startswith("spotify:playlist:"):
+            return ("playlist", s.split(":")[-1].strip() or None)
+
+        m = re.search(r"open\.spotify\.com/(track|playlist)/([A-Za-z0-9]+)", s)
+        if not m:
+            return (None, None)
+        return (m.group(1), m.group(2))
+
+    def _spotify_enabled(self) -> bool:
+        return bool(self._spotify_client_id and self._spotify_client_secret)
+
+    async def _spotify_get_token(self, session: aiohttp.ClientSession) -> Optional[str]:
+        now = time.time()
+        if self._spotify_token and now < (self._spotify_token_exp - 30):
+            return self._spotify_token
+
+        async with self._spotify_token_lock:
+            now = time.time()
+            if self._spotify_token and now < (self._spotify_token_exp - 30):
+                return self._spotify_token
+
+            if not self._spotify_enabled():
+                return None
+
+            basic = base64.b64encode(f"{self._spotify_client_id}:{self._spotify_client_secret}".encode("utf-8")).decode("ascii")
+            url = "https://accounts.spotify.com/api/token"
+            data = {"grant_type": "client_credentials"}
+
+            try:
+                async with session.post(url, data=data, headers={"Authorization": f"Basic {basic}"}) as r:
+                    if r.status != 200:
+                        return None
+                    js = await r.json()
+            except Exception:
+                return None
+
+            access = str(js.get("access_token") or "")
+            expires_in = int(js.get("expires_in") or 0)
+            if not access or expires_in <= 0:
+                return None
+
+            self._spotify_token = access
+            self._spotify_token_exp = time.time() + expires_in
+            return access
+
+    async def _spotify_api_get(self, session: aiohttp.ClientSession, url: str) -> Optional[dict]:
+        tok = await self._spotify_get_token(session)
+        if not tok:
+            return None
+        try:
+            async with session.get(url, headers={"Authorization": f"Bearer {tok}"}) as r:
+                if r.status != 200:
+                    return None
+                return await r.json()
+        except Exception:
+            return None
+
+    async def _spotify_track_query(self, session: aiohttp.ClientSession, track_id: str, fallback_url: str) -> str:
+        """
+        트랙을 (곡명 + 아티스트) 검색어로 변환.
+        API가 있으면 API 우선, 없으면 oEmbed로 best-effort.
+        """
+        if self._spotify_enabled():
+            js = await self._spotify_api_get(session, f"https://api.spotify.com/v1/tracks/{track_id}")
+            if js:
+                name = str(js.get("name") or "").strip()
+                artists = js.get("artists") or []
+                artist = str(artists[0].get("name") or "").strip() if artists else ""
+                q = f"{name} {artist}".strip()
+                return q or fallback_url
+
+        oembed = f"https://open.spotify.com/oembed?url={quote(fallback_url, safe='')}"
+        try:
+            async with session.get(oembed, headers={"User-Agent": "YumeBot"}) as r:
+                if r.status != 200:
+                    return fallback_url
+                data = await r.json()
+        except Exception:
+            return fallback_url
+
+        title = str(data.get("title") or "").strip()
+        author = str(data.get("author_name") or "").strip()
+        if not title:
+            return fallback_url
+        if author and author.lower() not in title.lower():
+            return f"{title} {author}"
+        return title
+
+    async def _spotify_playlist_queries(self, session: aiohttp.ClientSession, playlist_id: str) -> Optional[List[str]]:
+        """
+        Spotify 플레이리스트 -> ['곡명 아티스트', ...]
+        API 없으면 None 반환(안정성 위해).
+        """
+        if not self._spotify_enabled():
+            return None
+
+        try:
+            max_n = int(os.getenv("YUME_SPOTIFY_IMPORT_MAX", "50"))
+        except Exception:
+            max_n = 50
+        max_n = max(1, min(200, max_n))
+
+        out: List[str] = []
+        url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks?limit=100"
+
+        while url and len(out) < max_n:
+            js = await self._spotify_api_get(session, url)
+            if not js:
+                break
+            items = js.get("items") or []
+            for it in items:
+                tr = (it or {}).get("track") or {}
+                name = str(tr.get("name") or "").strip()
+                artists = tr.get("artists") or []
+                artist = str(artists[0].get("name") or "").strip() if artists else ""
+                q = f"{name} {artist}".strip()
+                if q:
+                    out.append(q)
+                if len(out) >= max_n:
+                    break
+            url = js.get("next")
+
+        return out
+
     async def _resolve_stream_url(self, track: _Track) -> Optional[str]:
         """
-        track.webpage_url로 yt_dlp를 다시 돌려 "진짜 재생 가능한 오디오 스트림 URL"을 얻는다.
+        track.webpage_url(유튜브 URL 또는 ytsearch1:...)로 yt_dlp를 돌려
+        "진짜 ffmpeg가 재생 가능한 오디오 스트림 URL"을 얻는다.
+
+        Phase2: playlist는 ytsearch1:로 큐에 들어갈 수 있으므로,
+        1차 extract에서 URL이 http(s)가 아니면(=id 등) 2차 extract로 formats 확보한다.
         """
-        # 짧은 캐시(30초): 스킵/재시작 같은 경우만 이득. 너무 길게 잡으면 URL 만료 위험.
         if track._resolved_stream_url and (time.time() - track._resolved_at) < 30:
             return track._resolved_stream_url
 
@@ -673,19 +1117,37 @@ class MusicCog(commands.Cog):
             entry = _pick_entry(info)
             if not entry:
                 return None
+
+            try:
+                real_title = entry.get("title")
+                real_page = entry.get("webpage_url") or entry.get("original_url")
+                if real_title and isinstance(real_title, str):
+                    track.title = real_title
+                if real_page and isinstance(real_page, str) and real_page.startswith("http"):
+                    track.webpage_url = real_page
+            except Exception:
+                pass
+
             url = _select_best_audio_url(entry)
-            if not url:
+
+            if not url or not re.match(r"^https?://", str(url)):
+                page = entry.get("webpage_url") or entry.get("original_url")
+                if page and page != track.webpage_url:
+                    info2 = await _extract_info(str(page))
+                    entry2 = _pick_entry(info2) or info2
+                    url = _select_best_audio_url(entry2)
+
+            if not url or not re.match(r"^https?://", str(url)):
                 return None
-            track._resolved_stream_url = url
+
+            track._resolved_stream_url = str(url)
             track._resolved_at = time.time()
-            return url
+            return track._resolved_stream_url
+
         except Exception as e:
             logger.warning("[Music] resolve error: %s", e)
             return None
 
-    # -------------------------------
-    # Player loop
-    # -------------------------------
     async def _player_loop(self, guild_id: int):
         st = self._state(guild_id)
 
@@ -701,12 +1163,10 @@ class MusicCog(commands.Cog):
             guild = self.bot.get_guild(guild_id)
             vc = guild.voice_client if guild else None
 
-            # 보이스가 없으면 트랙 버리고 다음
             if vc is None or not vc.is_connected():
                 st.now_playing = None
                 continue
 
-            # 재생 직전: 스트림 URL 해상
             stream_url = await self._resolve_stream_url(track)
             if not stream_url:
                 self._set_error(guild_id, "재생 URL을 해상하지 못했어(yt-dlp).")
@@ -714,7 +1174,6 @@ class MusicCog(commands.Cog):
                 await self._refresh_panel(guild_id)
                 continue
 
-            # 패널 업데이트(재생 시작)
             await self._refresh_panel(guild_id)
 
             done = asyncio.Event()
@@ -729,7 +1188,14 @@ class MusicCog(commands.Cog):
                     pass
 
             try:
-                src = _ffmpeg_source(stream_url, volume=st.volume)
+                src = _ffmpeg_source(stream_url, volume=st.volume, af_filters=self._build_af_filters(st))
+
+                st.play_started_at = self.bot.loop.time()
+                st.paused_at = None
+                st.paused_total = 0.0
+
+                await self._lyrics_on_track_start(guild_id)
+
                 vc.play(src, after=_after)
                 await done.wait()
 
@@ -741,7 +1207,6 @@ class MusicCog(commands.Cog):
                 finished = st.now_playing
                 st.now_playing = None
 
-                # 루프(큐 반복) 옵션: 스킵/정지로 멈춘 경우엔 한 번 재큐잉을 막는다.
                 if st.loop_all and finished is not None and not st._suppress_requeue_once:
                     try:
                         await st.queue.put(finished)
@@ -757,9 +1222,26 @@ class MusicCog(commands.Cog):
             return
         st.player_task = asyncio.create_task(self._player_loop(guild_id))
 
-    # -------------------------------
-    # Panel render/update
-    # -------------------------------
+
+
+    def _fx_summary(self, st: MusicState) -> str:
+        parts = []
+        if st.fx_eq_enabled and (abs(st.fx_bass_db) > 0.01 or abs(st.fx_mid_db) > 0.01 or abs(st.fx_treble_db) > 0.01 or abs(st.fx_preamp_db) > 0.01):
+            parts.append(f"EQ ON (B{st.fx_bass_db:+.0f} M{st.fx_mid_db:+.0f} T{st.fx_treble_db:+.0f} P{st.fx_preamp_db:+.0f})")
+        else:
+            parts.append("EQ OFF")
+
+        if st.fx_reverb_enabled and int(st.fx_reverb_mix) > 0:
+            parts.append(f"RVB {int(st.fx_reverb_mix)}%/{int(st.fx_reverb_room)}%")
+        else:
+            parts.append("RVB OFF")
+
+        if st.fx_tune_enabled and abs(st.fx_tune_semitones) > 0.01:
+            parts.append(f"TUNE {st.fx_tune_semitones:+.1f}")
+        else:
+            parts.append("TUNE 0")
+
+        return " | ".join(parts)
     def _build_embed(self, guild: discord.Guild) -> discord.Embed:
         """음악 패널 임베드(깔끔/고정용)."""
         st = self._state(guild.id)
@@ -774,7 +1256,7 @@ class MusicCog(commands.Cog):
             color=discord.Color.blurple(),
         )
 
-        if now_url:
+        if now_url and isinstance(now_url, str) and now_url.startswith("http"):
             embed.add_field(name="🎧 지금 재생", value=f"[{now_title}]({now_url})", inline=False)
         else:
             embed.add_field(name="🎧 지금 재생", value=now_title, inline=False)
@@ -782,6 +1264,7 @@ class MusicCog(commands.Cog):
         embed.add_field(name="📃 큐", value=f"{st.queue.qsize()}곡", inline=True)
         embed.add_field(name="🔁 반복", value="ON" if st.loop_all else "OFF", inline=True)
         embed.add_field(name="🔊 볼륨", value=f"{int(st.volume * 100)}%", inline=True)
+        embed.add_field(name="🎚️ FX", value=self._fx_summary(st), inline=True)
 
         if vc and vc.is_connected() and vc.channel:
             embed.add_field(name="🔊 음성 채널", value=vc.channel.name, inline=False)
@@ -809,7 +1292,6 @@ class MusicCog(commands.Cog):
         guild = ch.guild
         embed = self._build_embed(guild)
 
-        # 현재 저장된 message_id
         msg_id: Optional[int] = None
         if fixed:
             _, msg_id = self._fixed_panel(guild_id)
@@ -850,7 +1332,7 @@ class MusicCog(commands.Cog):
         force_create_when_transient: bool = False,
     ):
         """고정 패널이 있으면 그걸 갱신, 없으면 힌트/임시 패널을 갱신."""
-        fixed_channel_id, fixed_msg_id = self._fixed_panel(guild_id)
+        fixed_channel_id, _ = self._fixed_panel(guild_id)
         if fixed_channel_id:
             await self._ensure_panel_message(guild_id, fixed_channel_id, fixed=True)
             return
@@ -866,16 +1348,11 @@ class MusicCog(commands.Cog):
         await self._ensure_panel_message(guild_id, channel_id, fixed=False)
 
     async def _refresh_from_interaction(self, interaction: discord.Interaction):
-        """예전 코드 호환용: 버튼/모달에서 패널 갱신."""
         if interaction.guild is None:
             return
         await self._refresh_panel(interaction.guild.id, hint_channel_id=interaction.channel_id)
 
-    # -------------------------------
-    # Queue operations
-    # -------------------------------
     async def _enqueue_from_interaction(self, interaction: discord.Interaction, query: str):
-        # 모달 제출에서 호출될 수 있으므로 우선 defer 후 followup로 처리한다.
         try:
             await interaction.response.defer(ephemeral=True)
         except Exception:
@@ -894,7 +1371,6 @@ class MusicCog(commands.Cog):
 
         vc = await self._ensure_voice_interaction(interaction)
         if not vc:
-            # 유저가 음성에 없거나 / 연결 실패
             in_voice = isinstance(interaction.user, discord.Member) and interaction.user.voice and interaction.user.voice.channel
             msg = "먼저 음성 채널에 들어가줘." if not in_voice else "음성 채널에 연결하지 못했어."
             try:
@@ -913,7 +1389,6 @@ class MusicCog(commands.Cog):
             title = str(entry.get("title") or "제목 없음")
             webpage_url = str(entry.get("webpage_url") or entry.get("original_url") or q)
 
-            # 핵심: 여기서는 stream_url을 저장하지 않는다(불안정).
             track = _Track(title=title, webpage_url=webpage_url, requester_id=interaction.user.id)
 
             st = self._state(interaction.guild.id)
@@ -922,6 +1397,7 @@ class MusicCog(commands.Cog):
 
             await interaction.followup.send(f"큐에 추가: **{title}**", ephemeral=True)
             await self._refresh_from_interaction(interaction)
+
         except Exception as e:
             logger.warning("[Music] extract error: %s", e)
             self._set_error(interaction.guild.id, f"추가 실패: {e}")
@@ -930,53 +1406,83 @@ class MusicCog(commands.Cog):
             except Exception:
                 pass
 
-    async def _resolve_spotify_to_query(self, q: str) -> str:
-        """Spotify 트랙 URL이면 oEmbed로 제목을 가져와 YouTube 검색어로 변환한다.
-
-        - Spotify API 키 없이도 되는 방식(oEmbed)이라 운영이 간단하다.
-        - 실패하면 원문(q)을 그대로 반환해서 ytsearch에 태운다.
-        """
-        s = (q or "").strip()
-        if not s:
-            return s
-
-        # spotify:track:ID -> https://open.spotify.com/track/ID
-        if s.startswith("spotify:track:"):
-            tid = s.split(":")[-1].strip()
-            if tid:
-                s = f"https://open.spotify.com/track/{tid}"
-
-        if "open.spotify.com/track/" not in s:
-            return s
-
-        oembed = f"https://open.spotify.com/oembed?url={quote(s, safe='')}"
-        try:
-            timeout = aiohttp.ClientTimeout(total=8)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(oembed, headers={"User-Agent": "YumeBot"}) as r:
-                    if r.status != 200:
-                        return s
-                    data = await r.json()
-        except Exception:
-            return s
-
-        title = str(data.get("title") or "").strip()
-        author = str(data.get("author_name") or "").strip()
-        if not title:
-            return s
-
-        # title에 이미 아티스트가 들어있을 때가 많아서, author는 보조로만.
-        if author and author.lower() not in title.lower():
-            return f"{title} {author}"
-        return title
-
     async def _enqueue_spotify_from_interaction(self, interaction: discord.Interaction, query: str):
-        # Spotify URL -> (가능하면) 제목 추출 -> YouTube 검색으로 큐 추가
-        resolved = await self._resolve_spotify_to_query(query)
-        await self._enqueue_from_interaction(interaction, resolved)
+        """
+        Phase2:
+        - Spotify track: 제목/아티스트 -> 유튜브 검색으로 1곡 추가
+        - Spotify playlist: (API 필요) 트랙들 -> ytsearch1:... 로 대량 큐 적재 (재생 직전 해상)
+        """
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+        if interaction.guild is None:
+            return
+
+        raw = (query or "").strip()
+        if not raw:
+            try:
+                await interaction.followup.send("검색어/URL이 비어있어.", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        vc = await self._ensure_voice_interaction(interaction)
+        if not vc:
+            in_voice = isinstance(interaction.user, discord.Member) and interaction.user.voice and interaction.user.voice.channel
+            msg = "먼저 음성 채널에 들어가줘." if not in_voice else "음성 채널에 연결하지 못했어."
+            try:
+                await interaction.followup.send(msg, ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        kind, sid = self._parse_spotify(raw)
+
+        timeout = aiohttp.ClientTimeout(total=12)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            if kind == "playlist" and sid:
+                qs = await self._spotify_playlist_queries(session, sid)
+                if not qs:
+                    msg = (
+                        "플레이리스트를 가져오려면 Spotify API 키가 필요해.\n"
+                        "서버 .env에 SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET 넣고 재시작해줘."
+                    )
+                    try:
+                        await interaction.followup.send(msg, ephemeral=True)
+                    except Exception:
+                        pass
+                    return
+
+                st = self._state(interaction.guild.id)
+                added = 0
+                for q in qs:
+                    t = _Track(
+                        title=q,
+                        webpage_url=f"ytsearch1:{q}",
+                        requester_id=interaction.user.id,
+                    )
+                    await st.queue.put(t)
+                    added += 1
+
+                self._start_player_if_needed(interaction.guild.id)
+                await self._refresh_from_interaction(interaction)
+                try:
+                    await interaction.followup.send(f"플레이리스트에서 **{added}곡** 큐에 추가했어.", ephemeral=True)
+                except Exception:
+                    pass
+                return
+
+            if kind == "track" and sid:
+                url = f"https://open.spotify.com/track/{sid}"
+                q = await self._spotify_track_query(session, sid, url)
+                await self._enqueue_from_interaction(interaction, q)
+                return
+
+            await self._enqueue_from_interaction(interaction, raw)
 
     async def _set_volume_from_interaction(self, interaction: discord.Interaction, raw: str):
-        # 모달 제출이므로 defer 후 followup
         try:
             await interaction.response.defer(ephemeral=True)
         except Exception:
@@ -1013,18 +1519,21 @@ class MusicCog(commands.Cog):
 
         await self._refresh_from_interaction(interaction)
 
-    # -------------------------------
-    # Button actions
-    # -------------------------------
     async def _toggle_pause(self, interaction: discord.Interaction):
         if interaction.guild is None:
             return
         vc = interaction.guild.voice_client
         try:
+            st = self._state(interaction.guild.id)
             if vc and vc.is_connected() and vc.is_playing():
+                if st.paused_at is None:
+                    st.paused_at = self.bot.loop.time()
                 vc.pause()
                 await interaction.response.send_message("잠깐 멈출게.", ephemeral=True)
             elif vc and vc.is_connected() and vc.is_paused():
+                if st.paused_at is not None:
+                    st.paused_total += max(0.0, self.bot.loop.time() - st.paused_at)
+                    st.paused_at = None
                 vc.resume()
                 await interaction.response.send_message("다시 재생할게. 으헤~", ephemeral=True)
             else:
@@ -1073,7 +1582,6 @@ class MusicCog(commands.Cog):
             except Exception:
                 pass
 
-        # 큐 비우기
         try:
             while not st.queue.empty():
                 st.queue.get_nowait()
@@ -1129,6 +1637,231 @@ class MusicCog(commands.Cog):
             pass
         await self._refresh_from_interaction(interaction)
 
+
+    def _build_af_filters(self, st: MusicState) -> Optional[str]:
+        chain: List[str] = []
+
+        if st.fx_tune_enabled and abs(st.fx_tune_semitones) > 0.01:
+            factor = 2 ** (float(st.fx_tune_semitones) / 12.0)
+            inv = 1.0 / factor
+            chain.append(f"asetrate=48000*{factor}")
+            chain.append("aresample=48000")
+            chain.append(f"atempo={inv}")
+
+        if abs(st.fx_preamp_db) > 0.01:
+            chain.append(f"volume={float(st.fx_preamp_db)}dB")
+
+        if st.fx_eq_enabled:
+            if abs(st.fx_bass_db) > 0.01:
+                chain.append(f"bass=g={float(st.fx_bass_db)}:f=100:w=0.5")
+            if abs(st.fx_mid_db) > 0.01 and (not self._ffmpeg_filters or ('equalizer' in self._ffmpeg_filters)):
+                chain.append(f"equalizer=f=1000:t=q:w=1:g={float(st.fx_mid_db)}")
+            if abs(st.fx_treble_db) > 0.01:
+                chain.append(f"treble=g={float(st.fx_treble_db)}:f=3500:w=0.5")
+
+        if st.fx_reverb_enabled and int(st.fx_reverb_mix) > 0:
+            mix = max(0, min(100, int(st.fx_reverb_mix))) / 100.0
+            room = max(0, min(100, int(st.fx_reverb_room))) / 100.0
+            d1 = int(60 + 200 * room)
+            d2 = int(d1 * 2)
+            decay1 = min(0.95, 0.20 + 0.60 * mix)
+            decay2 = min(0.95, 0.12 + 0.45 * mix)
+            chain.append(f"aecho=0.8:0.9:{d1}|{d2}:{decay1}|{decay2}")
+
+        return ",".join(chain) if chain else None
+    async def _replay_current_from_start(self, guild_id: int) -> bool:
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return False
+        st = self._state(guild_id)
+        vc = guild.voice_client
+        if vc is None or (not vc.is_connected()):
+            return False
+        if st.now_playing is None:
+            return False
+
+        cur = st.now_playing
+
+        items: List[_Track] = []
+        try:
+            while not st.queue.empty():
+                items.append(st.queue.get_nowait())
+        except Exception:
+            pass
+
+        try:
+            st.queue.put_nowait(cur)
+        except Exception:
+            pass
+        for t in items:
+            try:
+                st.queue.put_nowait(t)
+            except Exception:
+                pass
+
+        st._suppress_requeue_once = True
+        try:
+            vc.stop()
+        except Exception:
+            return False
+        return True
+
+
+    async def _toggle_eq(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return
+        gid = interaction.guild.id
+        st = self._state(gid)
+        async with st.lock:
+            st.fx_eq_enabled = not bool(st.fx_eq_enabled)
+            await self._persist_fx_cfg_from_state(gid, st)
+            restarted = await self._replay_current_from_start(gid)
+
+        msg = f"EQ: {'ON' if st.fx_eq_enabled else 'OFF'}" + (" (현재 곡 재시작)" if restarted else " (다음 곡부터)")
+        try:
+            await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            try:
+                await interaction.followup.send(msg, ephemeral=True)
+            except Exception:
+                pass
+        await self._refresh_from_interaction(interaction)
+
+    async def _toggle_reverb(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return
+        gid = interaction.guild.id
+        st = self._state(gid)
+        async with st.lock:
+            st.fx_reverb_enabled = not bool(st.fx_reverb_enabled)
+            await self._persist_fx_cfg_from_state(gid, st)
+            restarted = await self._replay_current_from_start(gid)
+
+        msg = f"리버브: {'ON' if st.fx_reverb_enabled else 'OFF'}" + (" (현재 곡 재시작)" if restarted else " (다음 곡부터)")
+        try:
+            await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            try:
+                await interaction.followup.send(msg, ephemeral=True)
+            except Exception:
+                pass
+        await self._refresh_from_interaction(interaction)
+
+    async def _toggle_tune(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return
+        gid = interaction.guild.id
+        st = self._state(gid)
+        async with st.lock:
+            st.fx_tune_enabled = not bool(st.fx_tune_enabled)
+            await self._persist_fx_cfg_from_state(gid, st)
+            restarted = await self._replay_current_from_start(gid)
+
+        msg = f"튠: {'ON' if st.fx_tune_enabled else 'OFF'}" + (" (현재 곡 재시작)" if restarted else " (다음 곡부터)")
+        try:
+            await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            try:
+                await interaction.followup.send(msg, ephemeral=True)
+            except Exception:
+                pass
+        await self._refresh_from_interaction(interaction)
+
+    async def _set_eq_settings(self, interaction: discord.Interaction, *, guild_id: int, bass: float, mid: float, treble: float, preamp: float):
+        st = self._state(guild_id)
+        async with st.lock:
+            st.fx_bass_db = float(bass)
+            st.fx_mid_db = float(mid)
+            st.fx_treble_db = float(treble)
+            st.fx_preamp_db = float(preamp)
+            st.fx_eq_enabled = True
+            await self._persist_fx_cfg_from_state(guild_id, st)
+            restarted = await self._replay_current_from_start(guild_id)
+
+        msg = f"EQ 설정 저장: B{bass:+.1f} M{mid:+.1f} T{treble:+.1f} P{preamp:+.1f}" + (" (현재 곡 재시작)" if restarted else " (다음 곡부터)")
+        try:
+            await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            try:
+                await interaction.followup.send(msg, ephemeral=True)
+            except Exception:
+                pass
+        await self._refresh_from_interaction(interaction)
+
+    async def _set_reverb_settings(self, interaction: discord.Interaction, *, guild_id: int, mix: int, room: int):
+        st = self._state(guild_id)
+        async with st.lock:
+            st.fx_reverb_mix = int(mix)
+            st.fx_reverb_room = int(room)
+            st.fx_reverb_enabled = True
+            await self._persist_fx_cfg_from_state(guild_id, st)
+            restarted = await self._replay_current_from_start(guild_id)
+
+        msg = f"리버브 설정 저장: mix {mix}% / room {room}%" + (" (현재 곡 재시작)" if restarted else " (다음 곡부터)")
+        try:
+            await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            try:
+                await interaction.followup.send(msg, ephemeral=True)
+            except Exception:
+                pass
+        await self._refresh_from_interaction(interaction)
+
+    async def _set_tune_settings(self, interaction: discord.Interaction, *, guild_id: int, semitones: float):
+        st = self._state(guild_id)
+        async with st.lock:
+            st.fx_tune_semitones = float(semitones)
+            st.fx_tune_enabled = True
+            await self._persist_fx_cfg_from_state(guild_id, st)
+            restarted = await self._replay_current_from_start(guild_id)
+
+        msg = f"튠 설정 저장: {semitones:+.2f} semitone" + (" (현재 곡 재시작)" if restarted else " (다음 곡부터)")
+        try:
+            await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            try:
+                await interaction.followup.send(msg, ephemeral=True)
+            except Exception:
+                pass
+        await self._refresh_from_interaction(interaction)
+
+    async def _reset_fx(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return
+        gid = interaction.guild.id
+        st = self._state(gid)
+        async with st.lock:
+            st.fx_eq_enabled = False
+            st.fx_bass_db = 0.0
+            st.fx_mid_db = 0.0
+            st.fx_treble_db = 0.0
+            st.fx_preamp_db = 0.0
+
+            st.fx_reverb_enabled = False
+            st.fx_reverb_mix = 0
+            st.fx_reverb_room = 50
+
+            st.fx_tune_enabled = False
+            st.fx_tune_semitones = 0.0
+
+            await self._persist_fx_cfg_from_state(gid, st)
+            restarted = await self._replay_current_from_start(gid)
+
+        msg = "FX 초기화 완료" + (" (현재 곡 재시작)" if restarted else "")
+        try:
+            await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            try:
+                await interaction.followup.send(msg, ephemeral=True)
+            except Exception:
+                pass
+        await self._refresh_from_interaction(interaction)
+
+    async def _cycle_fx_preset(self, interaction: discord.Interaction):
+        await self._toggle_eq(interaction)
+
+    async def _cycle_reverb_level(self, interaction: discord.Interaction):
+        await self._toggle_reverb(interaction)
     async def _change_volume(self, interaction: discord.Interaction, *, delta: float):
         if interaction.guild is None:
             return
@@ -1145,49 +1878,6 @@ class MusicCog(commands.Cog):
             pass
         await self._refresh_from_interaction(interaction)
 
-    async def _leave(self, interaction: discord.Interaction):
-        if interaction.guild is None:
-            return
-
-        vc = interaction.guild.voice_client
-        if not vc or not vc.is_connected():
-            await interaction.response.send_message("이미 나가있어.", ephemeral=True)
-            return
-
-        st = self._state(interaction.guild.id)
-        st._suppress_requeue_once = True
-
-        try:
-            vc.stop()
-        except Exception:
-            pass
-
-        try:
-            await vc.disconnect(force=True)
-        except Exception:
-            pass
-
-        if st.player_task and not st.player_task.done():
-            st.player_task.cancel()
-
-        # 큐 비우기
-        try:
-            while not st.queue.empty():
-                st.queue.get_nowait()
-        except Exception:
-            pass
-
-        st.now_playing = None
-
-        try:
-            await interaction.response.send_message("나갈게. 으헤~", ephemeral=True)
-        except Exception:
-            pass
-        await self._refresh_from_interaction(interaction)
-
-    # -------------------------------
-    # Auto leave (유메만 남았을 때 자동 퇴장 + 큐 정리)
-    # -------------------------------
     def _human_count(self, channel: Optional[discord.VoiceChannel]) -> int:
         if not channel:
             return 0
@@ -1204,7 +1894,6 @@ class MusicCog(commands.Cog):
 
     def _schedule_auto_leave(self, guild_id: int, *, delay: float = 8.0):
         st = self._state(guild_id)
-        # 이미 예약돼 있으면 그대로 둔다.
         if st.auto_leave_task and not st.auto_leave_task.done():
             return
         st.auto_leave_task = asyncio.create_task(self._auto_leave_runner(guild_id, delay))
@@ -1244,7 +1933,6 @@ class MusicCog(commands.Cog):
         if not channel:
             return
 
-        # 이 채널과 무관한 이동은 무시
         if before.channel != channel and after.channel != channel:
             return
 
@@ -1261,10 +1949,8 @@ class MusicCog(commands.Cog):
         vc = guild.voice_client
         st = self._state(guild_id)
 
-        # 자동퇴장 예약은 여기서 끝낸다.
         self._cancel_auto_leave(guild_id)
 
-        # 재생/큐 정리
         async with st.lock:
             st._suppress_requeue_once = True
 
@@ -1281,7 +1967,6 @@ class MusicCog(commands.Cog):
                     pass
             st.player_task = None
 
-            # 큐 비우기
             try:
                 while not st.queue.empty():
                     st.queue.get_nowait()
@@ -1293,22 +1978,17 @@ class MusicCog(commands.Cog):
             if reason:
                 self._set_error(guild_id, reason)
 
-        # 보이스 나가기
         try:
             if vc and vc.is_connected():
                 await vc.disconnect()
         except Exception:
             pass
 
-        # 패널 갱신(고정 패널이 있으면 거기로)
         try:
             await self._refresh_panel(guild_id)
         except Exception:
             pass
 
-    # -------------------------------
-    # Queue manage (토글 메뉴)
-    # -------------------------------
     def _build_queue_embed(self, guild: discord.Guild) -> discord.Embed:
         st = self._state(guild.id)
         vc = guild.voice_client
@@ -1319,7 +1999,7 @@ class MusicCog(commands.Cog):
             color=discord.Color.blurple(),
         )
 
-        if st.now_playing and st.now_playing.webpage_url:
+        if st.now_playing and st.now_playing.webpage_url and st.now_playing.webpage_url.startswith("http"):
             embed.add_field(
                 name="🎧 지금 재생",
                 value=f"[{st.now_playing.title}]({st.now_playing.webpage_url})",
@@ -1330,10 +2010,8 @@ class MusicCog(commands.Cog):
         else:
             embed.add_field(name="🎧 지금 재생", value="없음", inline=False)
 
-        # 큐 미리보기
         items: List[_Track] = []
         try:
-            # asyncio.Queue 내부는 deque라 보통 _queue가 존재한다(읽기만)
             items = list(getattr(st.queue, "_queue", []))  # type: ignore[arg-type]
         except Exception:
             items = []
@@ -1344,7 +2022,7 @@ class MusicCog(commands.Cog):
         else:
             lines: List[str] = []
             for i, t in enumerate(items[:15], start=1):
-                if t.webpage_url:
+                if t.webpage_url and t.webpage_url.startswith("http"):
                     lines.append(f"{i}. [{t.title}]({t.webpage_url})")
                 else:
                     lines.append(f"{i}. {t.title}")
@@ -1373,7 +2051,6 @@ class MusicCog(commands.Cog):
         view: discord.ui.View,
         interaction: Optional[discord.Interaction] = None,
     ) -> bool:
-        # 버튼 인터랙션이면 그 메시지를 바로 수정
         if interaction is not None and getattr(interaction, "message", None) is not None:
             try:
                 await interaction.response.edit_message(embed=embed, view=view)
@@ -1381,7 +2058,6 @@ class MusicCog(commands.Cog):
             except Exception:
                 pass
 
-        # 모달 제출 등: 저장된 패널 메시지를 찾아 편집
         fixed_ch, fixed_mid = self._fixed_panel(guild_id)
         st = self._state(guild_id)
         ch_id = fixed_ch or st.temp_panel_channel_id
@@ -1413,8 +2089,233 @@ class MusicCog(commands.Cog):
         embed = self._build_embed(interaction.guild)
         await self._edit_panel_message(gid, embed=embed, view=self.panel_view, interaction=interaction)
 
+
+
+    def _lyrics_cache_key(self, track: _Track) -> str:
+        tn, ar = _guess_artist_title(track.title)
+        ar = ar or track.artist or ""
+        return f"{tn}|||{ar}".strip()
+
+    def _current_pos(self, st: MusicState) -> float:
+        if st.play_started_at <= 0:
+            return 0.0
+        now = self.bot.loop.time()
+        if st.paused_at is not None:
+            now = st.paused_at
+        pos = now - st.play_started_at - st.paused_total
+        if pos < 0:
+            pos = 0.0
+        return float(pos)
+
+    async def _disable_lyrics(self, guild_id: int, *, delete_message: bool):
+        st = self._state(guild_id)
+        st.lyrics_enabled = False
+
+        if st.lyrics_task and not st.lyrics_task.done():
+            try:
+                st.lyrics_task.cancel()
+            except Exception:
+                pass
+        st.lyrics_task = None
+
+        if delete_message and st.lyrics_channel_id and st.lyrics_message_id:
+            ch = self.bot.get_channel(st.lyrics_channel_id)
+            if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                try:
+                    msg = await ch.fetch_message(st.lyrics_message_id)
+                    await msg.delete()
+                except Exception:
+                    pass
+
+        st.lyrics_channel_id = None
+        st.lyrics_message_id = None
+        st._lyrics_last_track_key = None
+        st._lyrics_last_render_key = None
+
+    async def _toggle_lyrics(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return
+        gid = interaction.guild.id
+        st = self._state(gid)
+
+        if st.lyrics_enabled:
+            await self._disable_lyrics(gid, delete_message=True)
+            try:
+                await interaction.response.send_message("가사 표시를 껐어.", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        st.lyrics_enabled = True
+
+        cid, _mid = self._fixed_panel(gid)
+        if not cid:
+            cid = interaction.channel_id
+        st.lyrics_channel_id = cid
+
+        if st.lyrics_task is None or st.lyrics_task.done():
+            st.lyrics_task = asyncio.create_task(self._lyrics_loop(gid))
+
+        try:
+            await interaction.response.send_message("가사 표시를 켰어. 🎤", ephemeral=True)
+        except Exception:
+            pass
+
+    async def _lyrics_on_track_start(self, guild_id: int):
+        st = self._state(guild_id)
+        if not st.lyrics_enabled:
+            return
+        if st.lyrics_task is None or st.lyrics_task.done():
+            st.lyrics_task = asyncio.create_task(self._lyrics_loop(guild_id))
+
+        if not st.lyrics_channel_id:
+            cid, _ = self._fixed_panel(guild_id)
+            if cid:
+                st.lyrics_channel_id = cid
+
+
+    async def _fetch_lrclib(self, track_name: str, artist_name: Optional[str]) -> Optional[str]:
+        params = {"track_name": track_name}
+        if artist_name:
+            params["artist_name"] = artist_name
+
+        timeout = aiohttp.ClientTimeout(total=8)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(LRCLIB_API_BASE, params=params) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+        except Exception:
+            return None
+
+        lrc = data.get("syncedLyrics") or data.get("synced_lyrics")
+        if isinstance(lrc, str) and lrc.strip():
+            return lrc
+
+        return None
+
+    def _build_lyrics_embed(
+        self,
+        guild: discord.Guild,
+        track: Optional[_Track],
+        lines: List[Tuple[float, str]],
+        pos: float,
+    ) -> discord.Embed:
+        embed = discord.Embed(title="🎤 유메 - 가사")
+        if track:
+            if track.webpage_url:
+                embed.description = f"[{track.title}]({track.webpage_url})"
+            else:
+                embed.description = track.title
+
+        if not track:
+            embed.add_field(name="상태", value="재생 중인 곡이 없어.", inline=False)
+            return embed
+
+        if not lines:
+            embed.add_field(name="가사", value="`가사를 찾지 못했어.`", inline=False)
+            return embed
+
+        times = [t for t, _ in lines]
+        idx = bisect.bisect_right(times, pos) - 1
+        idx = max(0, min(idx, len(lines) - 1))
+
+        prev_txt = lines[idx - 1][1] if idx - 1 >= 0 else ""
+        cur_txt = lines[idx][1]
+        next_txt = lines[idx + 1][1] if idx + 1 < len(lines) else ""
+
+        desc = ""
+        if prev_txt:
+            desc += f"_{prev_txt}_\n"
+        desc += f"**{cur_txt}**\n"
+        if next_txt:
+            desc += f"_{next_txt}_\n"
+
+        mm = int(pos // 60)
+        ss = int(pos % 60)
+        embed.add_field(name=f"⏱ {mm:02d}:{ss:02d}", value=desc[:1024] or " ", inline=False)
+        embed.set_footer(text="가사 데이터: LRCLIB (가능한 곡만 제공돼)")
+        return embed
+
+    async def _lyrics_loop(self, guild_id: int):
+        last_embed_key: Optional[str] = None
+        while True:
+            st = self._state(guild_id)
+            if not st.lyrics_enabled:
+                break
+
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                await asyncio.sleep(2.0)
+                continue
+
+            if not st.lyrics_channel_id:
+                cid, _ = self._fixed_panel(guild_id)
+                if cid:
+                    st.lyrics_channel_id = cid
+
+            ch = self.bot.get_channel(st.lyrics_channel_id) if st.lyrics_channel_id else None
+            if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                await asyncio.sleep(2.0)
+                continue
+
+            msg = None
+            if st.lyrics_message_id:
+                try:
+                    msg = await ch.fetch_message(st.lyrics_message_id)
+                except Exception:
+                    st.lyrics_message_id = None
+                    msg = None
+
+            if msg is None:
+                try:
+                    m = await ch.send(embed=discord.Embed(title="🎤 유메 - 가사", description="가사를 준비하는 중..."))
+                    st.lyrics_message_id = m.id
+                    msg = m
+                except Exception:
+                    await asyncio.sleep(2.0)
+                    continue
+
+            track = st.now_playing
+            pos = self._current_pos(st)
+
+            track_key = self._lyrics_cache_key(track) if track else None
+            if track_key != st._lyrics_last_track_key:
+                st._lyrics_last_track_key = track_key
+                st._lyrics_last_render_key = None  # 강제 갱신
+
+            lines_lrc: List[Tuple[float, str]] = []
+            if track:
+                key = self._lyrics_cache_key(track)
+                if key in st.lyrics_cache:
+                    lines_lrc = st.lyrics_cache[key]
+                else:
+                    tn, ar = _guess_artist_title(track.title)
+                    ar = ar or track.artist
+                    lrc = await self._fetch_lrclib(tn, ar)
+                    lines_lrc = _parse_lrc(lrc or "")
+                    st.lyrics_cache[key] = lines_lrc
+
+            embed = self._build_lyrics_embed(guild, track, lines_lrc, pos)
+            try:
+                embed_key = json.dumps(embed.to_dict(), ensure_ascii=False)
+            except Exception:
+                embed_key = None
+
+            if embed_key and embed_key == last_embed_key:
+                await asyncio.sleep(2.5)
+                continue
+            last_embed_key = embed_key
+
+            try:
+                await msg.edit(embed=embed)
+            except Exception:
+                st.lyrics_message_id = None
+
+            await asyncio.sleep(2.5)
+
     def _parse_index_spec(self, spec: str, *, max_n: int) -> List[int]:
-        """'3', '3,5,7', '2-6' 같은 입력을 0-based 인덱스 리스트로 변환."""
         s = (spec or "").strip()
         if not s or max_n <= 0:
             return []
@@ -1443,7 +2344,6 @@ class MusicCog(commands.Cog):
                     continue
                 if 1 <= k <= max_n:
                     out.append(k - 1)
-        # 중복 제거 + 정렬
         return sorted(set(out))
 
     async def _queue_manage_shuffle(self, interaction: discord.Interaction):
@@ -1475,7 +2375,6 @@ class MusicCog(commands.Cog):
                 except Exception:
                     pass
 
-        # 큐 화면 갱신
         embed = self._build_queue_embed(interaction.guild)
         await self._edit_panel_message(gid, embed=embed, view=self.queue_view, interaction=interaction)
 
@@ -1504,7 +2403,6 @@ class MusicCog(commands.Cog):
                     except Exception:
                         pass
             else:
-                # 원복
                 for t in items:
                     try:
                         st.queue.put_nowait(t)
@@ -1519,7 +2417,6 @@ class MusicCog(commands.Cog):
         except Exception:
             pass
 
-        # 패널(큐화면) 갱신
         try:
             await self._edit_panel_message(gid, embed=self._build_queue_embed(interaction.guild), view=self.queue_view)
         except Exception:
@@ -1608,11 +2505,6 @@ class MusicCog(commands.Cog):
         embed = self._build_queue_embed(interaction.guild)
         await self._edit_panel_message(gid, embed=embed, view=self.queue_view, interaction=interaction)
 
-
-
-    # -------------------------------
-    # Command
-    # -------------------------------
     @commands.command(name="음악채널지정")
     @commands.has_permissions(manage_guild=True)
     async def set_music_channel(self, ctx: commands.Context, channel: discord.TextChannel):
@@ -1621,7 +2513,6 @@ class MusicCog(commands.Cog):
             await ctx.send("서버 채널에서만 쓸 수 있어.")
             return
 
-        # 패널 생성/복구
         cid, mid = await self._ensure_panel_message(ctx.guild.id, channel.id, fixed=True)
         if not cid or not mid:
             await ctx.send("그 채널에 패널을 만들 수 없었어(권한을 확인해줘).")
@@ -1657,7 +2548,6 @@ class MusicCog(commands.Cog):
 
         fixed_channel_id, _ = self._fixed_panel(ctx.guild.id)
         if fixed_channel_id:
-            # 고정 패널이 있으면 그 채널만 갱신한다.
             await self._ensure_panel_message(ctx.guild.id, fixed_channel_id, fixed=True)
             await self._refresh_panel(ctx.guild.id)
             try:
@@ -1666,7 +2556,6 @@ class MusicCog(commands.Cog):
                 pass
             return
 
-        # 고정이 없으면 현재 채널에 임시 패널을 띄워둔다.
         embed = self._build_embed(ctx.guild)
         msg = await ctx.send(embed=embed, view=self.panel_view)
         st = self._state(ctx.guild.id)
@@ -1678,7 +2567,6 @@ async def setup(bot: commands.Bot):
     cog = MusicCog(bot)
     await bot.add_cog(cog)
 
-    # 퍼시스턴트 뷰 등록 (재부팅 후에도 버튼이 동작)
     try:
         bot.add_view(cog.panel_view)
         bot.add_view(cog.queue_view)

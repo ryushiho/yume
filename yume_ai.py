@@ -28,7 +28,6 @@ import datetime
 from discord.ext import commands
 
 try:
-    # openai>=1.0.0 기준
     from openai import OpenAI  # type: ignore
 except Exception:  # pragma: no cover
     OpenAI = None  # type: ignore
@@ -48,7 +47,6 @@ DIARY_DIR = SYSTEM_DIR / "yume_diary"
 
 AffectionStage = Literal["cold", "normal", "warm", "hot"]
 
-# 호감도 범위: -100 ~ 100, 기본값 0
 AFFECTION_MIN = -100.0
 AFFECTION_MAX = 100.0
 
@@ -57,7 +55,6 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return lo if v < lo else hi if v > hi else v
 
 
-# 유메 캐릭터 설명 (항상 프롬프트에 주입)
 YUME_PERSONA_KR = (
     "너는 게임 '블루 아카이브(Blue Archive)'의 '아비도스 학원' "
     "(사립 아비도스 고등학교) 전 학생회장 '쿠치나시 유메'를 모티브로 한 캐릭터야. "
@@ -74,7 +71,6 @@ YUME_PERSONA_KR = (
 
 @dataclass
 class UserAffection:
-    # -100.0 ~ 100.0, 기본 0.0
     score: float = 0.0
     last_event: str = ""
     updated_at: float = 0.0
@@ -104,21 +100,17 @@ class YumeCore:
       - get_core_state() -> {"mood": float, "irritation": float}
     """
 
-    # 이벤트별 기본 효과 (weight 로 곱해진다)
     EVENT_EFFECTS: Dict[str, Dict[str, float]] = {
-        # 멘션 대화, 가벼운 상호작용
         "friendly_chat": {
             "affection": +1.0,
             "mood": +0.05,
             "irritation": -0.02,
         },
-        # /유메건의 같은 피드백
         "feedback_sent": {
             "affection": +2.0,
             "mood": +0.08,
             "irritation": -0.03,
         },
-        # 육포 / 바보 놀리기
         "insult": {
             "affection": -3.0,
             "mood": -0.10,
@@ -128,17 +120,12 @@ class YumeCore:
 
     def __init__(self) -> None:
         self._affection: Dict[str, UserAffection] = {}
-        # 전역 상태 (전체 분위기)
         self._mood: float = 0.0          # -1.0 ~ 1.0
         self._irritation: float = 0.0    # 0.0 ~ 1.0
 
         self._load()
 
-    # ---------------------------
-    # 로드 / 저장
-    # ---------------------------
     def _load(self) -> None:
-        # 코어 상태(mood/irritation)
         if CORE_STATE_PATH.exists():
             try:
                 with CORE_STATE_PATH.open("r", encoding="utf-8") as f:
@@ -148,7 +135,6 @@ class YumeCore:
             except Exception as e:  # pragma: no cover
                 logger.exception("YumeCore 코어 상태 로드 중 오류: %s", e)
 
-        # 유저별 호감도
         if AFFECTION_PATH.exists():
             try:
                 with AFFECTION_PATH.open("r", encoding="utf-8") as f:
@@ -177,9 +163,6 @@ class YumeCore:
         except Exception as e:  # pragma: no cover
             logger.exception("YumeCore 저장 중 오류: %s", e)
 
-    # ---------------------------
-    # 호감도 관련
-    # ---------------------------
     def get_affection(self, user_id: str) -> float:
         entry = self._affection.get(str(user_id))
         return float(entry.score) if entry else 0.0
@@ -218,9 +201,6 @@ class YumeCore:
             return "warm"
         return "hot"
 
-    # ---------------------------
-    # 이벤트 반영 (social.py 에서 호출)
-    # ---------------------------
     def apply_event(
         self,
         event: str,
@@ -239,7 +219,6 @@ class YumeCore:
         """
         conf = self.EVENT_EFFECTS.get(
             event,
-            # 정의되지 않은 이벤트는 아주 약하게만 반영
             {"affection": 0.5, "mood": 0.01, "irritation": 0.0},
         )
 
@@ -247,11 +226,9 @@ class YumeCore:
         mood_delta = conf.get("mood", 0.0) * float(weight)
         irritation_delta = conf.get("irritation", 0.0) * float(weight)
 
-        # 유저별 호감도 반영
         if affection_delta != 0.0:
             self.add_affection(user_id, affection_delta, reason=event)
 
-        # 전역 상태 반영
         if mood_delta != 0.0:
             self._mood = _clamp(self._mood + mood_delta, -1.0, 1.0)
         if irritation_delta != 0.0:
@@ -304,7 +281,6 @@ class YumeSpeaker:
         else:
             self.client = OpenAI(api_key=api_key)  # type: ignore[assignment]
 
-    # public API (social.py 에서 호출)
     def say(self, event: str, **kwargs: Any) -> str:
         """
         event: "feedback_received" 등 상황 키워드
@@ -329,11 +305,9 @@ class YumeSpeaker:
             affection_score = self.core.get_affection(str(user_id))
             stage = self.core.get_affection_stage(str(user_id))
 
-        # OpenAI 를 사용할 수 없으면, 유메 말투 템플릿 없이 기술적 오류만 반환
         if self.client is None:
             return "OpenAI 설정 오류로 인해 유메 대사를 생성할 수 없습니다."
 
-        # 시스템 프롬프트 (유메 캐릭터 + 스타일 설명)
         instructions = (
             "당신은 디스코드 봇 '유메'의 대사를 생성하는 역할입니다.\n"
             + YUME_PERSONA_KR
@@ -349,10 +323,8 @@ class YumeSpeaker:
             "  과도한 욕설이나 인신공격은 절대 하지 않는다.\n"
         )
 
-        # 이벤트별 분위기 힌트
         event_hint = self._event_hint(event)
 
-        # 한국어 프롬프트
         prompt = (
             f"[상황 키워드]: {event}\n"
             f"[상황 설명]: {event_hint}\n"
@@ -372,7 +344,6 @@ class YumeSpeaker:
                 input=prompt,
                 max_output_tokens=96,
             )
-            # Responses API: text 는 output[0].content[0].text 에 들어있다.
             out_items = getattr(response, "output", None) or []
             if not out_items:
                 raise RuntimeError("empty output from OpenAI")
@@ -388,7 +359,6 @@ class YumeSpeaker:
             if not text:
                 raise RuntimeError("empty text from OpenAI")
 
-            # 혹시 따옴표로 둘러싸여 있으면 제거
             if (text.startswith('"') and text.endswith('"')) or (
                 text.startswith("“") and text.endswith("”")
             ):
@@ -396,7 +366,6 @@ class YumeSpeaker:
             return text
         except Exception as e:  # pragma: no cover
             logger.error("YumeSpeaker.say OpenAI 호출 실패: %s", e)
-            # 여기서는 유메 말투로 fallback 하지 않고, 기술적 오류 메세지만 반환
             return f"OpenAI 호출 중 오류가 발생해서 유메 대사를 생성하지 못했습니다: {e}"
 
     def _event_hint(self, event: str) -> str:
@@ -412,7 +381,6 @@ class YumeSpeaker:
                 "유저가 장난스럽게 유메를 놀리거나 바보라고 해서, "
                 "유메가 삐지거나 툴툴거리지만 너무 진지하게 화내지는 않는 상황."
             )
-        # 기타 상황은 event 문자열만 힌트로 사용
         return f"{event} 상황에 어울리는 유메의 한 줄 멘트."
 
 
@@ -441,16 +409,12 @@ class YumeMemory:
             logger.exception("YumeMemory.log_today 오류: %s", e)
 
 
-# ---------------------------------
-# yume.py 에서 호출되는 엔트리 포인트
-# ---------------------------------
 def setup_yume_ai(bot: commands.Bot) -> None:
     """
     yume.py 의 main() 에서 한 번 호출해두면 된다.
     bot 에 yume_core / yume_speaker / yume_memory 속성을 심어준다.
     """
     if hasattr(bot, "yume_core") and hasattr(bot, "yume_speaker"):
-        # 이미 초기화되어 있으면 다시 만들지 않는다.
         logger.info("YumeAI 이미 초기화되어 있어 재사용합니다.")
         return
 

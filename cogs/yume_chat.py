@@ -1,22 +1,3 @@
-# yume_chat.py
-# 유메 프리토킹 전용 LLM Cog (호감도 엔진 연동 + 브레인 초기화 디버그 버전)
-#
-# - 기본 프리토킹 채널:
-#     1438804132613066833
-#     1445664712133181513
-# - 기본 채널은 항상 프리토킹 허용 상태
-# - 다른 채널에서는 기본적으로 프리토킹 OFF
-#   → !프리토킹시작 으로 채널별로 켜기
-#   → !프리토킹종료 로 세션/채널 끄기
-#
-# - 동작 개요:
-#   1) 프리토킹 활성 채널에서
-#      - 처음엔 @유메 멘션 또는 "유메" 포함해야 세션 시작
-#      - 이후엔 같은 유저가 말하면 계속 이어서 대화
-#   2) YumeBrain.chat(...) 에 user_message + user_profile + history 만 넘김
-#      - user_profile.bond_level 은 yume_core 의 affection_stage 를 사용
-#   3) 프리토킹이 성공하면 yume_core.apply_event("friendly_chat", ...) 호출
-#   4) YumeBrain 초기화 실패 시, 개발자에게 brain_error 를 디버그로 보여준다.
 
 from __future__ import annotations
 
@@ -32,13 +13,11 @@ from yume_brain import YumeBrain
 
 logger = logging.getLogger(__name__)
 
-# 기본 프리토킹 전용 채널 ID (항상 활성)
 DEFAULT_CHAT_CHANNEL_IDS: Set[int] = {
     1438804132613066833,
     1445664712133181513,
 }
 
-# 개발자(너) 디스코드 ID – 디버그 정보 노출용
 DEV_USER_ID = 1433962010785349634
 
 
@@ -57,17 +36,13 @@ class YumeChatCog(commands.Cog):
         self.brain: Optional[YumeBrain] = None
         self.brain_error: Optional[str] = None  # 최근 초기화 에러 내용
 
-        # 현재 프리토킹이 활성화된 채널 집합
         self.active_channels: Set[int] = set(DEFAULT_CHAT_CHANNEL_IDS)
 
-        # 채널별 세션
         self.sessions: Dict[int, ChatSession] = {}  # channel_id -> ChatSession
 
-        # 다른 Cog 에서도 참조할 수 있도록 공유
         setattr(self.bot, "yume_chat_active_channels", self.active_channels)
         setattr(self.bot, "yume_chat", self)
 
-    # ===== yume_ai 연동 유틸 =====
 
     def _core(self):
         """호감도 엔진(YumeCore). 없으면 None."""
@@ -86,7 +61,6 @@ class YumeChatCog(commands.Cog):
         except Exception:
             pass
 
-    # ===== YumeBrain용 유저 프로필 =====
 
     def _get_user_profile(
         self,
@@ -114,12 +88,10 @@ class YumeChatCog(commands.Cog):
             profile["bond_level"] = str(stage)
             profile["affection"] = float(aff)
         except Exception:
-            # 엔진 내부 세팅 문제여도, 프로필은 기본값으로 계속 사용
             pass
 
         return profile
 
-    # ===== YumeBrain 초기화 헬퍼 =====
 
     def _ensure_brain(self) -> bool:
         """
@@ -142,17 +114,14 @@ class YumeChatCog(commands.Cog):
             return False
 
     async def cog_load(self):
-        # Cog 로드 시 한 번 시도
         self._ensure_brain()
 
-    # ===== 세션 헬퍼 =====
 
     def _get_session(self, channel_id: int) -> Optional[ChatSession]:
         return self.sessions.get(channel_id)
 
     def _start_session(self, channel_id: int, user_id: int) -> ChatSession:
         sess = ChatSession(last_user_id=user_id)
-        # 기존 대화는 새 세션으로 덮어씀
         self.sessions[channel_id] = sess
         return sess
 
@@ -160,11 +129,9 @@ class YumeChatCog(commands.Cog):
         if channel_id in self.sessions:
             del self.sessions[channel_id]
 
-    # 다른 Cog에서 프리토킹 활성 여부를 물어볼 수 있는 API
     def is_active_channel(self, channel_id: int) -> bool:
         return channel_id in self.active_channels
 
-    # ===== 텍스트 명령어: !프리토킹시작 / !프리토킹종료 =====
 
     @commands.command(name="프리토킹시작")
     async def cmd_start_free_talk(self, ctx: commands.Context):
@@ -210,11 +177,9 @@ class YumeChatCog(commands.Cog):
 
         ch_id = ctx.channel.id
 
-        # 세션 정리
         had_session = ch_id in self.sessions
         self._reset_session(ch_id)
 
-        # 기본 채널이 아니라면 프리토킹 비활성화
         if ch_id not in DEFAULT_CHAT_CHANNEL_IDS and ch_id in self.active_channels:
             self.active_channels.remove(ch_id)
             msg = (
@@ -232,11 +197,9 @@ class YumeChatCog(commands.Cog):
 
         await ctx.send(msg, delete_after=15)
 
-    # ===== 메인 on_message =====
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        # 1) 기본 필터
         if message.author.bot:
             return
 
@@ -246,7 +209,6 @@ class YumeChatCog(commands.Cog):
 
         ch_id = channel.id
 
-        # 이 채널이 프리토킹 활성 채널이 아니면 무시
         if ch_id not in self.active_channels:
             return
 
@@ -254,36 +216,28 @@ class YumeChatCog(commands.Cog):
         if not content:
             return
 
-        # 명령어는 여기서 처리하지 않고, commands 확장으로 넘김
         if content.startswith("!"):
             return
 
-        # 2) 세션 여부 판정
         sess = self._get_session(ch_id)
         in_session = sess is not None and sess.last_user_id == message.author.id
 
         triggered = False
 
-        # 새 세션을 시작하려면 멘션 또는 "유메" 포함이 필요
         if not in_session:
             if self.bot.user and self.bot.user in message.mentions:
                 triggered = True
-                # 멘션 문자열 제거
                 content = content.replace(self.bot.user.mention, "").strip()
             elif "유메" in content:
                 triggered = True
 
             if not triggered:
-                # 아직 이 유저 기준 세션도 없고, 유메를 부른 것도 아니면 무시
                 return
 
-            # 새 세션 시작
             sess = self._start_session(ch_id, message.author.id)
         else:
-            # 이미 같은 유저와 세션이 있는 경우 → 계속 이어가기
             pass
 
-        # 3) YumeBrain 초기화 확인 (지연 초기화 포함)
         if not self._ensure_brain():
             debug_suffix = ""
             if message.author.id == DEV_USER_ID and self.brain_error:
@@ -296,11 +250,9 @@ class YumeChatCog(commands.Cog):
             )
             return
 
-        # 4) 유저 프로필 / 히스토리 구성
         user_profile = self._get_user_profile(message.author, message.guild)
         history = list(sess.history[-8:]) if sess else []
 
-        # 5) LLM 호출 (스레드풀에서 실행해서 이벤트 루프 안 막기)
         loop = asyncio.get_running_loop()
 
         def _call_brain():
@@ -322,7 +274,6 @@ class YumeChatCog(commands.Cog):
         ok = result.get("ok", False)
         reason = result.get("reason", "ok")
 
-        # 6) 에러/예산 초과 처리
         if not ok and reason == "limit_exceeded":
             await message.reply(
                 "이번 달에 유메가 쓸 수 있는 말 예산을 다 써버렸어요. "
@@ -331,7 +282,6 @@ class YumeChatCog(commands.Cog):
             )
             return
         elif not ok:
-            # 디버그: 개발자일 때만 reason 꼬리표 달기
             dev_suffix = ""
             if message.author.id == DEV_USER_ID:
                 dev_suffix = f"\n\n[디버그 reason: {reason!r}]"
@@ -353,24 +303,19 @@ class YumeChatCog(commands.Cog):
         if not reply.strip():
             reply = "..."  # 비어 있으면 최소한 무언가 응답
 
-        # 7) 실제 답변 보내기
         await message.reply(reply, mention_author=False)
 
-        # 8) 세션/기록 업데이트
         if sess:
             sess.last_user_id = message.author.id
             sess.history.append(("user", content))
             sess.history.append(("assistant", reply))
-            # 너무 길어지지 않게 자르기
             sess.history = sess.history[-12:]
 
-        # 9) 오늘 기록에 로그 남기기
         self._log_today(
             f"프리토킹: {message.author} ({message.author.id}) "
             f"@ {channel.name} | {content[:80]!r}"
         )
 
-        # 10) 호감도 엔진에 이벤트 반영 (있을 때만)
         core = self._core()
         if core is not None:
             try:
@@ -381,7 +326,6 @@ class YumeChatCog(commands.Cog):
                     weight=1.0,
                 )
             except Exception:
-                # 이벤트 반영 실패해도 프리토킹은 계속 동작해야 하므로 조용히 무시
                 pass
 
 

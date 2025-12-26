@@ -1,4 +1,3 @@
-# records_core.py
 import os
 import json
 from datetime import datetime, timezone
@@ -50,13 +49,11 @@ def _migrate_if_legacy(data: Any) -> Dict[str, Any]:
     if not isinstance(data, dict):
         return _empty_schema()
 
-    # 이미 신규 포맷이면 그대로
     if "users" in data and "matches" in data and isinstance(data.get("users"), dict) and isinstance(data.get("matches"), list):
         if "meta" not in data or not isinstance(data.get("meta"), dict):
             data["meta"] = {"schema": 2, "updated_at": datetime.now(timezone.utc).isoformat()}
         return data
 
-    # 레거시로 판단: 키들이 user_id처럼 보이고 값이 dict(win/loss) 형태
     users: Dict[str, Any] = {}
     for k, v in data.items():
         if not isinstance(v, dict):
@@ -89,7 +86,6 @@ def load_records() -> Dict[str, Any]:
     raw = _load_raw()
     data = _migrate_if_legacy(raw)
 
-    # 최소 필드 보정
     if "users" not in data or not isinstance(data["users"], dict):
         data["users"] = {}
     if "matches" not in data or not isinstance(data["matches"], list):
