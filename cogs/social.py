@@ -5,7 +5,9 @@ import asyncio
 import datetime
 import logging
 import random
-from typing import Optional
+from typing import Optional, Dict, Any
+
+from yume_brain import YumeBrain
 
 import discord
 from discord.ext import commands
@@ -15,6 +17,19 @@ logger = logging.getLogger(__name__)
 DEV_USER_ID = 1433962010785349634
 
 HEHE_CHANNEL_ID = 1445819862713893046
+
+
+# 블루 아카이브 세계관(쿠치나시 유메) 참고 메모.
+# - LLM이 "블루 아카이브 캐릭터/관계" 이야기를 더 자연스럽게 하도록 시스템 프롬프트에 섞어준다.
+# - 스포일러가 될 수 있는 건 먼저 물어보고, 사용자가 원하면 말한다.
+BLUE_ARCHIVE_LORE_KR = (
+    "[블루 아카이브 세계관 참고 메모]\n"
+    "- 쿠치나시 유메: 아비도스 고등학교 전 학생회장.\n"
+    "- 타카나시 호시노: 유메와 깊은 인연이 있는 후배.\n"
+    "- (아비도스 학생들) 유메 기준으로는 다 소중한 후배들.\n"
+    "- 선생님: SCHALE(샬레) 소속. 유메는 존중하되, 후배들 앞에서는 선배처럼 다정하게 이끈다.\n"
+    "- 주의: 스토리 스포일러(특히 유메 관련)는 먼저 \"스포일러 괜찮아?\" 하고 확인한 뒤 말한다.\n"
+)
 
 
 
@@ -278,24 +293,13 @@ class HelpCog(commands.Cog):
     async def help_command(self, ctx: commands.Context):
         mood, irritation = self._get_ai_mood_and_irritation()
 
+        title = "📚 유메 도움말"
         if irritation > 0.5:
-            title = "📚 유메 사용 설명서 (살짝 예민 모드)"
-            desc = (
-                "지금은 기분이 아주 좋진 않지만…\n"
-                "완전히 방치해 둘 순 없으니까, 필요한 만큼만 정리해 줄게."
-            )
+            desc = "명령어는 `!`로 시작해. 필요한 것만 빠르게 적어둘게."
         elif mood >= 0.4:
-            title = "📚 유메 사용 설명서 (기분 좋은 유메 버전)"
-            desc = (
-                "지금은 기분이 꽤 좋아서~\n"
-                "조금 길어져도 괜찮겠지? 천천히 같이 한 번 볼까, 후배?"
-            )
+            desc = "명령어는 `!`로 시작해. 중요한 것만 딱 정리해둘게, 으헤~"
         else:
-            title = "📚 유메 사용 설명서"
-            desc = (
-                "어디서부터 도와줘야 할지 모를 땐, 일단 설명서부터 보는 거야.\n"
-                "후배가 헷갈리지 않게, 중요한 것부터 정리해 줄게."
-            )
+            desc = "명령어는 `!`로 시작해. 헷갈릴 때는 여기만 보면 돼."
 
         embed = discord.Embed(
             title=title,
@@ -304,65 +308,60 @@ class HelpCog(commands.Cog):
         )
 
         embed.add_field(
-            name="🎮 블루전 (끝말잇기 게임)",
+            name="🎮 블루전",
             value=(
-                "**!블루전시작** – 다른 유저와 1:1 블루전 대결을 시작해.\n"
-                "**!블루전연습** – 유메랑 1:1 연습 모드.\n"
-                "**!블루전전적 [@유저]** – 승/패, 승차 등 전적 확인.\n"
-                "**!블루전랭킹** – 서버 내 블루전 랭킹 확인.\n"
+                "`!블루전` / `!블루전연습` / `!연습종료`\n"
+                "`!블루전전적 [@유저]` / `!블루전랭킹`"
             ),
             inline=False,
         )
 
         embed.add_field(
             name="🎵 음악",
+            value="`!음악` / `!음악채널지정` / `!음악채널해제`",
+            inline=False,
+        )
+
+        embed.add_field(
+            name="📝 일기/관계",
+            value="`!유메일기` / `!유메오늘어땠어` / `!유메기분` / `!유메관계`",
+            inline=False,
+        )
+
+        embed.add_field(
+            name="💬 프리토킹",
             value=(
-                "**!음악** – 유메를 음성 채널로 부르고 음악 패널을 열어.\n"
-                "  → 패널의 ➕ 버튼으로 유튜브 검색어/URL로 노래를 추가할 수 있어.\n"
+                "`!프리토킹시작` / `!프리토킹종료`\n"
+                "프리토킹 채널에선 그냥 말 걸면 유메가 받아줘."
             ),
             inline=False,
         )
 
         embed.add_field(
-            name="📨 건의사항 – 유메에게 한 말은 전부 기록된다",
-            value=(
-                "**!건의사항 내용...**\n"
-                "‣ 개발자 DM으로 건의 전달 + 유메 감정에 반영.\n"
-            ),
+            name="📨 기타",
+            value="`!건의사항 내용...` / `!바보`",
             inline=False,
         )
 
         embed.add_field(
-            name="💬 프리토킹 / 멘션 대화",
-            value=(
-                "**!프리토킹시작 / !프리토킹종료** – 채널 단위로 유메 프리토킹 ON/OFF.\n"
-                "`@유메` 멘션 → 짧은 대화 (프리토킹 채널 제외).\n"
-            ),
+            name="🔧 관리자(권한 필요)",
+            value="`!유메상태` / `!청소 N`",
             inline=False,
         )
 
-        embed.add_field(
-            name="😈 장난 / 육포 관련",
-            value=(
-                "**!바보** – 서버 내 랜덤 유저를 골라서 바보라고 놀리기.\n"
-                "채팅에 '육포'를 적으면… 5분 동안 명령어 사용이 제한될지도?\n"
-            ),
-            inline=False,
-        )
-
-        embed.set_footer(text="궁금한 게 더 있으면 그냥 편하게 물어봐. 유메가 최대한 도와줄게.")
+        embed.set_footer(text="잊어버리면 `!도움` 다시 치면 돼. 유메가 여기 있어.")
 
         try:
             await ctx.send(embed=embed)
         except discord.Forbidden:
             pass
 
+        # DM에도 한 번 더 보내준다(서버에서 임베드 권한이 막혀있을 수 있어서)
         try:
             dm = await ctx.author.create_dm()
             await dm.send(embed=embed)
         except Exception:
             pass
-
 
 
 class ReactionsCog(commands.Cog):
@@ -371,6 +370,10 @@ class ReactionsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._yukpo_block_until: dict[int, datetime.datetime] = {}
+
+        # 멘션 대화용 LLM(프리토킹 채널과 공유를 우선 시도)
+        self.brain: Optional[YumeBrain] = None
+        self.brain_error: Optional[str] = None
 
         self._hehe_task = self.bot.loop.create_task(self._hehe_loop())
 
@@ -406,6 +409,90 @@ class ReactionsCog(commands.Cog):
         name = discord.utils.escape_mentions(target.display_name or target.name)
         return f"{name} 바보. (…라고 누가 그러더라, 유메가 그런 거 아냐. 으헤~)"
 
+    def _core(self):
+        return getattr(self.bot, "yume_core", None)
+
+    def _memory(self):
+        return getattr(self.bot, "yume_memory", None)
+
+    def _log_today(self, text: str) -> None:
+        mem = self._memory()
+        if mem is None:
+            return
+        try:
+            mem.log_today(text)
+        except Exception:
+            pass
+
+    def _get_user_profile(self, user: discord.abc.User, guild: Optional[discord.Guild]) -> Dict[str, Any]:
+        profile: Dict[str, Any] = {
+            "nickname": getattr(user, "display_name", user.name),
+            "bond_level": "normal",
+        }
+
+        core = self._core()
+        if core is None:
+            return profile
+
+        try:
+            user_id = str(user.id)
+            profile["affection"] = float(core.get_affection(user_id))
+            profile["bond_level"] = str(core.get_affection_stage(user_id))
+        except Exception:
+            pass
+
+        return profile
+
+    def _get_yume_state(self) -> Dict[str, Any]:
+        core = self._core()
+        if core is None:
+            return {"mood": "neutral", "energy": "normal"}
+
+        try:
+            state = core.get_core_state()
+            mood = float(state.get("mood", 0.0))
+            if mood >= 0.4:
+                mood_label = "positive"
+            elif mood <= -0.4:
+                mood_label = "negative"
+            else:
+                mood_label = "neutral"
+            return {
+                "mood": mood_label,
+                "irritation": float(state.get("irritation", 0.0)),
+                "energy": "normal",
+                "loneliness": "normal",
+                "focus": "normal",
+            }
+        except Exception:
+            return {"mood": "neutral", "energy": "normal"}
+
+    def _try_get_shared_brain(self) -> Optional[YumeBrain]:
+        """yume_chat Cog가 이미 Brain을 들고 있으면 그걸 재사용한다."""
+        ychat = getattr(self.bot, "yume_chat", None)
+        brain = getattr(ychat, "brain", None) if ychat else None
+        return brain if isinstance(brain, YumeBrain) else None
+
+    def _ensure_brain(self) -> Optional[YumeBrain]:
+        shared = self._try_get_shared_brain()
+        if shared is not None:
+            self.brain = shared
+            self.brain_error = None
+            return shared
+
+        if self.brain is not None:
+            return self.brain
+
+        try:
+            self.brain = YumeBrain()
+            self.brain_error = None
+            return self.brain
+        except Exception as e:  # noqa: BLE001
+            self.brain = None
+            self.brain_error = repr(e)
+            logger.error("[ReactionsCog] YumeBrain 초기화 실패: %r", e)
+            return None
+
     @commands.command(name="바보")
     async def babo_text(self, ctx: commands.Context):
         if ctx.guild is None:
@@ -430,47 +517,76 @@ class ReactionsCog(commands.Cog):
         await ctx.send(msg)
 
     async def _handle_mention_chat(self, message: discord.Message) -> None:
-        """
-        @유메 멘션에 대한 간단 대화.
-        - 대사는 전부 YumeSpeaker(OpenAI)를 통해 생성한다.
-        """
+        """@유메 멘션에 대한 간단 대화(블루 아카이브 세계관/관계 지식 포함)."""
         raw = message.content
         if self.bot.user:
             raw = raw.replace(self.bot.user.mention, "").strip()
 
-        ychat = getattr(self.bot, "yume_chat", None)
-        if ychat is not None:
-            if hasattr(ychat, "is_active_channel"):
-                try:
-                    if ychat.is_active_channel(message.channel.id):  # type: ignore[attr-defined]
-                        return
-                except Exception:
-                    pass
+        if not raw:
+            return
 
-        speaker = getattr(self.bot, "yume_speaker", None)
-        if speaker is None:
+        # 프리토킹 채널은 YumeChatCog가 처리하므로, 여기선 짧은 멘션 대화만.
+        brain = self._ensure_brain()
+        if brain is None:
+            # 시스템 안내/에러는 템플릿 허용
             await message.channel.send(
-                "지금은 긴 대화를 할 준비가 안 되어 있어서… 미안해. 나중에 다시 불러 줄래?",
-                delete_after=8,
+                "지금은 유메 머리가 잠깐 멈췄어… 으헤~\n"
+                "(OPENAI_API_KEY나 한도 설정을 한 번만 확인해줘.)"
             )
             return
 
-        try:
-            reply = speaker.say(
-                "friendly_chat",
-                user=message.author,
-                extra={
-                    "message_text": raw,
-                    "channel_id": message.channel.id,
-                },
+        guild = message.guild
+        profile = self._get_user_profile(message.author, guild)
+        yume_state = self._get_yume_state()
+
+        # 멘션 대화는 짧게. (OpenAI 호출은 블로킹이므로 executor로 돌린다.)
+        scene = "discord_mention_chat\n" + BLUE_ARCHIVE_LORE_KR
+        loop = asyncio.get_running_loop()
+
+        def _call_brain() -> Dict[str, Any]:
+            return brain.chat(
+                user_message=raw,
+                mode="free_talk",
+                scene=scene,
+                yume_state=yume_state,
+                user_profile=profile,
+                max_tokens=128,
+                temperature=0.85,
             )
-        except Exception:
-            await message.channel.send(
-                "지금은 머리가 살짝 복잡해서, 말이 잘 안 나오는 날이야.\n"
-                "나중에 다시 한 번만 불러 줄래?",
-                delete_after=8,
-            )
+
+        result = await loop.run_in_executor(None, _call_brain)
+
+        if not result.get("ok"):
+            reason = result.get("reason")
+            if reason == "limit_exceeded":
+                await message.channel.send(
+                    "이번 달엔 유메가 너무 많이 떠들어서… 잠깐 쉬어야겠어. 으헤~"
+                )
+            else:
+                await message.channel.send(
+                    "지금은 말이 잘 안 나와… 잠깐만 다시 불러줘. 으헤~"
+                )
             return
+
+        reply = (result.get("reply") or "").strip()
+        if not reply:
+            return
+
+        # 감정/관계에 살짝 반영
+        core = getattr(self.bot, "yume_core", None)
+        if core is not None:
+            try:
+                core.apply_event(
+                    "friendly_chat",
+                    user_id=str(message.author.id),
+                    guild_id=str(guild.id) if guild else None,
+                    weight=0.6,
+                )
+            except Exception:
+                pass
+
+        # 일기/로그에 짧게만 남김
+        self._log_today(f"[멘션대화] {profile.get('nickname','?')}: {raw} -> {reply}")
 
         await message.channel.send(reply)
 

@@ -59,70 +59,84 @@ YUME_SYSTEM_PROMPT = """너는 디스코드 봇 '유메'의 말투로 말한다.
 너무 과장되게 귀엽지 말고 자연스럽게.
 """
 
-DEFAULT_DOOUM_MAP: Dict[str, Set[str]] = {
-    "녀": {"여"},
-    "녁": {"역"},
-    "년": {"연"},
-    "녈": {"열"},
-    "념": {"염"},
-    "녑": {"엽"},
-    "녓": {"엿"},
-    "녕": {"영"},
-    "뇨": {"요"},
-    "뇰": {"욜"},
-    "뇽": {"용"},
-    "뉴": {"유"},
-    "뉵": {"육"},
-    "늄": {"윰"},
-    "늉": {"융"},
-    "니": {"이"},
-    "닉": {"익"},
-    "닌": {"인"},
-    "닐": {"일"},
-    "님": {"임"},
-    "닙": {"입"},
-    "닛": {"잇"},
-    "닝": {"잉"},
-    "닢": {"잎"},
-    "라": {"나"},
-    "락": {"낙"},
-    "란": {"난"},
-    "랄": {"날"},
-    "람": {"남"},
-    "랍": {"납"},
-    "랫": {"낫"},
-    "량": {"양"},
-    "략": {"약"},
-    "려": {"여"},
-    "력": {"역"},
-    "련": {"연"},
-    "렬": {"열"},
-    "렴": {"염"},
-    "렵": {"엽"},
-    "렷": {"엿"},
-    "령": {"영"},
-    "로": {"노"},
-    "록": {"녹"},
-    "론": {"논"},
-    "롤": {"놀"},
-    "롬": {"놈"},
-    "롭": {"놉"},
-    "롯": {"놋"},
-    "료": {"요"},
-    "룡": {"용"},
-    "루": {"누"},
-    "륙": {"육"},
-    "륜": {"윤"},
-    "률": {"율"},
-    "륭": {"융"},
-    "를": {"늘"},
-    "리": {"이"},
-    "린": {"인"},
-    "림": {"임"},
-    "립": {"입"},
-    "릿": {"잇"},
-    "링": {"잉"},
-}
+# =========================
+# 두음법칙(단방향 · 공식 규칙)
+#
+# 요구사항:
+# - 로:노면 로→노만 허용(역방향 노→로 금지)
+# - 누락 없이 전부 '공식 규칙'으로 고정(파일/부분 규칙에 의존하지 않음)
+#
+# 구현 방식:
+# - 한글 음절을 초/중/종성으로 분해해, 두음법칙 규칙을 알고리즘으로 적용한다.
+# - ㄴ + (ㅣ/ㅑ/ㅕ/ㅛ/ㅠ/ㅖ/ㅒ) → ㅇ
+# - ㄹ + (ㅣ/ㅑ/ㅕ/ㅛ/ㅠ/ㅖ/ㅒ) → ㅇ
+# - ㄹ + (그 외) → ㄴ
+#
+# 참고: 두음법칙은 '단어의 첫소리'에만 적용한다.
+#       블루전에서는 직전 단어의 마지막 음절을 '다음 단어의 첫 음절'로 강제하므로,
+#       마지막 음절(last_char)을 기준으로 다음 단어 첫 음절에만 단방향으로 적용한다.
+# =========================
+
+HANGUL_BASE = 0xAC00
+HANGUL_LAST = 0xD7A3
+
+# 초성 인덱스: ㄴ=2, ㄹ=5, ㅇ=11
+CHO_NIEUN = 2
+CHO_RIEUL = 5
+CHO_IEUNG = 11
+
+# 중성 인덱스(유니코드 한글 조합 표준 순서):
+# 0:ㅏ 1:ㅐ 2:ㅑ 3:ㅒ 4:ㅓ 5:ㅔ 6:ㅕ 7:ㅖ 8:ㅗ 9:ㅘ 10:ㅙ 11:ㅚ
+# 12:ㅛ 13:ㅜ 14:ㅝ 15:ㅞ 16:ㅟ 17:ㅠ 18:ㅡ 19:ㅢ 20:ㅣ
+Y_VOWELS = {2, 3, 6, 7, 12, 17, 20}  # ㅑ/ㅒ/ㅕ/ㅖ/ㅛ/ㅠ/ㅣ
+
+
+def _is_hangul_syllable(ch: str) -> bool:
+    if not ch or len(ch) != 1:
+        return False
+    o = ord(ch)
+    return HANGUL_BASE <= o <= HANGUL_LAST
+
+
+def _decompose_syllable(ch: str) -> tuple[int, int, int]:
+    """한글 음절을 (초성, 중성, 종성) 인덱스로 분해."""
+    code = ord(ch) - HANGUL_BASE
+    cho = code // 588
+    jung = (code % 588) // 28
+    jong = code % 28
+    return cho, jung, jong
+
+
+def _compose_syllable(cho: int, jung: int, jong: int) -> str:
+    """(초성, 중성, 종성) 인덱스를 한글 음절로 조합."""
+    return chr(HANGUL_BASE + (cho * 588) + (jung * 28) + jong)
+
+
+def _dooum_variant(last_char: str) -> str | None:
+    """last_char(한 글자)에 대해 두음법칙으로 허용되는 '다음 단어 첫 음절' 변형을 반환.
+
+    단방향만 반환한다.
+    예) '로' -> '노', '노' -> None
+    """
+    if not _is_hangul_syllable(last_char):
+        return None
+
+    cho, jung, jong = _decompose_syllable(last_char)
+
+    # ㄴ -> ㅇ (ㅣ/ㅑ/ㅕ/ㅛ/ㅠ/ㅖ/ㅒ)
+    if cho == CHO_NIEUN:
+        if jung in Y_VOWELS:
+            return _compose_syllable(CHO_IEUNG, jung, jong)
+        return None
+
+    # ㄹ -> ㅇ (ㅣ/ㅑ/ㅕ/ㅛ/ㅠ/ㅖ/ㅒ), 그 외 ㄹ -> ㄴ
+    if cho == CHO_RIEUL:
+        if jung in Y_VOWELS:
+            return _compose_syllable(CHO_IEUNG, jung, jong)
+        return _compose_syllable(CHO_NIEUN, jung, jong)
+
+    return None
+
 
 def _normalize_word(w: str) -> str:
     return (w or "").strip()
@@ -224,128 +238,25 @@ def _load_suggestions() -> List[str]:
                 out.append(w)
     return out
 
-def _parse_dooum_text_as_lines(text: str) -> Dict[str, Set[str]]:
-    m: Dict[str, Set[str]] = defaultdict(set)
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if line.startswith("#"):
-            continue
-        if ":" not in line:
-            continue
-        k, v = line.split(":", 1)
-        k = k.strip().strip('"').strip("'")
-        v = v.strip()
-        if not k or not v:
-            continue
-        parts: List[str] = []
-        for token in v.replace(",", " ").split():
-            t = token.strip().strip('"').strip("'")
-            if t:
-                parts.append(t)
-        if parts:
-            m[k].update(parts)
-    return {k: set(v) for k, v in m.items()}
-
-def _parse_dooum_text_as_literal(text: str) -> Dict[str, Set[str]]:
-    s = text.strip()
-    if not s:
-        return {}
-    try:
-        data = ast.literal_eval(s)
-        if not isinstance(data, dict):
-            return {}
-        out: Dict[str, Set[str]] = {}
-        for k, v in data.items():
-            if not isinstance(k, str):
-                continue
-            if isinstance(v, (set, list, tuple)):
-                vals = set(str(x) for x in v if str(x))
-            elif isinstance(v, str):
-                vals = {v} if v else set()
-            else:
-                vals = set()
-            if vals:
-                out[k] = vals
-        return out
-    except Exception:
-        return {}
-
-def _load_dooum_map() -> Dict[str, Set[str]]:
-    """두음법칙 맵을 로드한다.
-
-    ✅ 안전장치:
-    - dooum_rules.txt가 **부분 규칙만** 들어있더라도 기본(DEFAULT_DOOUM_MAP)은 항상 유지한다.
-      (파일이 존재하는 순간 기본 규칙이 통째로 덮여서 '두음법칙이 하나도 적용 안 됨' 같은 현상을 방지)
-    """
-    base: Dict[str, Set[str]] = {k: set(v) for k, v in DEFAULT_DOOUM_MAP.items()}
-
-    if not os.path.exists(DOOUM_RULES_FILE):
-        return base
-
-    try:
-        with open(DOOUM_RULES_FILE, "r", encoding="utf-8") as f:
-            text = f.read()
-
-        extra = _parse_dooum_text_as_lines(text)
-        if not extra:
-            extra = _parse_dooum_text_as_literal(text)
-
-        if extra:
-            for k, vs in extra.items():
-                if not k:
-                    continue
-                base.setdefault(k, set()).update(set(vs or []))
-
-        return base
-    except Exception as e:
-        logger.warning("[BlueWar] 두음법칙 파일 로드 실패: %s", e)
-        return base
+# 두음법칙(단방향)은 **알고리즘(_dooum_variant)** 만 사용한다.
+#
+# 요구사항이 '공식 규칙을 코드에 고정'이기 때문에,
+# 외부 파일(dooum_rules.txt)로 규칙이 바뀌는 경로는 아예 두지 않는다.
 
 
-
-def _build_equiv_map(dooum: Dict[str, Set[str]]) -> Dict[str, Set[str]]:
-    adj: Dict[str, Set[str]] = defaultdict(set)
-    for a, bs in dooum.items():
-        if not a:
-            continue
-        for b in bs:
-            if not b:
-                continue
-            adj[a].add(b)
-            adj[b].add(a)
-    nodes = set(adj.keys())
-    for vs in adj.values():
-        nodes |= set(vs)
-    equiv: Dict[str, Set[str]] = {}
-    visited: Set[str] = set()
-    for n in nodes:
-        if n in visited:
-            continue
-        q = deque([n])
-        comp: Set[str] = set()
-        visited.add(n)
-        while q:
-            x = q.popleft()
-            comp.add(x)
-            for y in adj.get(x, set()):
-                if y not in visited:
-                    visited.add(y)
-                    q.append(y)
-        for x in comp:
-            equiv[x] = set(comp)
-    return equiv
-
-DOOUM_MAP: Dict[str, Set[str]] = _load_dooum_map()
-DOOUM_EQUIV: Dict[str, Set[str]] = _build_equiv_map(DOOUM_MAP)
 
 def _allowed_first_chars(last_char: str) -> Set[str]:
+    """다음 단어의 시작 음절로 허용되는 집합(단방향 두음법칙)."""
     if not last_char:
         return set()
-    s = {last_char}
-    s |= DOOUM_MAP.get(last_char, set())
-    s |= DOOUM_EQUIV.get(last_char, set())
+
+    s: Set[str] = {last_char}
+
+    # 공식 두음법칙(단방향)
+    v = _dooum_variant(last_char)
+    if v:
+        s.add(v)
+
     return s
 
 def _valid_follow(prev_word: str, next_word: str) -> bool:
