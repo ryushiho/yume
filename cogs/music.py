@@ -1099,9 +1099,9 @@ class MusicCog(commands.Cog):
 
             try:
                 if msg:
-                    await msg.edit(embed=embed, view=view)
+                    await msg.edit(embed=embed, view=self.panel_view)
                 else:
-                    msg = await ch.send(embed=embed, view=view)
+                    msg = await ch.send(embed=embed, view=self.panel_view)
                     await self._set_fixed_panel(gid, channel_id, msg.id)
             except Exception as e:
                 logger.warning("[Music] panel restore error: %s", e)
@@ -1507,10 +1507,10 @@ class MusicCog(commands.Cog):
 
         try:
             if msg:
-                await msg.edit(embed=embed, view=view)
+                await msg.edit(embed=embed, view=self.panel_view)
                 return (channel_id, msg.id)
 
-            msg = await ch.send(embed=embed, view=view)
+            msg = await ch.send(embed=embed, view=self.panel_view)
             if fixed:
                 await self._set_fixed_panel(guild_id, channel_id, msg.id)
             else:
@@ -2298,7 +2298,7 @@ class MusicCog(commands.Cog):
     ) -> bool:
         if interaction is not None and getattr(interaction, "message", None) is not None:
             try:
-                await interaction.response.edit_message(embed=embed, view=view)
+                await interaction.response.edit_message(embed=embed, view=self.panel_view)
                 return True
             except Exception:
                 pass
@@ -2315,7 +2315,7 @@ class MusicCog(commands.Cog):
             return False
         try:
             msg = await ch.fetch_message(int(mid))
-            await msg.edit(embed=embed, view=view)
+            await msg.edit(embed=embed, view=self.panel_view)
             return True
         except Exception:
             return False
