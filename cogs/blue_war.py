@@ -338,14 +338,13 @@ def _build_equiv_map(dooum: Dict[str, Set[str]]) -> Dict[str, Set[str]]:
     return equiv
 
 DOOUM_MAP: Dict[str, Set[str]] = _load_dooum_map()
-DOOUM_EQUIV: Dict[str, Set[str]] = _build_equiv_map(DOOUM_MAP)
-
 def _allowed_first_chars(last_char: str) -> Set[str]:
+    # NOTE(중요): 두음법칙은 '단방향' 공식 규칙만 허용한다.
+    # 예) '릴' -> '일' 은 가능할 수 있지만, '일' -> '릴' 같은 역방향은 절대 허용하면 안 된다.
     if not last_char:
         return set()
     s = {last_char}
     s |= DOOUM_MAP.get(last_char, set())
-    s |= DOOUM_EQUIV.get(last_char, set())
     return s
 
 def _valid_follow(prev_word: str, next_word: str) -> bool:

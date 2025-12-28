@@ -143,11 +143,66 @@ _TAG_LINE_RE = re.compile(r"^\s*\[(ar|ti|al|by|offset):", re.IGNORECASE)
 _TS_RE = re.compile(r"\[(\d+):(\d+)(?:\.(\d+))?\]")
 
 def _clean_title(s: str) -> str:
+    """YouTube 제목을 가사 검색용 키워드로 최대한 '깨끗하게' 만든다.
+
+    흔히 붙는 꼬리표([Official Video], (MV), | ... , feat. ... 등)를 제거해서
+    LRCLIB 검색 성공률을 올린다.
+    """
     s = (s or "").strip()
-    s = re.sub(r"\s*\[[^\]]+\]\s*$", "", s)
-    s = re.sub(r"\s*\([^\)]+\)\s*$", "", s)
-    s = re.sub(r"\s*(official|mv|m/v|audio|video|lyrics?)\s*$", "", s, flags=re.IGNORECASE)
-    return s.strip()
+    if not s:
+        return ""
+
+    # 유니코드 구분자 정리
+    s = s.replace("｜", "|").replace("—", "-").replace("–", "-").replace("·", "-")
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # '|' 뒤는 보통 꼬리표(Official Video 등)인 경우가 많아서 우선 잘라낸다.
+    if "|" in s:
+        s = s.split("|", 1)[0].strip()
+
+    # 특정 키워드가 들어있는 괄호/대괄호 구간 제거
+    noise_kw = re.compile(
+        r"(official|music\s*video|mv|m/v|lyric|lyrics|audio|video|performance|live|hd|4k|visualizer|karaoke)",
+        re.IGNORECASE,
+    )
+
+    def _strip_bracketed(text: str, open_ch: str, close_ch: str) -> str:
+        # 반복 제거(중첩/여러개 대응)
+        while True:
+            m = re.search(rf"\{open_ch}([^\{close_ch}]*)\{close_ch}", text)
+            if not m:
+                break
+            inner = (m.group(1) or "").strip()
+            # feat/ft도 꼬리표로 취급
+            if noise_kw.search(inner) or re.search(r"\b(feat\.?|ft\.?|featuring)\b", inner, re.IGNORECASE):
+                text = (text[: m.start()] + " " + text[m.end() :]).strip()
+            else:
+                # 의미있는 괄호는 남긴다(예: (Japanese Ver.))
+                break
+        return text
+
+    s = _strip_bracketed(s, "[", "]")
+    s = _strip_bracketed(s, "(", ")")
+
+    # 뒤쪽에 붙는 ' - Official Video' 같은 꼬리표 제거(여러 번 반복)
+    tail_noise = re.compile(
+        r"^(official|music\s*video|mv|m/v|lyric(s)?|audio|video|performance|live|hd|4k|visualizer|karaoke)$",
+        re.IGNORECASE,
+    )
+    while True:
+        parts = [p.strip() for p in s.split("-") if p.strip()]
+        if len(parts) >= 2 and tail_noise.match(parts[-1]):
+            s = " - ".join(parts[:-1]).strip()
+            continue
+        break
+
+    # feat / featuring 꼬리표 제거 (끝부분 위주)
+    s = re.sub(r"\s*\b(feat\.?|ft\.?|featuring)\b\s+.*$", "", s, flags=re.IGNORECASE).strip()
+
+    # 끝 장식 문자 정리
+    s = s.strip("-–—| ").strip()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 def _guess_artist_title(raw_title: str) -> Tuple[str, Optional[str]]:
     """
@@ -205,6 +260,41 @@ def _parse_lrc(lrc_text: str) -> List[Tuple[float, str]]:
     return out
 
 
+
+
+def _strip_lrc_to_plain(lrc_text: str) -> str:
+    """syncedLyrics(LRC)에서 타임코드를 제거해 '순수 가사'만 남긴다."""
+    if not lrc_text:
+        return ""
+    out_lines: List[str] = []
+    for raw_line in lrc_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if _TAG_LINE_RE.match(line):
+            continue
+        # 모든 타임스탬프 제거
+        line = _TS_RE.sub("", line).strip()
+        if line:
+            out_lines.append(line)
+    return "\n".join(out_lines).strip()
+
+
+def _parse_plain_lyrics(text: str, *, interval_sec: float = 3.0) -> List[Tuple[float, str]]:
+    """plainLyrics(타임코드 없음)를 기존 가사 루프가 쓸 수 있게 '가짜 타임코드'로 변환한다.
+
+    - 표시 목적(타임코드 없는 가사)이라 정확한 싱크는 보장하지 않는다.
+    - 1줄당 interval_sec 간격으로 time을 배치한다.
+    """
+    if not text:
+        return []
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    out: List[Tuple[float, str]] = []
+    t = 0.0
+    for ln in lines:
+        out.append((t, ln))
+        t += float(interval_sec)
+    return out
 class MusicState:
     def __init__(self):
         self.queue: asyncio.Queue[_Track] = asyncio.Queue()
@@ -432,7 +522,7 @@ class MusicPanelView(discord.ui.View):
         style=discord.ButtonStyle.secondary,
         emoji="🔊",
         custom_id="yume_music_volume",
-        row=1,
+        row=2,
     )
     async def volume_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         if interaction.guild is None:
@@ -459,6 +549,17 @@ class MusicPanelView(discord.ui.View):
     )
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._shuffle(interaction)
+
+
+    @discord.ui.button(
+        label="가사",
+        style=discord.ButtonStyle.secondary,
+        emoji="🎤",
+        custom_id="yume_music_lyrics",
+        row=1,
+    )
+    async def lyrics_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        await self.cog._toggle_lyrics(interaction)
 
     @discord.ui.button(
         label="정지",
@@ -602,21 +703,13 @@ class QueueManageView(discord.ui.View):
 
 
 class SoundManageView(discord.ui.View):
-    """이퀄라이저/가사 관리(토글 메뉴)."""
+    """이퀄라이저 관리(토글 메뉴)."""
 
     def __init__(self, cog: "MusicCog"):
         super().__init__(timeout=None)
         self.cog = cog
 
-    @discord.ui.button(
-        label="가사",
-        style=discord.ButtonStyle.secondary,
-        emoji="🎤",
-        custom_id="yume_music_lyrics",
-        row=0,
-    )
-    async def lyrics_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
-        await self.cog._toggle_lyrics(interaction)
+    
 
     @discord.ui.button(
         label="EQ",
@@ -1978,7 +2071,7 @@ class MusicCog(commands.Cog):
 
         embed = discord.Embed(
             title="유메 - 이퀄라이저 관리",
-            description="EQ(이퀄라이저)와 가사 표시를 조절해.",
+            description="EQ(이퀄라이저)를 조절해.",
             color=discord.Color.blurple(),
         )
 
@@ -1993,11 +2086,6 @@ class MusicCog(commands.Cog):
         else:
             embed.add_field(name="🎧 지금 재생", value="없음", inline=False)
 
-        lyrics = "ON" if st.lyrics_enabled else "OFF"
-        if st.lyrics_enabled and st.lyrics_channel_id:
-            lyrics += f" (채널 <#{st.lyrics_channel_id}>)"
-        embed.add_field(name="🎤 가사", value=lyrics, inline=False)
-
         eq = self._fx_summary(st)
         embed.add_field(name="🎚️ EQ", value=eq, inline=False)
 
@@ -2009,7 +2097,7 @@ class MusicCog(commands.Cog):
         if st.last_error and (time.time() - st.last_error_at) < 300:
             embed.add_field(name="⚠️ 상태", value=st.last_error, inline=False)
 
-        embed.set_footer(text="이퀄라이저/가사 관리는 여기서. ↩️ 돌아가기 누르면 메인 패널로 돌아가.")
+        embed.set_footer(text="이퀄라이저 관리는 여기서. ↩️ 돌아가기 누르면 메인 패널로 돌아가.")
         return embed
 
 
@@ -2080,7 +2168,7 @@ class MusicCog(commands.Cog):
 
     def _lyrics_cache_key(self, track: _Track) -> str:
         tn, ar = _guess_artist_title(track.title)
-        ar = ar or track.artist or ""
+        ar = ar or getattr(track, 'artist', None) or ""
         return f"{tn}|||{ar}".strip()
 
     def _current_pos(self, st: MusicState) -> float:
@@ -2177,9 +2265,14 @@ class MusicCog(commands.Cog):
         except Exception:
             return None
 
-        lrc = data.get("syncedLyrics") or data.get("synced_lyrics")
+        plain = data.get("plainLyrics") or data.get("plain_lyrics") or data.get("plainlyrics")
+        if isinstance(plain, str) and plain.strip():
+            return plain.strip()
+
+        lrc = data.get("syncedLyrics") or data.get("synced_lyrics") or data.get("syncedlyrics")
         if isinstance(lrc, str) and lrc.strip():
-            return lrc
+            # syncedLyrics만 있을 때는 타임코드를 제거해서 순수 가사로 변환
+            return _strip_lrc_to_plain(lrc)
 
         return None
 
@@ -2280,9 +2373,9 @@ class MusicCog(commands.Cog):
                     lines_lrc = st.lyrics_cache[key]
                 else:
                     tn, ar = _guess_artist_title(track.title)
-                    ar = ar or track.artist
+                    ar = ar or getattr(track, 'artist', None)
                     lrc = await self._fetch_lrclib(tn, ar)
-                    lines_lrc = _parse_lrc(lrc or "")
+                    lines_lrc = _parse_plain_lyrics(lrc or "")
                     st.lyrics_cache[key] = lines_lrc
 
             embed = self._build_lyrics_embed(guild, track, lines_lrc, pos)
