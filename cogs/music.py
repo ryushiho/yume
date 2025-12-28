@@ -38,7 +38,11 @@ YTDL_OPTS = {
 }
 
 FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-FFMPEG_OPTIONS = "-vn"
+# ffmpeg는 스트림 연결이 흔들릴 때 warning 로그를 많이 뿜는다.
+# (예: "Connection reset by peer")
+# 서비스 재시작/음악 스킵 때마다 journalctl이 지저분해지니,
+# 기본 로그 레벨을 error로 낮춰서 '정말 중요한 오류'만 남긴다.
+FFMPEG_OPTIONS = "-vn -hide_banner -loglevel error"
 FFMPEG_EXECUTABLE = os.getenv("YUME_FFMPEG_PATH", "ffmpeg")
 
 _ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)

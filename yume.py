@@ -222,8 +222,24 @@ async def main():
             except Exception as e:  # pylint: disable=broad-except
                 logger.exception("확장 로드 실패: %s (%s)", ext, e)
 
-        await bot.start(token)
+        # systemd 재시작/종료(또는 deploy 과정)에서 SIGINT/SIGTERM으로
+        # 이벤트 루프가 취소될 수 있다. 이때 CancelledError/KeyboardInterrupt가
+        # 그대로 전파되면 journalctl에 "Traceback"이 찍혀서
+        # 마치 크래시처럼 보인다.
+        try:
+            await bot.start(token)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            logger.info("종료 신호를 받아 유메를 정상 종료합니다.")
+            # async with bot: 블록을 빠져나가며 close가 호출된다.
+            return
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # 일부 환경(특히 systemd stop/restart)에서 SIGINT가 들어오면
+        # asyncio.run이 KeyboardInterrupt를 던질 수 있다.
+        logger.info("KeyboardInterrupt로 종료합니다.")
+    except asyncio.CancelledError:
+        logger.info("CancelledError로 종료합니다.")
