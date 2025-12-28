@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 from typing import Optional, Literal
 
 import discord
@@ -214,6 +215,43 @@ async def main():
 
     setup_yume_ai(bot)
 
+    # systemd stop/restart 과정에서 SIGINT/SIGTERM이 들어올 때,
+    # asyncio.run 기본 SIGINT 처리(KeyboardInterrupt)로 인해
+    # CancelledError/KeyboardInterrupt Traceback이 journalctl에 찍히는 경우가 있다.
+    # 여기서 이벤트 루프의 시그널 핸들러를 우리가 다시 등록해서
+    # "Traceback 폭발" 없이 조용히 종료하도록 만든다.
+    loop = asyncio.get_running_loop()
+    _shutdown_called = {"v": False}
+
+    def _request_shutdown(signame: str) -> None:
+        if _shutdown_called["v"]:
+            return
+        _shutdown_called["v"] = True
+        logger.info("종료 신호(%s) 수신: 유메를 종료합니다.", signame)
+        try:
+            loop.create_task(bot.close())
+        except Exception:  # pylint: disable=broad-except
+            # 루프가 이미 닫히는 중이거나, close 예약이 실패해도 종료는 진행된다.
+            pass
+
+    def _install_signal(sig: int, name: str) -> None:
+        try:
+            loop.add_signal_handler(sig, _request_shutdown, name)
+            return
+        except (NotImplementedError, RuntimeError):
+            # Windows 등에서는 add_signal_handler가 지원되지 않을 수 있다.
+            pass
+        try:
+            signal.signal(sig, lambda _s, _f, _name=name: _request_shutdown(_name))
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+    # Linux(systemd) 기준: SIGTERM(기본) + SIGINT(KillSignal=SIGINT 같은 설정)
+    if hasattr(signal, "SIGTERM"):
+        _install_signal(signal.SIGTERM, "SIGTERM")
+    if hasattr(signal, "SIGINT"):
+        _install_signal(signal.SIGINT, "SIGINT")
+
     async with bot:
         for ext in EXTENSIONS:
             try:
@@ -222,15 +260,12 @@ async def main():
             except Exception as e:  # pylint: disable=broad-except
                 logger.exception("확장 로드 실패: %s (%s)", ext, e)
 
-        # systemd 재시작/종료(또는 deploy 과정)에서 SIGINT/SIGTERM으로
-        # 이벤트 루프가 취소될 수 있다. 이때 CancelledError/KeyboardInterrupt가
-        # 그대로 전파되면 journalctl에 "Traceback"이 찍혀서
-        # 마치 크래시처럼 보인다.
+        # 시그널 핸들러에서 bot.close()를 호출하면 bot.start()가 조용히 반환된다.
+        # (KeyboardInterrupt/CancelledError를 최대한 바깥으로 새지 않게)
         try:
             await bot.start(token)
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            logger.info("종료 신호를 받아 유메를 정상 종료합니다.")
-            # async with bot: 블록을 빠져나가며 close가 호출된다.
+        except asyncio.CancelledError:
+            logger.info("CancelledError로 종료합니다.")
             return
 
 
