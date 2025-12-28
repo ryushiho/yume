@@ -222,21 +222,12 @@ class MusicState:
         self.volume: float = 1.0
         self.loop_all: bool = False
 
+
         self.fx_eq_enabled: bool = False
         self.fx_bass_db: float = 0.0
         self.fx_mid_db: float = 0.0
         self.fx_treble_db: float = 0.0
         self.fx_preamp_db: float = 0.0
-
-        self.fx_reverb_enabled: bool = False
-        self.fx_reverb_mix: int = 0      # 0~100
-        self.fx_reverb_room: int = 50    # 0~100
-
-        self.fx_tune_enabled: bool = False
-        self.fx_tune_semitones: float = 0.0  # -12.0 ~ +12.0 (소수 허용)
-
-        self.fx_eq_preset: str = "off"
-        self.fx_reverb_level: int = 0
 
         self._suppress_requeue_once: bool = False
 
@@ -389,59 +380,6 @@ class EQSettingsModal(discord.ui.Modal):
         await self.cog._set_eq_settings(interaction, guild_id=self.guild_id, bass=bass, mid=mid, treble=treble, preamp=preamp)
 
 
-class ReverbSettingsModal(discord.ui.Modal):
-    title = "리버브 설정"
-
-    def __init__(self, cog: "MusicCog", guild_id: int):
-        super().__init__(timeout=180)
-        self.cog = cog
-        self.guild_id = guild_id
-
-        st = cog._state(guild_id)
-        self.mix = discord.ui.TextInput(
-            label="Mix (0~100)",
-            placeholder="예) 20",
-            required=False,
-            default=str(st.fx_reverb_mix),
-            max_length=16,
-        )
-        self.room = discord.ui.TextInput(
-            label="Room (0~100)",
-            placeholder="예) 60",
-            required=False,
-            default=str(st.fx_reverb_room),
-            max_length=16,
-        )
-        self.add_item(self.mix)
-        self.add_item(self.room)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        mix = _parse_int(self.mix.value, default=0, lo=0, hi=100)
-        room = _parse_int(self.room.value, default=50, lo=0, hi=100)
-        await self.cog._set_reverb_settings(interaction, guild_id=self.guild_id, mix=mix, room=room)
-
-
-class TuneSettingsModal(discord.ui.Modal):
-    title = "튠(피치) 설정"
-
-    def __init__(self, cog: "MusicCog", guild_id: int):
-        super().__init__(timeout=180)
-        self.cog = cog
-        self.guild_id = guild_id
-
-        st = cog._state(guild_id)
-        self.semi = discord.ui.TextInput(
-            label="Semitone (-12.0 ~ +12.0)",
-            placeholder="예) 2  /  -3.5",
-            required=False,
-            default=str(st.fx_tune_semitones),
-            max_length=16,
-        )
-        self.add_item(self.semi)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        semi = _parse_float(self.semi.value, default=0.0, lo=-12.0, hi=12.0)
-        await self.cog._set_tune_settings(interaction, guild_id=self.guild_id, semitones=semi)
 class MusicPanelView(discord.ui.View):
     """패널은 재부팅 이후에도 버튼이 살아있도록(퍼시스턴트) timeout=None로 유지."""
 
@@ -533,7 +471,7 @@ class MusicPanelView(discord.ui.View):
         await self.cog._stop(interaction)
 
     @discord.ui.button(
-        label="큐 관리",
+        label="대기열 관리",
         style=discord.ButtonStyle.secondary,
         emoji="🧰",
         custom_id="yume_music_queue",
@@ -544,7 +482,7 @@ class MusicPanelView(discord.ui.View):
 
 
     @discord.ui.button(
-        label="음향 관리",
+        label="이퀄라이저 관리",
         style=discord.ButtonStyle.secondary,
         emoji="🎛️",
         custom_id="yume_music_sound",
@@ -662,8 +600,9 @@ class QueueManageView(discord.ui.View):
         await self.cog._back_to_main_panel(interaction)
 
 
+
 class SoundManageView(discord.ui.View):
-    """음향 관리(토글 메뉴)."""
+    """이퀄라이저/가사 관리(토글 메뉴)."""
 
     def __init__(self, cog: "MusicCog"):
         super().__init__(timeout=None)
@@ -686,7 +625,7 @@ class SoundManageView(discord.ui.View):
         custom_id="yume_music_fx",
         row=0,
     )
-    async def fx_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+    async def eq_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._toggle_eq(interaction)
 
     @discord.ui.button(
@@ -713,79 +652,13 @@ class SoundManageView(discord.ui.View):
                 pass
 
     @discord.ui.button(
-        label="리버브",
-        style=discord.ButtonStyle.secondary,
-        emoji="🌊",
-        custom_id="yume_music_reverb",
-        row=0,
-    )
-    async def reverb_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
-        await self.cog._toggle_reverb(interaction)
-
-    @discord.ui.button(
-        label="리버브 설정",
-        style=discord.ButtonStyle.secondary,
-        emoji="⚙️",
-        custom_id="yume_music_reverb_settings",
-        row=0,
-    )
-    async def reverb_settings_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
-        guild = interaction.guild
-        if guild is None:
-            try:
-                await interaction.response.send_message("서버에서만 사용할 수 있어.", ephemeral=True)
-            except Exception:
-                pass
-            return
-        try:
-            await interaction.response.send_modal(ReverbSettingsModal(self.cog, guild.id))
-        except Exception:
-            try:
-                await interaction.followup.send("지금은 입력창을 열 수 없어…", ephemeral=True)
-            except Exception:
-                pass
-
-    @discord.ui.button(
-        label="튠",
-        style=discord.ButtonStyle.secondary,
-        emoji="🎛️",
-        custom_id="yume_music_tune",
-        row=1,
-    )
-    async def tune_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
-        await self.cog._toggle_tune(interaction)
-
-    @discord.ui.button(
-        label="튠 설정",
-        style=discord.ButtonStyle.secondary,
-        emoji="⚙️",
-        custom_id="yume_music_tune_settings",
-        row=1,
-    )
-    async def tune_settings_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
-        guild = interaction.guild
-        if guild is None:
-            try:
-                await interaction.response.send_message("서버에서만 사용할 수 있어.", ephemeral=True)
-            except Exception:
-                pass
-            return
-        try:
-            await interaction.response.send_modal(TuneSettingsModal(self.cog, guild.id))
-        except Exception:
-            try:
-                await interaction.followup.send("지금은 입력창을 열 수 없어…", ephemeral=True)
-            except Exception:
-                pass
-
-    @discord.ui.button(
-        label="FX 초기화",
+        label="EQ 초기화",
         style=discord.ButtonStyle.danger,
         emoji="🧼",
         custom_id="yume_music_fx_reset",
         row=1,
     )
-    async def fx_reset_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+    async def eq_reset_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._reset_fx(interaction)
 
     @discord.ui.button(
@@ -797,7 +670,6 @@ class SoundManageView(discord.ui.View):
     )
     async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._back_to_main_panel(interaction)
-
 
 
 class MusicCog(commands.Cog):
@@ -900,16 +772,16 @@ class MusicCog(commands.Cog):
     # FX config (per-guild)
     # =========================
 
+
     def _load_fx_cfg(self) -> Dict[str, Dict[str, object]]:
-        """
-        data/storage/music_fx.json 에서 길드별 FX 설정을 읽어온다.
-        - 파일이 없거나 깨져 있으면 빈 dict를 반환한다.
-        - 값은 최소한으로 검증/클램프해서 저장한다.
+        """data/storage/music_fx.json 에서 길드별 EQ 설정을 읽어온다.
+
+        과거 버전에 리버브/튠 키가 들어있더라도 무시한다(호환성).
         """
         try:
             if not os.path.exists(FX_CFG_PATH):
                 return {}
-            with open(FX_CFG_PATH, 'r', encoding='utf-8') as f:
+            with open(FX_CFG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
                 return {}
@@ -937,27 +809,13 @@ class MusicCog(commands.Cog):
                     except Exception:
                         return default
 
-                def _ii(x: object, default: int, lo: int, hi: int) -> int:
-                    try:
-                        return _clamp_int(int(x), lo, hi)
-                    except Exception:
-                        return default
-
                 out[str(gid)] = {
-                    'eq_enabled': _bf(v.get('eq_enabled', False), False),
-                    'bass_db': _ff(v.get('bass_db', 0.0), 0.0, -24.0, 24.0),
-                    'mid_db': _ff(v.get('mid_db', 0.0), 0.0, -24.0, 24.0),
-                    'treble_db': _ff(v.get('treble_db', 0.0), 0.0, -24.0, 24.0),
-                    'preamp_db': _ff(v.get('preamp_db', 0.0), 0.0, -24.0, 24.0),
-
-                    'reverb_enabled': _bf(v.get('reverb_enabled', False), False),
-                    'reverb_mix': _ii(v.get('reverb_mix', 0), 0, 0, 100),
-                    'reverb_room': _ii(v.get('reverb_room', 50), 50, 0, 100),
-
-                    'tune_enabled': _bf(v.get('tune_enabled', False), False),
-                    'tune_semitones': _ff(v.get('tune_semitones', 0.0), 0.0, -12.0, 12.0),
+                    "eq_enabled": _bf(v.get("eq_enabled", False), False),
+                    "bass_db": _ff(v.get("bass_db", 0.0), 0.0, -24.0, 24.0),
+                    "mid_db": _ff(v.get("mid_db", 0.0), 0.0, -24.0, 24.0),
+                    "treble_db": _ff(v.get("treble_db", 0.0), 0.0, -24.0, 24.0),
+                    "preamp_db": _ff(v.get("preamp_db", 0.0), 0.0, -24.0, 24.0),
                 }
-
             return out
         except Exception:
             return {}
@@ -965,49 +823,34 @@ class MusicCog(commands.Cog):
     def _save_fx_cfg_unlocked(self) -> None:
         try:
             os.makedirs(STORAGE_DIR, exist_ok=True)
-            tmp = FX_CFG_PATH + '.tmp'
-            with open(tmp, 'w', encoding='utf-8') as f:
+            tmp = FX_CFG_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self._fx_cfg, f, ensure_ascii=False, indent=2)
             os.replace(tmp, FX_CFG_PATH)
         except Exception as e:
-            logger.warning('[Music] failed to save fx cfg: %s', e)
+            logger.warning("[Music] failed to save fx cfg: %s", e)
 
     def _apply_fx_cfg_to_state(self, guild_id: int, st: MusicState) -> None:
         cfg = self._fx_cfg.get(str(guild_id))
         if not cfg:
             return
         try:
-            st.fx_eq_enabled = bool(cfg.get('eq_enabled', False))
-            st.fx_bass_db = float(cfg.get('bass_db', 0.0))
-            st.fx_mid_db = float(cfg.get('mid_db', 0.0))
-            st.fx_treble_db = float(cfg.get('treble_db', 0.0))
-            st.fx_preamp_db = float(cfg.get('preamp_db', 0.0))
-
-            st.fx_reverb_enabled = bool(cfg.get('reverb_enabled', False))
-            st.fx_reverb_mix = int(cfg.get('reverb_mix', 0))
-            st.fx_reverb_room = int(cfg.get('reverb_room', 50))
-
-            st.fx_tune_enabled = bool(cfg.get('tune_enabled', False))
-            st.fx_tune_semitones = float(cfg.get('tune_semitones', 0.0))
+            st.fx_eq_enabled = bool(cfg.get("eq_enabled", False))
+            st.fx_bass_db = float(cfg.get("bass_db", 0.0))
+            st.fx_mid_db = float(cfg.get("mid_db", 0.0))
+            st.fx_treble_db = float(cfg.get("treble_db", 0.0))
+            st.fx_preamp_db = float(cfg.get("preamp_db", 0.0))
         except Exception:
-            # 값이 깨져있어도 봇이 죽으면 안 된다.
             return
 
     async def _persist_fx_cfg_from_state(self, guild_id: int, st: MusicState) -> None:
         async with self._fx_cfg_lock:
             self._fx_cfg[str(guild_id)] = {
-                'eq_enabled': bool(st.fx_eq_enabled),
-                'bass_db': float(_clamp_float(st.fx_bass_db, -24.0, 24.0)),
-                'mid_db': float(_clamp_float(st.fx_mid_db, -24.0, 24.0)),
-                'treble_db': float(_clamp_float(st.fx_treble_db, -24.0, 24.0)),
-                'preamp_db': float(_clamp_float(st.fx_preamp_db, -24.0, 24.0)),
-
-                'reverb_enabled': bool(st.fx_reverb_enabled),
-                'reverb_mix': int(_clamp_int(int(st.fx_reverb_mix), 0, 100)),
-                'reverb_room': int(_clamp_int(int(st.fx_reverb_room), 0, 100)),
-
-                'tune_enabled': bool(st.fx_tune_enabled),
-                'tune_semitones': float(_clamp_float(float(st.fx_tune_semitones), -12.0, 12.0)),
+                "eq_enabled": bool(st.fx_eq_enabled),
+                "bass_db": float(_clamp_float(st.fx_bass_db, -24.0, 24.0)),
+                "mid_db": float(_clamp_float(st.fx_mid_db, -24.0, 24.0)),
+                "treble_db": float(_clamp_float(st.fx_treble_db, -24.0, 24.0)),
+                "preamp_db": float(_clamp_float(st.fx_preamp_db, -24.0, 24.0)),
             }
             self._save_fx_cfg_unlocked()
 
@@ -1099,9 +942,9 @@ class MusicCog(commands.Cog):
 
             try:
                 if msg:
-                    await msg.edit(embed=embed, view=self.panel_view)
+                    await msg.edit(embed=embed, view=view)
                 else:
-                    msg = await ch.send(embed=embed, view=self.panel_view)
+                    msg = await ch.send(embed=embed, view=view)
                     await self._set_fixed_panel(gid, channel_id, msg.id)
             except Exception as e:
                 logger.warning("[Music] panel restore error: %s", e)
@@ -1411,23 +1254,14 @@ class MusicCog(commands.Cog):
 
 
     def _fx_summary(self, st: MusicState) -> str:
-        parts = []
-        if st.fx_eq_enabled and (abs(st.fx_bass_db) > 0.01 or abs(st.fx_mid_db) > 0.01 or abs(st.fx_treble_db) > 0.01 or abs(st.fx_preamp_db) > 0.01):
-            parts.append(f"EQ ON (B{st.fx_bass_db:+.0f} M{st.fx_mid_db:+.0f} T{st.fx_treble_db:+.0f} P{st.fx_preamp_db:+.0f})")
-        else:
-            parts.append("EQ OFF")
-
-        if st.fx_reverb_enabled and int(st.fx_reverb_mix) > 0:
-            parts.append(f"RVB {int(st.fx_reverb_mix)}%/{int(st.fx_reverb_room)}%")
-        else:
-            parts.append("RVB OFF")
-
-        if st.fx_tune_enabled and abs(st.fx_tune_semitones) > 0.01:
-            parts.append(f"TUNE {st.fx_tune_semitones:+.1f}")
-        else:
-            parts.append("TUNE 0")
-
-        return " | ".join(parts)
+        if st.fx_eq_enabled and (
+            abs(st.fx_bass_db) > 0.01
+            or abs(st.fx_mid_db) > 0.01
+            or abs(st.fx_treble_db) > 0.01
+            or abs(st.fx_preamp_db) > 0.01
+        ):
+            return f"ON (B{st.fx_bass_db:+.0f} M{st.fx_mid_db:+.0f} T{st.fx_treble_db:+.0f} P{st.fx_preamp_db:+.0f})"
+        return "OFF"
     def _build_embed(self, guild: discord.Guild) -> discord.Embed:
         """음악 패널 임베드(깔끔/고정용)."""
         st = self._state(guild.id)
@@ -1450,7 +1284,7 @@ class MusicCog(commands.Cog):
         embed.add_field(name="📃 큐", value=f"{st.queue.qsize()}곡", inline=True)
         embed.add_field(name="🔁 반복", value="ON" if st.loop_all else "OFF", inline=True)
         embed.add_field(name="🔊 볼륨", value=f"{int(st.volume * 100)}%", inline=True)
-        embed.add_field(name="🎚️ FX", value=self._fx_summary(st), inline=True)
+        embed.add_field(name="🎚️ EQ", value=self._fx_summary(st), inline=True)
 
         if vc and vc.is_connected() and vc.channel:
             embed.add_field(name="🔊 음성 채널", value=vc.channel.name, inline=False)
@@ -1507,10 +1341,10 @@ class MusicCog(commands.Cog):
 
         try:
             if msg:
-                await msg.edit(embed=embed, view=self.panel_view)
+                await msg.edit(embed=embed, view=view)
                 return (channel_id, msg.id)
 
-            msg = await ch.send(embed=embed, view=self.panel_view)
+            msg = await ch.send(embed=embed, view=view)
             if fixed:
                 await self._set_fixed_panel(guild_id, channel_id, msg.id)
             else:
@@ -1835,14 +1669,8 @@ class MusicCog(commands.Cog):
 
 
     def _build_af_filters(self, st: MusicState) -> Optional[str]:
+        """ffmpeg -af 체인 생성 (EQ 전용)."""
         chain: List[str] = []
-
-        if st.fx_tune_enabled and abs(st.fx_tune_semitones) > 0.01:
-            factor = 2 ** (float(st.fx_tune_semitones) / 12.0)
-            inv = 1.0 / factor
-            chain.append(f"asetrate=48000*{factor}")
-            chain.append("aresample=48000")
-            chain.append(f"atempo={inv}")
 
         if abs(st.fx_preamp_db) > 0.01:
             chain.append(f"volume={float(st.fx_preamp_db)}dB")
@@ -1850,19 +1678,10 @@ class MusicCog(commands.Cog):
         if st.fx_eq_enabled:
             if abs(st.fx_bass_db) > 0.01:
                 chain.append(f"bass=g={float(st.fx_bass_db)}:f=100:w=0.5")
-            if abs(st.fx_mid_db) > 0.01 and (self._ffmpeg_filters is not None and 'equalizer' in self._ffmpeg_filters):
+            if abs(st.fx_mid_db) > 0.01 and (self._ffmpeg_filters is not None and "equalizer" in self._ffmpeg_filters):
                 chain.append(f"equalizer=f=1000:t=q:w=1:g={float(st.fx_mid_db)}")
             if abs(st.fx_treble_db) > 0.01:
                 chain.append(f"treble=g={float(st.fx_treble_db)}:f=3500:w=0.5")
-
-        if st.fx_reverb_enabled and int(st.fx_reverb_mix) > 0:
-            mix = max(0, min(100, int(st.fx_reverb_mix))) / 100.0
-            room = max(0, min(100, int(st.fx_reverb_room))) / 100.0
-            d1 = int(60 + 200 * room)
-            d2 = int(d1 * 2)
-            decay1 = min(0.95, 0.20 + 0.60 * mix)
-            decay2 = min(0.95, 0.12 + 0.45 * mix)
-            chain.append(f"aecho=0.8:0.9:{d1}|{d2}:{decay1}|{decay2}")
 
         return ",".join(chain) if chain else None
     async def _replay_current_from_start(self, guild_id: int) -> bool:
@@ -1924,48 +1743,6 @@ class MusicCog(commands.Cog):
                 pass
         await self._refresh_from_interaction(interaction)
 
-    async def _toggle_reverb(self, interaction: discord.Interaction):
-        if interaction.guild is None:
-            return
-        gid = interaction.guild.id
-        st = self._state(gid)
-        st.panel_mode = 'sound'
-        async with st.lock:
-            st.fx_reverb_enabled = not bool(st.fx_reverb_enabled)
-            await self._persist_fx_cfg_from_state(gid, st)
-            restarted = await self._replay_current_from_start(gid)
-
-        msg = f"리버브: {'ON' if st.fx_reverb_enabled else 'OFF'}" + (" (현재 곡 재시작)" if restarted else " (다음 곡부터)")
-        try:
-            await interaction.response.send_message(msg, ephemeral=True)
-        except Exception:
-            try:
-                await interaction.followup.send(msg, ephemeral=True)
-            except Exception:
-                pass
-        await self._refresh_from_interaction(interaction)
-
-    async def _toggle_tune(self, interaction: discord.Interaction):
-        if interaction.guild is None:
-            return
-        gid = interaction.guild.id
-        st = self._state(gid)
-        st.panel_mode = 'sound'
-        async with st.lock:
-            st.fx_tune_enabled = not bool(st.fx_tune_enabled)
-            await self._persist_fx_cfg_from_state(gid, st)
-            restarted = await self._replay_current_from_start(gid)
-
-        msg = f"튠: {'ON' if st.fx_tune_enabled else 'OFF'}" + (" (현재 곡 재시작)" if restarted else " (다음 곡부터)")
-        try:
-            await interaction.response.send_message(msg, ephemeral=True)
-        except Exception:
-            try:
-                await interaction.followup.send(msg, ephemeral=True)
-            except Exception:
-                pass
-        await self._refresh_from_interaction(interaction)
-
     async def _set_eq_settings(self, interaction: discord.Interaction, *, guild_id: int, bass: float, mid: float, treble: float, preamp: float):
         st = self._state(guild_id)
         st.panel_mode = 'sound'
@@ -1988,51 +1765,12 @@ class MusicCog(commands.Cog):
                 pass
         await self._refresh_from_interaction(interaction)
 
-    async def _set_reverb_settings(self, interaction: discord.Interaction, *, guild_id: int, mix: int, room: int):
-        st = self._state(guild_id)
-        st.panel_mode = 'sound'
-        async with st.lock:
-            st.fx_reverb_mix = int(mix)
-            st.fx_reverb_room = int(room)
-            st.fx_reverb_enabled = True
-            await self._persist_fx_cfg_from_state(guild_id, st)
-            restarted = await self._replay_current_from_start(guild_id)
-
-        msg = f"리버브 설정 저장: mix {mix}% / room {room}%" + (" (현재 곡 재시작)" if restarted else " (다음 곡부터)")
-        try:
-            await interaction.response.send_message(msg, ephemeral=True)
-        except Exception:
-            try:
-                await interaction.followup.send(msg, ephemeral=True)
-            except Exception:
-                pass
-        await self._refresh_from_interaction(interaction)
-
-    async def _set_tune_settings(self, interaction: discord.Interaction, *, guild_id: int, semitones: float):
-        st = self._state(guild_id)
-        st.panel_mode = 'sound'
-        async with st.lock:
-            st.fx_tune_semitones = float(semitones)
-            st.fx_tune_enabled = True
-            await self._persist_fx_cfg_from_state(guild_id, st)
-            restarted = await self._replay_current_from_start(guild_id)
-
-        msg = f"튠 설정 저장: {semitones:+.2f} semitone" + (" (현재 곡 재시작)" if restarted else " (다음 곡부터)")
-        try:
-            await interaction.response.send_message(msg, ephemeral=True)
-        except Exception:
-            try:
-                await interaction.followup.send(msg, ephemeral=True)
-            except Exception:
-                pass
-        await self._refresh_from_interaction(interaction)
-
     async def _reset_fx(self, interaction: discord.Interaction):
         if interaction.guild is None:
             return
         gid = interaction.guild.id
         st = self._state(gid)
-        st.panel_mode = 'sound'
+        st.panel_mode = "sound"
         async with st.lock:
             st.fx_eq_enabled = False
             st.fx_bass_db = 0.0
@@ -2040,17 +1778,10 @@ class MusicCog(commands.Cog):
             st.fx_treble_db = 0.0
             st.fx_preamp_db = 0.0
 
-            st.fx_reverb_enabled = False
-            st.fx_reverb_mix = 0
-            st.fx_reverb_room = 50
-
-            st.fx_tune_enabled = False
-            st.fx_tune_semitones = 0.0
-
             await self._persist_fx_cfg_from_state(gid, st)
             restarted = await self._replay_current_from_start(gid)
 
-        msg = "FX 초기화 완료" + (" (현재 곡 재시작)" if restarted else "")
+        msg = "EQ 초기화 완료" + (" (현재 곡 재시작)" if restarted else "")
         try:
             await interaction.response.send_message(msg, ephemeral=True)
         except Exception:
@@ -2060,11 +1791,6 @@ class MusicCog(commands.Cog):
                 pass
         await self._refresh_from_interaction(interaction)
 
-    async def _cycle_fx_preset(self, interaction: discord.Interaction):
-        await self._toggle_eq(interaction)
-
-    async def _cycle_reverb_level(self, interaction: discord.Interaction):
-        await self._toggle_reverb(interaction)
     async def _change_volume(self, interaction: discord.Interaction, *, delta: float):
         if interaction.guild is None:
             return
@@ -2197,7 +1923,7 @@ class MusicCog(commands.Cog):
         vc = guild.voice_client
 
         embed = discord.Embed(
-            title="유메 - 큐 관리",
+            title="유메 - 대기열 관리",
             description="번호로 삭제/정리할 수 있어. (예: 3,5,7 / 2-6)",
             color=discord.Color.blurple(),
         )
@@ -2243,7 +1969,7 @@ class MusicCog(commands.Cog):
         if st.last_error and (time.time() - st.last_error_at) < 300:
             embed.add_field(name="⚠️ 상태", value=st.last_error, inline=False)
 
-        embed.set_footer(text="큐 관리는 여기서. ↩️ 돌아가기 누르면 메인 패널로 돌아가.")
+        embed.set_footer(text="대기열 관리는 여기서. ↩️ 돌아가기 누르면 메인 패널로 돌아가.")
         return embed
 
     def _build_sound_embed(self, guild: discord.Guild) -> discord.Embed:
@@ -2251,8 +1977,8 @@ class MusicCog(commands.Cog):
         vc = guild.voice_client
 
         embed = discord.Embed(
-            title="유메 - 음향 관리",
-            description="EQ/리버브/튠/가사 표시를 조절해.",
+            title="유메 - 이퀄라이저 관리",
+            description="EQ(이퀄라이저)와 가사 표시를 조절해.",
             color=discord.Color.blurple(),
         )
 
@@ -2272,12 +1998,10 @@ class MusicCog(commands.Cog):
             lyrics += f" (채널 <#{st.lyrics_channel_id}>)"
         embed.add_field(name="🎤 가사", value=lyrics, inline=False)
 
-        eq = f"{('ON' if st.fx_eq_enabled else 'OFF')} ({st.fx_eq_preset})"
-        rvb = f"{('ON' if st.fx_reverb_enabled else 'OFF')} (레벨 {st.fx_reverb_level})"
-        tune = f"{('ON' if st.fx_tune_enabled else 'OFF')} ({st.fx_tune_semitones:+.1f})"
-        embed.add_field(name="🎚️ FX", value=f"EQ {eq} | RVB {rvb} | TUNE {tune}", inline=False)
+        eq = self._fx_summary(st)
+        embed.add_field(name="🎚️ EQ", value=eq, inline=False)
 
-        if vc and vc.is_connected() and getattr(vc, 'channel', None):
+        if vc and vc.is_connected() and getattr(vc, "channel", None):
             embed.add_field(name="🔊 음성 채널", value=vc.channel.name, inline=False)
         else:
             embed.add_field(name="🔊 음성 채널", value="(연결 안 됨)", inline=False)
@@ -2285,8 +2009,9 @@ class MusicCog(commands.Cog):
         if st.last_error and (time.time() - st.last_error_at) < 300:
             embed.add_field(name="⚠️ 상태", value=st.last_error, inline=False)
 
-        embed.set_footer(text="음향 관리는 여기서. 가사는 곡마다 없을 수도 있어. ↩️ 돌아가기 누르면 메인 패널로 돌아가.")
+        embed.set_footer(text="이퀄라이저/가사 관리는 여기서. ↩️ 돌아가기 누르면 메인 패널로 돌아가.")
         return embed
+
 
     async def _edit_panel_message(
         self,
@@ -2296,9 +2021,13 @@ class MusicCog(commands.Cog):
         view: discord.ui.View,
         interaction: Optional[discord.Interaction] = None,
     ) -> bool:
+        # 버튼 상호작용이면 가능한 한 "해당 메시지"를 바로 수정한다.
         if interaction is not None and getattr(interaction, "message", None) is not None:
             try:
-                await interaction.response.edit_message(embed=embed, view=self.panel_view)
+                if not interaction.response.is_done():
+                    await interaction.response.edit_message(embed=embed, view=view)
+                else:
+                    await interaction.message.edit(embed=embed, view=view)  # type: ignore[union-attr]
                 return True
             except Exception:
                 pass
@@ -2315,7 +2044,7 @@ class MusicCog(commands.Cog):
             return False
         try:
             msg = await ch.fetch_message(int(mid))
-            await msg.edit(embed=embed, view=self.panel_view)
+            await msg.edit(embed=embed, view=view)
             return True
         except Exception:
             return False
