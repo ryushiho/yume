@@ -7,6 +7,9 @@ Phase 5: 블루전 단어 DB를 웹(yume-admin)에서 가져오고, 로컬 캐�
   - GET {BASE}/api/bluewar/wordlists/suggestion.txt
   - GET {BASE}/api/bluewar/wordlists/blue_archive_words.txt
 
+  ※ 운영 웹에서 원본 TXT를 토큰으로 보호하는 경우
+    env YUME_WORDLIST_TOKEN 을 봇과 웹 둘 다 동일하게 설정해야 한다.
+
 - BASE URL 우선순위:
   - YUME_WORDLIST_BASE_URL
   - YUME_ADMIN_URL (전적 전송에 쓰는 동일 base)
@@ -47,13 +50,26 @@ def get_wordlist_base_url() -> str:
     return base.rstrip("/")
 
 
+def get_wordlist_token() -> str:
+    """원본 TXT 다운로드 보호 토큰.
+
+    웹(yume-web)에서 /api/bluewar/wordlists/*.txt 를 토큰으로 보호할 때 사용.
+    - env: YUME_WORDLIST_TOKEN
+    """
+    return (os.getenv("YUME_WORDLIST_TOKEN") or "").strip()
+
+
 def _http_get(url: str, *, timeout: float = 5.0) -> bytes:
+    token = get_wordlist_token()
+    headers = {
+        "User-Agent": "yumebot-bluewar-wordlists/1.0",
+        "Accept": "application/json, text/plain, */*",
+    }
+    if token:
+        headers["X-Yume-Wordlist-Token"] = token
     req = urllib.request.Request(
         url=url,
-        headers={
-            "User-Agent": "yumebot-bluewar-wordlists/1.0",
-            "Accept": "application/json, text/plain, */*",
-        },
+        headers=headers,
         method="GET",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
