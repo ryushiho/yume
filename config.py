@@ -17,6 +17,12 @@ USER_STATE_DIR = os.path.join(DATA_DIR, "user_state")
 SYSTEM_DIR = os.path.join(DATA_DIR, "system")
 STORAGE_DIR = os.path.join(DATA_DIR, "storage")
 
+CACHE_DIR = os.path.join(DATA_DIR, "cache")
+BLUEWAR_WORDLIST_CACHE_DIR = os.path.join(CACHE_DIR, "bluewar_wordlists")
+BLUEWAR_CACHED_WORDS_FILE = os.path.join(BLUEWAR_WORDLIST_CACHE_DIR, "blue_archive_words.txt")
+BLUEWAR_CACHED_SUGGESTION_FILE = os.path.join(BLUEWAR_WORDLIST_CACHE_DIR, "suggestion.txt")
+BLUEWAR_WORDLIST_META_FILE = os.path.join(BLUEWAR_WORDLIST_CACHE_DIR, "meta.json")
+
 
 WORDS_FILE = os.path.join(DICT_DIR, "blue_archive_words.txt")
 
@@ -42,11 +48,13 @@ def ensure_directories():
         USER_STATE_DIR,
         SYSTEM_DIR,
         STORAGE_DIR,
+        CACHE_DIR,
+        BLUEWAR_WORDLIST_CACHE_DIR,
     ]
 
     for d in dirs:
         if not os.path.exists(d):
-            os.makedirs(d)
+            os.makedirs(d, exist_ok=True)
 
 
 ensure_directories()

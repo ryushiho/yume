@@ -4,6 +4,7 @@ import asyncio
 import ast
 import logging
 import json
+import hashlib
 import os
 import urllib.request
 import urllib.error
@@ -18,7 +19,9 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Callable
 import discord
 from discord.ext import commands
 
-from words_core import WORDS_SET, WORDS_BY_FIRST
+from words_core import load_words_from_file, pick_words_source
+from bluewar_wordlists import sync_wordlists, load_local_meta
+from config import BLUEWAR_CACHED_SUGGESTION_FILE, WORDS_FILE
 from records_core import ensure_records, load_records, save_records, add_match_record, calc_rankings
 
 logger = logging.getLogger(__name__)
@@ -33,6 +36,11 @@ PRACTICE_TURN_TIMEOUT = 90.0
 PVP_TURN_TIMEOUT = 90.0
 AI_SEARCH_DEPTH = 10
 AI_SEARCH_TIME_LIMIT = 60.0
+
+# Phase 5: 웹(어드민) 단어리스트 캐시/폴백을 통해 로드된다.
+# 이 모듈의 여러 함수가 참조하므로, 최신 값으로 재할당한다.
+WORDS_SET: Set[str] = set()
+WORDS_BY_FIRST: Dict[str, List[str]] = defaultdict(list)
 
 try:
     from openai import AsyncOpenAI
@@ -194,11 +202,22 @@ def post_bluewar_match_to_admin(payload: Dict[str, Any]) -> bool:
         logger.warning("[BlueWar->Admin] Error: %s", e)
         return False
 
+def _pick_suggestion_source(*, prefer_cache: bool = True) -> str:
+    if prefer_cache and os.path.exists(BLUEWAR_CACHED_SUGGESTION_FILE):
+        try:
+            if os.path.getsize(BLUEWAR_CACHED_SUGGESTION_FILE) > 0:
+                return BLUEWAR_CACHED_SUGGESTION_FILE
+        except Exception:
+            pass
+    return SUGGESTION_FILE
+
+
 def _load_suggestions() -> List[str]:
-    if not os.path.exists(SUGGESTION_FILE):
+    path = _pick_suggestion_source()
+    if not os.path.exists(path):
         return []
     out: List[str] = []
-    with open(SUGGESTION_FILE, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             w = _normalize_word(line)
             if w:
@@ -351,24 +370,37 @@ def _build_graph(words: Set[str]) -> Dict[str, Set[str]]:
         first = _first_char(w)
         last = _last_char(w)
         graph[first].add(w)
+        # last char도 key는 만들어둔다
         graph[last]
     return graph
 
-def _load_or_build_graph() -> Dict[str, Set[str]]:
+
+def _load_or_build_graph(words: Set[str], signature: str) -> Dict[str, Set[str]]:
+    """단어 그래프(캐시)를 로드하거나 빌드한다.
+
+    signature(예: sha256)가 바뀌면 캐시를 무조건 재생성한다.
+    """
     try:
         if os.path.exists(GRAPH_CACHE_FILE):
             with open(GRAPH_CACHE_FILE, "rb") as f:
                 data = pickle.load(f)
-                if isinstance(data, dict):
-                    return data
+
+            # 새 포맷: {"signature": str, "graph": dict}
+            if isinstance(data, dict) and "signature" in data and "graph" in data:
+                sig = data.get("signature")
+                g = data.get("graph")
+                if isinstance(sig, str) and sig == signature and isinstance(g, dict):
+                    return g  # type: ignore[return-value]
+
+            # 구 포맷: 그래프 dict만 저장되어 있던 경우 -> words 변경 가능성이 있어 재빌드
     except Exception as e:
         logger.warning("[BlueWar] 그래프 캐시 로드 실패: %s", e)
 
-    graph = _build_graph(WORDS_SET)
+    graph = _build_graph(words)
     try:
         os.makedirs(os.path.dirname(GRAPH_CACHE_FILE), exist_ok=True)
         with open(GRAPH_CACHE_FILE, "wb") as f:
-            pickle.dump(graph, f)
+            pickle.dump({"signature": signature, "graph": graph}, f)
     except Exception as e:
         logger.warning("[BlueWar] 그래프 캐시 저장 실패: %s", e)
     return graph
@@ -632,9 +664,111 @@ class BlueWarCog(commands.Cog):
         self.bot = bot
         self.sessions: Dict[Tuple[int, int], BlueWarSession] = {}
         self._sessions_lock = asyncio.Lock()
-        self.suggestions = _load_suggestions()
-        self.graph = _load_or_build_graph()
+
+        # Phase 5: 단어리스트는 웹(어드민) -> 로컬 캐시 -> 로컬 파일 순으로 로드한다.
+        self._wordlists_signature: str = ""
+        self._wordlists_source: str = ""
+        self._wordlists_last_sync_reason: str = ""
+
+        self._load_wordlists_initial()
+
         self.openai = AsyncOpenAI(api_key=OPENAI_API_KEY) if (AsyncOpenAI and OPENAI_API_KEY) else None
+
+
+    def _compute_file_sha256(self, path: str) -> str:
+        try:
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return ""
+
+    def _get_words_signature(self, words_path: str) -> str:
+        """웹 meta(sha256) -> 파일 sha256 순으로 시그니처를 만든다."""
+        try:
+            meta = load_local_meta()
+            m = meta.get("blue_archive_words") if isinstance(meta, dict) else None
+            if isinstance(m, dict):
+                sha = (m.get("sha256") or "").strip()
+                if sha:
+                    return sha
+        except Exception:
+            pass
+        if words_path and os.path.exists(words_path):
+            return self._compute_file_sha256(words_path)
+        return ""
+
+    def _reload_words_and_graph(self) -> None:
+        global WORDS_SET, WORDS_BY_FIRST
+        words_path = pick_words_source(prefer_cache=True)
+        self._wordlists_source = words_path
+        WORDS_SET, WORDS_BY_FIRST = load_words_from_file(words_path)
+        self._wordlists_signature = self._get_words_signature(words_path)
+        self.graph = _load_or_build_graph(WORDS_SET, self._wordlists_signature)
+
+    def _load_wordlists_initial(self) -> None:
+        """봇 시작 시 단어리스트를 로드한다.
+
+        - 캐시가 없고 로컬 파일도 없으면 1회 동기화를 시도한다.
+        - 네트워크가 실패해도 예외로 죽지 않고(가능한 폴백),
+          최종적으로 로드 실패 시 WORDS_SET이 비게 된다.
+        """
+        # 1) 서버에 로컬 파일을 안 둘 수도 있으니, 캐시/로컬 둘 다 없으면 동기화 1회 시도
+        try:
+            words_candidate = pick_words_source(prefer_cache=True)
+            sugg_candidate = _pick_suggestion_source(prefer_cache=True)
+            need_sync = (not os.path.exists(words_candidate)) or (not os.path.exists(sugg_candidate))
+            if need_sync:
+                res = sync_wordlists(force=False)
+                self._wordlists_last_sync_reason = res.reason
+        except Exception as e:
+            self._wordlists_last_sync_reason = f"initial sync failed: {e}"
+
+        # 2) 실제 로드
+        try:
+            self._reload_words_and_graph()
+        except Exception as e:
+            logger.error("[BlueWar] 단어 로드 실패: %s", e)
+            WORDS_SET = set()
+            WORDS_BY_FIRST = defaultdict(list)
+            self.graph = {}
+            self._wordlists_signature = ""
+            self._wordlists_source = ""
+
+        try:
+            self.suggestions = _load_suggestions()
+        except Exception:
+            self.suggestions = []
+
+    async def _ensure_wordlists_ready(self, *, force: bool = False) -> bool:
+        """게임 시작 직전에 웹 캐시를 확인하고, 변경되었으면 리로드한다."""
+        try:
+            res = await asyncio.to_thread(sync_wordlists, force=force)
+            self._wordlists_last_sync_reason = res.reason
+            if not res.synced:
+                return False
+            if not res.changed:
+                return False
+
+            changed = False
+            if "blue_archive_words" in res.changed_lists:
+                self._reload_words_and_graph()
+                changed = True
+            if "suggestion" in res.changed_lists:
+                self.suggestions = _load_suggestions()
+                changed = True
+
+            if changed:
+                logger.info("[BlueWar] wordlists updated: %s", ",".join(res.changed_lists))
+            return changed
+        except Exception as e:
+            logger.warning("[BlueWar] wordlists ensure failed: %s", e)
+            return False
 
     def _key(self, guild: Optional[discord.Guild], channel: discord.abc.GuildChannel | discord.abc.PrivateChannel) -> Tuple[int, int]:
         gid = guild.id if guild else 0
@@ -1259,6 +1393,12 @@ class BlueWarCog(commands.Cog):
             await ctx.send("PVP 블루전은 서버 채널에서만 할 수 있어.")
             return
 
+        # Phase 5: 게임 시작 전 웹 단어리스트 캐시를 한 번 확인한다.
+        await self._ensure_wordlists_ready()
+        if not WORDS_SET:
+            await ctx.send("단어 DB를 아직 못 불러왔어... 웹 단어리스트 설정/상태를 확인해 줘.")
+            return
+
         key = self._key(ctx.guild, ctx.channel)
 
         async with self._sessions_lock:
@@ -1320,6 +1460,12 @@ class BlueWarCog(commands.Cog):
 
     @commands.command(name="블루전연습", help="유메와 1:1 연습 블루전을 합니다.")
     async def cmd_bluewar_practice(self, ctx: commands.Context):
+        # Phase 5: 게임 시작 전 웹 단어리스트 캐시를 한 번 확인한다.
+        await self._ensure_wordlists_ready()
+        if not WORDS_SET:
+            await ctx.send("단어 DB를 아직 못 불러왔어... 웹 단어리스트 설정/상태를 확인해 줘.")
+            return
+
         key = self._key(ctx.guild, ctx.channel)
 
         async with self._sessions_lock:
