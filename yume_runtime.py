@@ -28,6 +28,7 @@ import discord
 
 from yume_llm import generate_daily_rule
 from yume_send import send_channel
+from yume_websync import post_sync_payload
 from yume_store import (
     bump_daily_rule_attempt,
     ensure_daily_rule_row,
@@ -277,6 +278,39 @@ async def _world_state_loop(bot: discord.Client) -> None:
         await asyncio.sleep(60)
 
 
+def _websync_enabled() -> bool:
+    # Phase6-1: bot -> web dashboard sync is optional.
+    url = (os.getenv("YUME_WEB_SYNC_URL", "") or "").strip()
+    token = (os.getenv("YUME_WEB_SYNC_TOKEN", "") or "").strip()
+    return bool(url and token)
+
+
+async def _web_sync_loop(bot: discord.Client) -> None:
+    """Periodically POST a small status snapshot to the web.
+
+    - Disabled unless env is configured.
+    - Never raises (keeps the bot alive).
+    """
+
+    await asyncio.sleep(random.uniform(2.0, 6.0))
+
+    while True:
+        try:
+            if _websync_enabled():
+                ok = await post_sync_payload(bot)
+                # On failure, retry a bit sooner (but not too spammy).
+                await asyncio.sleep(120 if not ok else 300)
+            else:
+                # Check again later.
+                await asyncio.sleep(600)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("[web_sync_loop] error: %s", e)
+            await asyncio.sleep(300)
+
+
 def start_background_tasks(bot: discord.Client) -> None:
     """Start background tasks once. Safe to call multiple times."""
 
@@ -289,6 +323,7 @@ def start_background_tasks(bot: discord.Client) -> None:
     try:
         tasks.append(asyncio.create_task(_world_state_loop(bot)))
         tasks.append(asyncio.create_task(_daily_rule_loop(bot)))
+        tasks.append(asyncio.create_task(_web_sync_loop(bot)))
     except Exception as e:
         logger.error("Failed to start background tasks: %s", e)
 

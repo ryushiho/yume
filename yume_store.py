@@ -521,3 +521,30 @@ def get_latest_stamp_reward(user_id: int) -> Optional[Dict[str, Any]]:
         """,
         (int(user_id),),
     )
+
+
+def get_top_stamps(limit: int = 10) -> list[Dict[str, Any]]:
+    """Return top users by stamps.
+
+    Used by Phase6-1 web sync to show a tiny leaderboard.
+    """
+
+    lim = int(limit)
+    if lim <= 0:
+        lim = 10
+    if lim > 50:
+        lim = 50
+
+    rows = fetchall(
+        """
+        SELECT user_id,
+               COALESCE(stamps, 0) AS stamps,
+               COALESCE(stamp_title, '') AS stamp_title,
+               COALESCE(updated_at, 0) AS updated_at
+        FROM user_settings
+        ORDER BY COALESCE(stamps, 0) DESC, updated_at DESC
+        LIMIT ?;
+        """,
+        (lim,),
+    )
+    return rows or []
