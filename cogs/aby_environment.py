@@ -11,7 +11,19 @@ import discord
 from discord.ext import commands, tasks
 
 from yume_send import send_ctx
-from yume_store import ensure_world_weather_rotated, get_config, get_world_state, set_config, set_world_weather
+from yume_store import (
+    ABY_DEFAULT_DEBT,
+    ABY_DEFAULT_INTEREST_RATE,
+    apply_guild_interest_upto_today,
+    debt_pressure_stage,
+    ensure_world_weather_rotated,
+    get_config,
+    get_guild_debt,
+    get_world_state,
+    list_aby_debt_guild_ids,
+    set_config,
+    set_world_weather,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -58,6 +70,10 @@ def _normalize_weather(arg: str) -> Optional[str]:
     return None
 
 
+def _today_ymd_kst() -> str:
+    return datetime.datetime.now(tz=KST).date().isoformat()
+
+
 def _weather_one_liner(weather: str) -> str:
     w = (weather or "clear").strip()
     if w == "sandstorm":
@@ -79,10 +95,17 @@ class AbyEnvironmentCog(commands.Cog):
         self.bot = bot
         if not self._weather_loop.is_running():
             self._weather_loop.start()
+        if not self._debt_loop.is_running():
+            self._debt_loop.start()
 
     def cog_unload(self) -> None:
         try:
             self._weather_loop.cancel()
+        except Exception:
+            pass
+
+        try:
+            self._debt_loop.cancel()
         except Exception:
             pass
 
@@ -118,6 +141,101 @@ class AbyEnvironmentCog(commands.Cog):
     @_weather_loop.before_loop
     async def _before_weather_loop(self) -> None:
         await self.bot.wait_until_ready()
+
+    # ------------------------------
+    # Phase6: Debt auto-interest + announcements
+    # ------------------------------
+
+    @tasks.loop(minutes=5)
+    async def _debt_loop(self) -> None:
+        """Background debt interest application.
+
+        Safe by design:
+        - Interest is applied *at most once* per KST day (tracked in DB).
+        - Running frequently is ok; no repeated compounding.
+        """
+
+        try:
+            today = _today_ymd_kst()
+            guild_ids = list_aby_debt_guild_ids()
+            if not guild_ids:
+                return
+
+            for gid in guild_ids:
+                res = apply_guild_interest_upto_today(int(gid), today)
+                applied_days = int(res.get("applied_days") or 0)
+                if applied_days <= 0:
+                    continue
+                await self._maybe_announce_debt_update(int(gid), res, today)
+
+        except Exception:
+            logger.exception("AbyEnvironment: debt loop failed")
+
+    @_debt_loop.before_loop
+    async def _before_debt_loop(self) -> None:
+        await self.bot.wait_until_ready()
+
+    async def _maybe_announce_debt_update(self, guild_id: int, res: dict, today_ymd: str) -> None:
+        key_chan = f"aby_debt_announce_channel_id:{int(guild_id)}"
+        chan_id_s = get_config(key_chan, None)
+        if not chan_id_s:
+            return
+
+        try:
+            chan_id = int(chan_id_s)
+        except Exception:
+            return
+
+        key_last = f"aby_debt_last_announce_ymd:{int(guild_id)}"
+        last_ymd = str(get_config(key_last, "") or "")
+        if last_ymd == str(today_ymd):
+            return
+
+        ch = self.bot.get_channel(chan_id)
+        if ch is None:
+            try:
+                ch = await self.bot.fetch_channel(chan_id)
+            except Exception:
+                return
+
+        if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+            return
+
+        s = get_guild_debt(int(guild_id))
+        new_debt = int(s.get("debt", ABY_DEFAULT_DEBT))
+        rate = float(s.get("interest_rate", ABY_DEFAULT_INTEREST_RATE))
+
+        old_debt = int(res.get("old_debt") or new_debt)
+        applied_days = int(res.get("applied_days") or 0)
+        delta = max(0, new_debt - old_debt)
+
+        stage = debt_pressure_stage(new_debt, initial=ABY_DEFAULT_DEBT)
+        stage_txt = f"{stage.get('emoji', '')} {stage.get('stage', '')}".strip()
+
+        note = ""
+        if applied_days > 1:
+            note = f"(봇이 꺼져있던 기간 포함: {applied_days}일치 이자 반영)"
+
+        embed = discord.Embed(
+            title="아비도스 채무 갱신",
+            description=f"오늘도 빚이… 자랐어. {note}".strip(),
+        )
+        embed.add_field(name="현재 빚", value=f"{new_debt:,}", inline=True)
+        embed.add_field(name="증가", value=f"+{delta:,}", inline=True)
+        embed.add_field(name="일일 이자율", value=f"{rate * 100:.2f}%", inline=True)
+        if stage_txt:
+            embed.add_field(name="채무 압박", value=stage_txt, inline=True)
+
+        try:
+            await ch.send(embed=embed)
+        except Exception:
+            return
+
+        # Mark announced for today (even if we applied multiple days)
+        try:
+            set_config(key_last, str(today_ymd))
+        except Exception:
+            pass
 
     async def _maybe_announce_change(self, prev_weather: str, new_weather: str, state: dict) -> None:
         chan_id_s = get_config("aby_weather_announce_channel_id", None)

@@ -1276,6 +1276,130 @@ def repay_guild_debt(guild_id: int, user_id: int, amount: int, today_ymd: str) -
         "credits_after": max(0, credits - pay),
     }
 
+
+# ------------------------------
+# Phase6-2 Phase6: Debt pressure helpers
+# ------------------------------
+
+
+def list_aby_debt_guild_ids() -> list[int]:
+    """Return guild_ids that have a debt row.
+
+    We only auto-apply interest for guilds that already opted into the
+    Abydos debt system (i.e., a row exists).
+    """
+
+    rows = fetchall(
+        """
+        SELECT guild_id
+        FROM aby_guild_debt
+        ORDER BY guild_id ASC;
+        """
+    )
+    out: list[int] = []
+    for r in rows or []:
+        try:
+            out.append(int(r.get("guild_id") or 0))
+        except Exception:
+            continue
+    return [x for x in out if x > 0]
+
+
+def get_interest_delta_for_day(guild_id: int, ymd: str) -> int:
+    """Sum of interest deltas for a given day (ymd)."""
+
+    row = fetchone(
+        """
+        SELECT COALESCE(SUM(delta_debt), 0) AS total
+        FROM aby_economy_log
+        WHERE guild_id=? AND kind='interest' AND memo=?;
+        """,
+        (int(guild_id), str(ymd)),
+    )
+    return int((row or {}).get("total") or 0)
+
+
+def get_repay_total_for_day_guild(guild_id: int, ymd: str) -> int:
+    """Total repaid credits for a given day (across all users)."""
+
+    row = fetchone(
+        """
+        SELECT COALESCE(SUM(-delta_credits), 0) AS total
+        FROM aby_economy_log
+        WHERE guild_id=? AND kind='repay' AND memo=?;
+        """,
+        (int(guild_id), str(ymd)),
+    )
+    return int((row or {}).get("total") or 0)
+
+
+def get_interest_deltas_recent(guild_id: int, limit: int = 7) -> list[Dict[str, Any]]:
+    """Recent per-day interest deltas (ymd, delta)."""
+
+    lim = int(limit)
+    if lim <= 0:
+        lim = 7
+    if lim > 30:
+        lim = 30
+
+    rows = fetchall(
+        """
+        SELECT memo AS ymd,
+               COALESCE(SUM(delta_debt), 0) AS delta_debt,
+               MAX(created_at) AS created_at
+        FROM aby_economy_log
+        WHERE guild_id=? AND kind='interest' AND memo != ''
+        GROUP BY memo
+        ORDER BY memo DESC
+        LIMIT ?;
+        """,
+        (int(guild_id), lim),
+    )
+    return rows or []
+
+
+def get_repay_totals_recent(guild_id: int, limit: int = 7) -> list[Dict[str, Any]]:
+    """Recent per-day repay totals (ymd, total)."""
+
+    lim = int(limit)
+    if lim <= 0:
+        lim = 7
+    if lim > 30:
+        lim = 30
+
+    rows = fetchall(
+        """
+        SELECT memo AS ymd,
+               COALESCE(SUM(-delta_credits), 0) AS total_repaid,
+               MAX(created_at) AS created_at
+        FROM aby_economy_log
+        WHERE guild_id=? AND kind='repay' AND memo != ''
+        GROUP BY memo
+        ORDER BY memo DESC
+        LIMIT ?;
+        """,
+        (int(guild_id), lim),
+    )
+    return rows or []
+
+
+def debt_pressure_stage(debt: int, *, initial: int = ABY_DEFAULT_DEBT) -> Dict[str, Any]:
+    """Compute a simple narrative "pressure" stage from the current debt."""
+
+    d = max(0, int(debt))
+    base = max(1, int(initial))
+    ratio = d / float(base)
+
+    if ratio < 1.02:
+        return {"stage": "버티는 중", "emoji": "🙂", "ratio": ratio}
+    if ratio < 1.10:
+        return {"stage": "긴장", "emoji": "😬", "ratio": ratio}
+    if ratio < 1.25:
+        return {"stage": "위기", "emoji": "😵", "ratio": ratio}
+    if ratio < 1.50:
+        return {"stage": "절망", "emoji": "💀", "ratio": ratio}
+    return {"stage": "종말", "emoji": "☠️", "ratio": ratio}
+
 # ------------------------------
 # Phase6-2 Phase5: Explore meta + Quest board + Weekly points
 # ------------------------------
@@ -1390,7 +1514,7 @@ _ABY_MATS_BASIC = ["scrap", "cloth"]
 _ABY_MATS_ADV = ["filter", "battery", "circuit"]
 
 
-def _gen_daily_quests(guild_id: int, today_ymd: str) -> list[dict]:
+def _gen_daily_quests(guild_id: int, today_ymd: str, *, pressure_ratio: float = 1.0) -> list[dict]:
     r = _aby_rng(guild_id, scope="daily", board_key=today_ymd)
 
     q: list[dict] = []
@@ -1450,7 +1574,13 @@ def _gen_daily_quests(guild_id: int, today_ymd: str) -> list[dict]:
     )
 
     # 3) repay total (daily)
-    repay_amt = r.choice([15_000, 20_000, 30_000, 40_000, 50_000])
+    # Phase6: as debt grows, repayment targets rise (still dwarfed by interest).
+    choices = [15_000, 20_000, 30_000, 40_000, 50_000]
+    if pressure_ratio >= 1.30:
+        choices = [30_000, 40_000, 50_000, 60_000, 80_000]
+    if pressure_ratio >= 1.60:
+        choices = [50_000, 60_000, 80_000, 100_000, 120_000]
+    repay_amt = r.choice(choices)
     pts3 = r.randint(10, 16)
     cred3 = r.randint(0, 3_000)
     title3 = "부채 상환 실적"
@@ -1473,7 +1603,7 @@ def _gen_daily_quests(guild_id: int, today_ymd: str) -> list[dict]:
     return q
 
 
-def _gen_weekly_quests(guild_id: int, week_key: str) -> list[dict]:
+def _gen_weekly_quests(guild_id: int, week_key: str, *, pressure_ratio: float = 1.0) -> list[dict]:
     r = _aby_rng(guild_id, scope="weekly", board_key=week_key)
 
     q: list[dict] = []
@@ -1509,7 +1639,13 @@ def _gen_weekly_quests(guild_id: int, week_key: str) -> list[dict]:
     )
 
     # 2) repay total (weekly)
-    repay_amt = r.choice([120_000, 150_000, 200_000, 250_000])
+    # Phase6: as debt grows, weekly targets rise.
+    choices = [120_000, 150_000, 200_000, 250_000]
+    if pressure_ratio >= 1.30:
+        choices = [200_000, 250_000, 300_000, 350_000]
+    if pressure_ratio >= 1.60:
+        choices = [350_000, 450_000, 550_000, 650_000]
+    repay_amt = r.choice(choices)
     pts2 = r.randint(26, 40)
     cred2 = r.randint(15_000, 35_000)
     title2 = "주간 부채 상환"
@@ -1605,16 +1741,39 @@ def _insert_quests(guild_id: int, scope: str, board_key: str, quests: list[dict]
 
 
 def ensure_aby_daily_quest_board(guild_id: int, today_ymd: str) -> None:
+    # Phase6: keep debt updated so the board reflects current "pressure".
+    apply_guild_interest_upto_today(guild_id, today_ymd)
+
+    s = get_guild_debt(guild_id)
+    debt = int((s or {}).get("debt") or ABY_DEFAULT_DEBT)
+    stage = debt_pressure_stage(debt, initial=ABY_DEFAULT_DEBT)
+    try:
+        ratio = float(stage.get("ratio") or 1.0)
+    except Exception:
+        ratio = 1.0
+
     if _get_quest_count(guild_id, "daily", today_ymd) >= ABY_DAILY_QUEST_COUNT:
         return
-    quests = _gen_daily_quests(int(guild_id), str(today_ymd))
+    quests = _gen_daily_quests(int(guild_id), str(today_ymd), pressure_ratio=ratio)
     _insert_quests(int(guild_id), "daily", str(today_ymd), quests)
 
 
 def ensure_aby_weekly_quest_board(guild_id: int, week_key: str) -> None:
+    # Phase6: weekly board also reacts to current debt pressure.
+    today_ymd = datetime.datetime.now(tz=KST).date().isoformat()
+    apply_guild_interest_upto_today(guild_id, today_ymd)
+
+    s = get_guild_debt(guild_id)
+    debt = int((s or {}).get("debt") or ABY_DEFAULT_DEBT)
+    stage = debt_pressure_stage(debt, initial=ABY_DEFAULT_DEBT)
+    try:
+        ratio = float(stage.get("ratio") or 1.0)
+    except Exception:
+        ratio = 1.0
+
     if _get_quest_count(guild_id, "weekly", week_key) >= ABY_WEEKLY_QUEST_COUNT:
         return
-    quests = _gen_weekly_quests(int(guild_id), str(week_key))
+    quests = _gen_weekly_quests(int(guild_id), str(week_key), pressure_ratio=ratio)
     _insert_quests(int(guild_id), "weekly", str(week_key), quests)
 
 

@@ -29,9 +29,19 @@ from yume_store import (
     repay_guild_debt,
     ABY_DEFAULT_DEBT,
     ABY_DEFAULT_INTEREST_RATE,
+    debt_pressure_stage,
+    get_config,
+    get_interest_delta_for_day,
+    get_interest_deltas_recent,
+    get_repay_total_for_day_guild,
+    get_repay_totals_recent,
+    set_config,
 )
 
 logger = logging.getLogger(__name__)
+
+
+OWNER_ID = 1433962010785349634
 
 
 WEATHER_LABEL = {
@@ -190,6 +200,8 @@ class AbyMiniGameCog(commands.Cog):
             "- `!사용 <아이템>` : 아이템 사용 (버프)\n- `!공방` : 제작/판매 안내\n- `!제작 <아이템>` : 아이템 제작\n- `!판매 <재료> [수량|전체]` : 재료 판매\n- `!의뢰` : 의뢰 게시판 보기(일일/주간)\n- `!납품 <번호>` : 의뢰 보상 받기(조건 달성 시)\n- `!의뢰랭킹` : 주간 의뢰 포인트 랭킹\n"
             "- `!빚현황` : 우리 학교 빚/이자 확인\n"
             "- `!빚상환 <금액|전체>` : 내 크레딧으로 빚 상환\n\n"
+            "- `!이자내역` : 최근 이자/상환 기록 보기\n"
+            "- `!빚알림 [#채널|끄기]` : 이자 반영 시 자동 알림 채널 설정\n\n"
             "**환경(날씨)**\n"
             "- `!날씨` : 아비도스 가상 날씨 확인\n"
             "- 날씨에 따라 `!탐사` 성공률/보상이 조금 변해\n\n"
@@ -653,6 +665,21 @@ class AbyMiniGameCog(commands.Cog):
         rate = float(s.get("interest_rate", ABY_DEFAULT_INTEREST_RATE))
         last = str(s.get("last_interest_ymd", ""))
 
+        today_interest = get_interest_delta_for_day(ctx.guild.id, today)
+        today_repaid = get_repay_total_for_day_guild(ctx.guild.id, today)
+
+        stage = debt_pressure_stage(debt, initial=ABY_DEFAULT_DEBT)
+        try:
+            ratio = float(stage.get("ratio") or 0.0)
+        except Exception:
+            ratio = 0.0
+        stage_txt = f"{stage.get('emoji','')} {stage.get('stage','')}".strip()
+
+        pressure_line = f"- 채무 압박: **{stage_txt or '-'}**"
+        if ratio > 0:
+            pressure_line += f" (기준 대비 {ratio:.2f}x)"
+        pressure_line += "\n"
+
         tomorrow_debt = _apply_interest_once(debt, rate)
         tomorrow_interest = max(0, int(tomorrow_debt - debt))
 
@@ -661,9 +688,102 @@ class AbyMiniGameCog(commands.Cog):
             f"{hon}… 아비도스 재정 보고서 가져왔어.\n"
             f"- 현재 빚: **{_fmt(debt)} 크레딧**\n"
             f"- 일일 이자율: **{rate * 100:.2f}%**\n"
+            f"{pressure_line}"
+            f"- 오늘 이자 반영: **+{_fmt(today_interest)}** / 오늘 상환 누적: **-{_fmt(today_repaid)}**\n"
             f"- 오늘 기준 적용일: `{last}`\n"
             f"- 내일 예상 이자: **+{_fmt(tomorrow_interest)}** (예상 빚 **{_fmt(tomorrow_debt)}**)\n\n"
             "이 숫자… 계속 커져. 그래서 더… 다 같이 버티는 거야. 으헤~\n"
+        )
+        await send_ctx(ctx, txt, allow_glitch=True)
+
+    @commands.command(name="빚알림")
+    async def debt_announce_channel(self, ctx: commands.Context, *, arg: str = ""):
+        """Set a guild-specific channel to announce daily interest application."""
+
+        if ctx.guild is None:
+            await send_ctx(ctx, "빚 알림은… 서버에서만 설정할 수 있어.", allow_glitch=True)
+            return
+
+        perms = getattr(ctx.author, "guild_permissions", None)
+        if ctx.author.id != OWNER_ID and not (perms and perms.manage_guild):
+            await send_ctx(ctx, "이건… 서버 관리 권한이 필요해.", allow_glitch=True)
+            return
+
+        key = f"aby_debt_announce_channel_id:{int(ctx.guild.id)}"
+
+        raw = (arg or "").strip()
+        if not raw:
+            cur = get_config(key, "")
+            if cur:
+                await send_ctx(ctx, f"현재 빚 알림 채널: <#{cur}>\n끄려면 `!빚알림 끄기`", allow_glitch=True)
+            else:
+                await send_ctx(ctx, "현재 빚 알림은 꺼져 있어.\n켜려면 `!빚알림 #채널`", allow_glitch=True)
+            return
+
+        if raw.lower() in ("끄기", "꺼", "off", "none", "0"):
+            set_config(key, "")
+            await send_ctx(ctx, "오케이. 빚 알림은 꺼둘게…", allow_glitch=True)
+            return
+
+        m = re.search(r"<#(\d+)>", raw)
+        if m:
+            chan_id = int(m.group(1))
+        elif raw.isdigit():
+            chan_id = int(raw)
+        else:
+            await send_ctx(ctx, "채널을 `#채널`로 멘션해줘. 예) `!빚알림 #아비도스-공지`", allow_glitch=True)
+            return
+
+        ch = ctx.guild.get_channel(chan_id)
+        if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+            await send_ctx(ctx, "그 채널은… 텍스트 채널이 아닌 것 같아.", allow_glitch=True)
+            return
+
+        set_config(key, str(chan_id))
+        await send_ctx(ctx, f"좋아. 이제부터 이자 반영되면 <#{chan_id}>에 알려줄게. 으헤~", allow_glitch=True)
+
+    @commands.command(name="이자내역", aliases=["빚내역", "이자로그"])
+    async def interest_history(self, ctx: commands.Context, days: int = 7):
+        if ctx.guild is None:
+            await send_ctx(ctx, "내역은… 서버(아비도스) 단위야. 서버에서 확인해줘…", allow_glitch=True)
+            return
+
+        today = _today_ymd_kst()
+        apply_guild_interest_upto_today(ctx.guild.id, today)
+
+        lim = int(days)
+        if lim < 3:
+            lim = 3
+        if lim > 30:
+            lim = 30
+
+        i_rows = get_interest_deltas_recent(ctx.guild.id, lim)
+        r_rows = get_repay_totals_recent(ctx.guild.id, lim)
+
+        i_map = {str(r.get("ymd")): int(r.get("delta_debt") or 0) for r in (i_rows or []) if r.get("ymd")}
+        r_map = {str(r.get("ymd")): int(r.get("total_repaid") or 0) for r in (r_rows or []) if r.get("ymd")}
+
+        dates = sorted(set(i_map.keys()) | set(r_map.keys()), reverse=True)
+        if not dates:
+            await send_ctx(ctx, "아직 이자/상환 기록이 없어… (빚을 만든 적이 없을 수도 있어)", allow_glitch=True)
+            return
+
+        dates = dates[:lim]
+        lines = []
+        for ymd in dates:
+            i = int(i_map.get(ymd, 0))
+            rep = int(r_map.get(ymd, 0))
+            net = i - rep
+            sign = "+" if net >= 0 else ""
+            lines.append(
+                f"- {ymd}: 이자 +{_fmt(i)} / 상환 -{_fmt(rep)} / 순변화 {sign}{_fmt(net)}"
+            )
+
+        hon = get_honorific(ctx.author, ctx.guild)
+        txt = (
+            f"{hon} 최근 {len(dates)}일 기록이야. (KST 기준)\n"
+            + "\n".join(lines)
+            + "\n\n※ 이자는 하루 1번만 반영돼. 봇이 꺼져있던 날이 있으면, 다시 켤 때 몰아서 반영될 수 있어."
         )
         await send_ctx(ctx, txt, allow_glitch=True)
 
