@@ -39,6 +39,8 @@ from yume_store import (
     mark_daily_rule_posted,
     set_world_weather,
     update_daily_rule_text,
+    ensure_guild_debt,
+    apply_guild_interest_upto_today,
 )
 
 logger = logging.getLogger(__name__)
@@ -311,6 +313,37 @@ async def _web_sync_loop(bot: discord.Client) -> None:
             await asyncio.sleep(300)
 
 
+async def _debt_interest_loop(bot: discord.Client) -> None:
+    """Apply daily debt interest once per KST day.
+
+    Interest is also applied lazily when users check debt/repay, but this loop makes the
+    world feel "alive" even if nobody calls commands for a while.
+    """
+
+    last_done_ymd: str = ""
+    logger.info("[runtime] debt interest loop started")
+
+    while True:
+        try:
+            now = _now_kst()
+            today_ymd = now.date().isoformat()
+
+            # Run once per day, shortly after midnight.
+            if today_ymd != last_done_ymd and now.hour == 0 and now.minute >= 5:
+                for g in getattr(bot, "guilds", []) or []:
+                    try:
+                        ensure_guild_debt(g.id)
+                        apply_guild_interest_upto_today(g.id, today_ymd)
+                    except Exception:
+                        logger.exception("[runtime] debt interest apply failed: guild_id=%s", g.id)
+                last_done_ymd = today_ymd
+
+        except Exception:
+            logger.exception("[runtime] debt interest loop top-level error")
+
+        await asyncio.sleep(30)
+
+
 def start_background_tasks(bot: discord.Client) -> None:
     """Start background tasks once. Safe to call multiple times."""
 
@@ -323,6 +356,7 @@ def start_background_tasks(bot: discord.Client) -> None:
     try:
         tasks.append(asyncio.create_task(_world_state_loop(bot)))
         tasks.append(asyncio.create_task(_daily_rule_loop(bot)))
+        tasks.append(asyncio.create_task(_debt_interest_loop(bot)))
         tasks.append(asyncio.create_task(_web_sync_loop(bot)))
     except Exception as e:
         logger.error("Failed to start background tasks: %s", e)

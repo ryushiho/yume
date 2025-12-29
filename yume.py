@@ -127,6 +127,7 @@ EXTENSIONS = [
     "cogs.noise_settings",
     "cogs.aby_environment",
     "cogs.rule_maker",
+        "cogs.aby_mini_game",
     "cogs.survival_cooking",
     "cogs.stamps",
 "cogs.yume_diary",

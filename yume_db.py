@@ -13,6 +13,7 @@ v1: user_settings, world_state
 v2: bot_config, daily_rules, rule_suggestions
 v3: daily_meals
 v4: stamps opt-in + rewards/events logs
+v5: Abydos mini-game economy (debt/interest + exploration)
 """
 
 from __future__ import annotations
@@ -105,7 +106,7 @@ def init_db() -> None:
 
     now = int(time.time())
 
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 5
 
     with transaction() as con:
         con.execute(
@@ -258,12 +259,74 @@ def init_db() -> None:
                   guild_id INTEGER,
                   milestone INTEGER NOT NULL,
                   title TEXT NOT NULL,
-                  letter TEXT NOT NULL,
+                  letter_text TEXT NOT NULL,
                   created_at INTEGER NOT NULL
                 );
                 """
             )
 
+
+
+        # ===== v5 =====
+        if current_version < 5:
+            # Fix older v4 schema where stamp_rewards used column name `letter`.
+            try:
+                _add_column("stamp_rewards", "letter_text TEXT NOT NULL DEFAULT ''")
+                # If the old column exists, copy it over once.
+                try:
+                    con.execute(
+                        "UPDATE stamp_rewards SET letter_text = letter WHERE (letter_text='' OR letter_text IS NULL) AND letter IS NOT NULL;"
+                    )
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS aby_user_economy (
+                  user_id INTEGER PRIMARY KEY,
+                  credits INTEGER NOT NULL DEFAULT 0,
+                  water INTEGER NOT NULL DEFAULT 0,
+                  last_explore_ymd TEXT NOT NULL DEFAULT '',
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL
+                );
+                """
+            )
+
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS aby_guild_debt (
+                  guild_id INTEGER PRIMARY KEY,
+                  debt INTEGER NOT NULL,
+                  interest_rate REAL NOT NULL,
+                  last_interest_ymd TEXT NOT NULL,
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL
+                );
+                """
+            )
+
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS aby_economy_log (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  guild_id INTEGER,
+                  user_id INTEGER,
+                  kind TEXT NOT NULL,
+                  delta_credits INTEGER NOT NULL DEFAULT 0,
+                  delta_water INTEGER NOT NULL DEFAULT 0,
+                  delta_debt INTEGER NOT NULL DEFAULT 0,
+                  memo TEXT,
+                  created_at INTEGER NOT NULL
+                );
+                """
+            )
+
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_aby_econ_log_guild_time ON aby_economy_log(guild_id, created_at);"
+            )
         con.execute(
             """
             INSERT INTO schema_meta(key, value, updated_at)

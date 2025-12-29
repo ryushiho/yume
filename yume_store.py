@@ -548,3 +548,310 @@ def get_top_stamps(limit: int = 10) -> list[Dict[str, Any]]:
         (lim,),
     )
     return rows or []
+
+# -----------------------------------------------------------------------------
+# Abydos Mini-Game Economy (Phase6-2)
+# -----------------------------------------------------------------------------
+
+from decimal import Decimal, ROUND_CEILING
+import datetime
+
+
+ABY_DEFAULT_DEBT = 900_000_000  # 9억 크레딧
+ABY_DEFAULT_INTEREST_RATE = 0.35  # 일일 이자율 (35%)
+
+
+def _date_from_ymd(ymd: str) -> datetime.date:
+    try:
+        return datetime.date.fromisoformat(ymd)
+    except Exception:
+        # fallback: treat as today (caller should pass valid ymd)
+        return datetime.date.today()
+
+
+def _ymd_iter_exclusive(start_ymd: str, end_ymd: str):
+    """Yield dates for (start_ymd, end_ymd] in ISO format."""
+    start = _date_from_ymd(start_ymd)
+    end = _date_from_ymd(end_ymd)
+    d = start
+    while d < end:
+        d = d + datetime.timedelta(days=1)
+        yield d.isoformat()
+
+
+def ensure_user_economy(user_id: int) -> None:
+    uid = int(user_id)
+    now = now_ts()
+    with get_con() as con:
+        con.execute(
+            """
+            INSERT INTO aby_user_economy(user_id, credits, water, last_explore_ymd, created_at, updated_at)
+            VALUES(?, 0, 0, '', ?, ?)
+            ON CONFLICT(user_id) DO NOTHING;
+            """,
+            (uid, now, now),
+        )
+
+
+def get_user_economy(user_id: int) -> Dict[str, Any]:
+    ensure_user_economy(user_id)
+    row = fetchone(
+        """
+        SELECT user_id, credits, water, last_explore_ymd, created_at, updated_at
+        FROM aby_user_economy
+        WHERE user_id=?;
+        """,
+        (int(user_id),),
+    )
+    if not row:
+        return {
+            "user_id": int(user_id),
+            "credits": 0,
+            "water": 0,
+            "last_explore_ymd": "",
+            "created_at": now_ts(),
+            "updated_at": now_ts(),
+        }
+    return row
+
+
+def claim_daily_explore(user_id: int, date_ymd: str, delta_credits: int, delta_water: int = 0) -> Optional[Dict[str, Any]]:
+    """Claim one daily explore reward (KST date).
+
+    Returns updated economy row if successful, else None if already claimed today.
+    """
+
+    uid = int(user_id)
+    d_credits = int(delta_credits)
+    d_water = int(delta_water)
+    if d_credits < 0:
+        d_credits = 0
+    if d_water < 0:
+        d_water = 0
+
+    ensure_user_economy(uid)
+    now = now_ts()
+
+    with get_con() as con:
+        row = con.execute(
+            "SELECT credits, water, last_explore_ymd FROM aby_user_economy WHERE user_id=?;",
+            (uid,),
+        ).fetchone()
+        last_ymd = (row[2] or "") if row else ""
+        if last_ymd == date_ymd:
+            return None
+
+        con.execute(
+            """
+            UPDATE aby_user_economy
+            SET credits = MAX(0, credits + ?),
+                water   = MAX(0, water + ?),
+                last_explore_ymd = ?,
+                updated_at = ?
+            WHERE user_id=?;
+            """,
+            (d_credits, d_water, date_ymd, now, uid),
+        )
+
+        con.execute(
+            """
+            INSERT INTO aby_economy_log(guild_id, user_id, kind, delta_credits, delta_water, delta_debt, memo, created_at)
+            VALUES(NULL, ?, 'explore', ?, ?, 0, ?, ?);
+            """,
+            (uid, d_credits, d_water, f"{date_ymd}", now),
+        )
+
+    return get_user_economy(uid)
+
+
+def ensure_guild_debt(guild_id: int, *, initial_debt: int = ABY_DEFAULT_DEBT, interest_rate: float = ABY_DEFAULT_INTEREST_RATE, today_ymd: Optional[str] = None) -> None:
+    gid = int(guild_id)
+    now = now_ts()
+    if today_ymd is None:
+        # Use UTC date as a fallback; callers should pass KST date.
+        today_ymd = datetime.date.today().isoformat()
+
+    with get_con() as con:
+        con.execute(
+            """
+            INSERT INTO aby_guild_debt(guild_id, debt, interest_rate, last_interest_ymd, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id) DO NOTHING;
+            """,
+            (gid, int(initial_debt), float(interest_rate), str(today_ymd), now, now),
+        )
+
+
+def _apply_interest_once(debt: int, rate: float) -> int:
+    d = Decimal(int(debt))
+    r = Decimal(str(rate))
+    mult = Decimal("1") + r
+    new_val = (d * mult).to_integral_value(rounding=ROUND_CEILING)
+    # Never go below 0
+    return int(new_val) if new_val > 0 else 0
+
+
+def apply_guild_interest_upto_today(guild_id: int, today_ymd: str) -> Dict[str, Any]:
+    """Apply missed daily interest up to today_ymd (inclusive).
+
+    Interprets last_interest_ymd as "already applied for that date".
+    If last_interest_ymd == today_ymd, does nothing.
+    """
+
+    gid = int(guild_id)
+    ensure_guild_debt(gid, today_ymd=today_ymd)
+
+    with get_con() as con:
+        row = con.execute(
+            "SELECT debt, interest_rate, last_interest_ymd FROM aby_guild_debt WHERE guild_id=?;",
+            (gid,),
+        ).fetchone()
+        if not row:
+            return {
+                "guild_id": gid,
+                "debt": ABY_DEFAULT_DEBT,
+                "interest_rate": ABY_DEFAULT_INTEREST_RATE,
+                "last_interest_ymd": today_ymd,
+            }
+
+        debt = int(row[0])
+        rate = float(row[1])
+        last_ymd = str(row[2] or "")
+        if not last_ymd:
+            last_ymd = today_ymd
+
+        if last_ymd == today_ymd:
+            return {
+                "guild_id": gid,
+                "debt": debt,
+                "interest_rate": rate,
+                "last_interest_ymd": last_ymd,
+            }
+
+        now = now_ts()
+        old_debt = debt
+        applied_days = 0
+        for ymd in _ymd_iter_exclusive(last_ymd, today_ymd):
+            new_debt = _apply_interest_once(debt, rate)
+            delta = new_debt - debt
+            debt = new_debt
+            applied_days += 1
+
+            con.execute(
+                """
+                INSERT INTO aby_economy_log(guild_id, user_id, kind, delta_credits, delta_water, delta_debt, memo, created_at)
+                VALUES(?, NULL, 'interest', 0, 0, ?, ?, ?);
+                """,
+                (gid, int(delta), ymd, now),
+            )
+
+        con.execute(
+            """
+            UPDATE aby_guild_debt
+            SET debt=?, last_interest_ymd=?, updated_at=?
+            WHERE guild_id=?;
+            """,
+            (debt, today_ymd, now, gid),
+        )
+
+    return {
+        "guild_id": gid,
+        "debt": debt,
+        "interest_rate": rate,
+        "last_interest_ymd": today_ymd,
+        "applied_days": applied_days,
+        "old_debt": old_debt,
+    }
+
+
+def get_guild_debt(guild_id: int, today_ymd: Optional[str] = None) -> Dict[str, Any]:
+    gid = int(guild_id)
+    if today_ymd is not None:
+        apply_guild_interest_upto_today(gid, today_ymd)
+
+    row = fetchone(
+        """
+        SELECT guild_id, debt, interest_rate, last_interest_ymd, created_at, updated_at
+        FROM aby_guild_debt
+        WHERE guild_id=?;
+        """,
+        (gid,),
+    )
+    if not row:
+        # fallback
+        return {
+            "guild_id": gid,
+            "debt": ABY_DEFAULT_DEBT,
+            "interest_rate": ABY_DEFAULT_INTEREST_RATE,
+            "last_interest_ymd": today_ymd or "",
+        }
+    return row
+
+
+def repay_guild_debt(guild_id: int, user_id: int, amount: int, today_ymd: str) -> Dict[str, Any]:
+    """Repay part of the guild debt from user's credits.
+
+    Returns a result dict with status.
+    """
+
+    gid = int(guild_id)
+    uid = int(user_id)
+    amt = int(amount)
+    if amt <= 0:
+        return {"ok": False, "reason": "amount"}
+
+    # Apply interest first so the story feels relentless.
+    apply_guild_interest_upto_today(gid, today_ymd)
+    ensure_user_economy(uid)
+
+    now = now_ts()
+    with get_con() as con:
+        u = con.execute(
+            "SELECT credits FROM aby_user_economy WHERE user_id=?;",
+            (uid,),
+        ).fetchone()
+        credits = int(u[0]) if u else 0
+        if credits <= 0:
+            return {"ok": False, "reason": "no_credits", "credits": credits}
+
+        pay = min(amt, credits)
+
+        g = con.execute(
+            "SELECT debt, interest_rate, last_interest_ymd FROM aby_guild_debt WHERE guild_id=?;",
+            (gid,),
+        ).fetchone()
+        if not g:
+            # ensure then retry
+            ensure_guild_debt(gid, today_ymd=today_ymd)
+            g = con.execute(
+                "SELECT debt, interest_rate, last_interest_ymd FROM aby_guild_debt WHERE guild_id=?;",
+                (gid,),
+            ).fetchone()
+        debt = int(g[0]) if g else ABY_DEFAULT_DEBT
+
+        new_debt = max(0, debt - pay)
+
+        con.execute(
+            "UPDATE aby_user_economy SET credits = MAX(0, credits - ?), updated_at=? WHERE user_id=?;",
+            (pay, now, uid),
+        )
+        con.execute(
+            "UPDATE aby_guild_debt SET debt=?, updated_at=? WHERE guild_id=?;",
+            (new_debt, now, gid),
+        )
+
+        con.execute(
+            """
+            INSERT INTO aby_economy_log(guild_id, user_id, kind, delta_credits, delta_water, delta_debt, memo, created_at)
+            VALUES(?, ?, 'repay', ?, 0, ?, ?, ?);
+            """,
+            (gid, uid, -pay, -(debt - new_debt), f"{today_ymd}", now),
+        )
+
+    return {
+        "ok": True,
+        "paid": pay,
+        "old_debt": debt,
+        "new_debt": new_debt,
+        "credits_after": max(0, credits - pay),
+    }
