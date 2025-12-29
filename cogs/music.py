@@ -26,6 +26,7 @@ ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 STORAGE_DIR = os.path.join(ROOT_DIR, "data", "storage")
 PANEL_CFG_PATH = os.path.join(STORAGE_DIR, "music_panel.json")
 FX_CFG_PATH = os.path.join(STORAGE_DIR, "music_fx.json")
+CACHE_CFG_PATH = os.path.join(STORAGE_DIR, "music_cache.json")
 
 
 
@@ -62,6 +63,7 @@ class _Track:
     # Phase1: Spotify 등 외부 소스 메타(가사 검색/표시 정확도)
     meta_track: Optional[str] = None
     meta_artist: Optional[str] = None
+    spotify_track_id: Optional[str] = None
     _resolved_stream_url: Optional[str] = None
     _resolved_at: float = 0.0
 
@@ -1154,6 +1156,23 @@ class MusicCog(commands.Cog):
         self._panel_cfg_lock = asyncio.Lock()
         self._fx_cfg = self._load_fx_cfg()
         self._fx_cfg_lock = asyncio.Lock()
+        self._cache: Dict[str, object] = self._load_music_cache()
+        self._cache_lock: asyncio.Lock = asyncio.Lock()
+        # Phase4: 영구 캐시
+        # - spotify_track_to_youtube: {spotify_track_id: {youtube_id, updated_at, title, artist}}
+        # - lyrics_cache: {"track|||artist": {lines:[[sec,text],...], updated_at}}
+        sp = self._cache.get("spotify_track_to_youtube")
+        if not isinstance(sp, dict):
+            sp = {}
+            self._cache["spotify_track_to_youtube"] = sp
+        self._spotify_track_to_youtube: Dict[str, dict] = sp
+
+        ly = self._cache.get("lyrics_cache")
+        if not isinstance(ly, dict):
+            ly = {}
+            self._cache["lyrics_cache"] = ly
+        self._lyrics_cache_persist: Dict[str, dict] = ly
+
         self._ffmpeg_filters = self._detect_ffmpeg_filters()
         self._restore_task: Optional[asyncio.Task] = None
 
@@ -1286,6 +1305,145 @@ class MusicCog(commands.Cog):
             os.replace(tmp, PANEL_CFG_PATH)
         except Exception as e:
             logger.warning("[Music] failed to save panel cfg: %s", e)
+
+
+    # =========================
+    # Phase4: Persistent cache
+    # =========================
+
+    def _load_music_cache(self) -> Dict[str, object]:
+        """data/storage/music_cache.json
+
+        저장 항목:
+        - spotify_track_to_youtube: {spotify_track_id: {youtube_id, updated_at, title?, artist?}}
+        - lyrics_cache: {lyrics_key: {lines: [[sec, line], ...], updated_at}}
+        """
+        try:
+            if not os.path.exists(CACHE_CFG_PATH):
+                return {"spotify_track_to_youtube": {}, "lyrics_cache": {}}
+            with open(CACHE_CFG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {"spotify_track_to_youtube": {}, "lyrics_cache": {}}
+            if not isinstance(data.get("spotify_track_to_youtube"), dict):
+                data["spotify_track_to_youtube"] = {}
+            if not isinstance(data.get("lyrics_cache"), dict):
+                data["lyrics_cache"] = {}
+            return data
+        except Exception:
+            return {"spotify_track_to_youtube": {}, "lyrics_cache": {}}
+
+    def _save_music_cache_unlocked(self) -> None:
+        try:
+            os.makedirs(STORAGE_DIR, exist_ok=True)
+            tmp = CACHE_CFG_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._cache, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, CACHE_CFG_PATH)
+        except Exception as e:
+            logger.warning("[Music] failed to save cache: %s", e)
+
+    def _trim_cache_unlocked(self) -> None:
+        """캐시 크기 폭발 방지(오래된 것부터 정리)."""
+        try:
+            max_sp = int(os.getenv("YUME_MUSIC_CACHE_MAX_SPOTIFY", "2000"))
+        except Exception:
+            max_sp = 2000
+        try:
+            max_ly = int(os.getenv("YUME_MUSIC_CACHE_MAX_LYRICS", "1500"))
+        except Exception:
+            max_ly = 1500
+
+        def _trim_map(m: dict, max_n: int):
+            if not isinstance(m, dict) or max_n <= 0:
+                return
+            if len(m) <= max_n:
+                return
+            items = []
+            for k, v in m.items():
+                try:
+                    ts = float((v or {}).get("updated_at") or 0.0) if isinstance(v, dict) else 0.0
+                except Exception:
+                    ts = 0.0
+                items.append((ts, k))
+            items.sort()  # 오래된 것부터
+            drop = len(m) - max_n
+            for _, k in items[:drop]:
+                m.pop(k, None)
+
+        _trim_map(self._spotify_track_to_youtube, max_sp)
+        _trim_map(self._lyrics_persist_cache, max_ly)
+
+    def _cache_get_spotify_youtube(self, spotify_id: str) -> Optional[str]:
+        if not spotify_id:
+            return None
+        rec = self._spotify_track_to_youtube.get(str(spotify_id))
+        if not isinstance(rec, dict):
+            return None
+        yid = rec.get("youtube_id")
+        if isinstance(yid, str) and yid:
+            return yid
+        return None
+
+    async def _cache_set_spotify_youtube(self, spotify_id: str, youtube_id: str, *, title: Optional[str] = None, artist: Optional[str] = None):
+        if not spotify_id or not youtube_id:
+            return
+        async with self._cache_lock:
+            rec = self._spotify_track_to_youtube.get(str(spotify_id))
+            if not isinstance(rec, dict):
+                rec = {}
+            rec["youtube_id"] = str(youtube_id)
+            rec["updated_at"] = time.time()
+            if title:
+                rec["title"] = str(title)[:120]
+            if artist:
+                rec["artist"] = str(artist)[:120]
+            self._spotify_track_to_youtube[str(spotify_id)] = rec
+            self._trim_cache_unlocked()
+            self._save_music_cache_unlocked()
+
+    def _cache_get_lyrics(self, key: str) -> Optional[List[Tuple[float, str]]]:
+        if not key:
+            return None
+        rec = self._lyrics_persist_cache.get(str(key))
+        if not isinstance(rec, dict):
+            return None
+        lines = rec.get("lines")
+        if not isinstance(lines, list):
+            return None
+        out: List[Tuple[float, str]] = []
+        for it in lines:
+            if not isinstance(it, (list, tuple)) or len(it) != 2:
+                continue
+            try:
+                sec = float(it[0])
+            except Exception:
+                continue
+            line = str(it[1] or "").strip()
+            if not line:
+                continue
+            out.append((sec, line))
+        return out or None
+
+    async def _cache_set_lyrics(self, key: str, lines: List[Tuple[float, str]]):
+        if not key or not lines:
+            return
+        payload = []
+        for sec, line in lines[:5000]:  # 안전장치
+            try:
+                s = float(sec)
+            except Exception:
+                continue
+            t = str(line or "").strip()
+            if not t:
+                continue
+            payload.append([s, t])
+        if not payload:
+            return
+        async with self._cache_lock:
+            self._lyrics_persist_cache[str(key)] = {"lines": payload, "updated_at": time.time()}
+            self._trim_cache_unlocked()
+            self._save_music_cache_unlocked()
 
 
     # =========================
@@ -1781,6 +1939,15 @@ class MusicCog(commands.Cog):
 
         try:
             src = track.webpage_url
+
+            # Phase4: Spotify 영구 캐시 매핑이 있으면 바로 그 유튜브 영상으로 고정
+            try:
+                if getattr(track, 'spotify_track_id', None):
+                    cached_yid = self._cache_get_spotify_youtube(str(track.spotify_track_id))
+                    if cached_yid:
+                        src = f"https://www.youtube.com/watch?v={cached_yid}"
+            except Exception:
+                pass
             entry: dict = {}
             info: Optional[dict] = None
 
@@ -1821,6 +1988,27 @@ class MusicCog(commands.Cog):
             except Exception:
                 pass
 
+
+            # Phase4: resolve 후 Spotify->YouTube 매핑 저장(다음부터는 0초 정답)
+            try:
+                if getattr(track, 'spotify_track_id', None):
+                    yid = None
+                    if isinstance(entry.get('id'), str):
+                        yid = entry.get('id')
+                    if not yid:
+                        page = entry.get('webpage_url') or entry.get('original_url') or ''
+                        m2 = re.search(r'(?:v=|youtu\.be/)([A-Za-z0-9_-]{6,})', str(page))
+                        if m2:
+                            yid = m2.group(1)
+                    if yid:
+                        await self._cache_set_spotify_youtube(
+                            str(track.spotify_track_id),
+                            str(yid),
+                            title=str(getattr(track, 'meta_track', '') or ''),
+                            artist=str(getattr(track, 'meta_artist', '') or ''),
+                        )
+            except Exception:
+                pass
             url = _select_best_audio_url(entry)
 
             if not url or not re.match(r"^https?://", str(url)):
@@ -2211,8 +2399,11 @@ class MusicCog(commands.Cog):
                 # 메시지가 사라졌으면 재생성
                 try:
                     if fixed_ch:
+
                         await self._ensure_panel_message(guild_id, int(fixed_ch), fixed=True)
+
                     else:
+
                         st.temp_panel_message_id = None
                 except Exception:
                     pass
@@ -2382,6 +2573,7 @@ class MusicCog(commands.Cog):
                     requester_id=interaction.user.id,
                     meta_track=tn,
                     meta_artist=ar,
+                    spotify_track_id=sid,
                 )
                 await st.queue.put(track)
                 self._start_player_if_needed(interaction.guild.id)
@@ -3065,8 +3257,11 @@ class MusicCog(commands.Cog):
             if interaction is not None and getattr(interaction, "message", None) is not None:
                 try:
                     if not interaction.response.is_done():
+
                         await interaction.response.edit_message(embed=embed, view=view)
+
                     else:
+
                         await interaction.message.edit(embed=embed, view=view)  # type: ignore[union-attr]
                     return True
                 except Exception:
@@ -3385,21 +3580,27 @@ async def _fetch_lrclib(self, track_name: str, artist_name: Optional[str]) -> Op
                 if key in st.lyrics_cache:
                     lines_lrc = st.lyrics_cache[key]
                 else:
-
-                    now_ts = time.time()
-                    miss_until = st.lyrics_miss_until.get(key, 0.0)
-                    if now_ts < miss_until:
-                        lines_lrc = []
+                    # Phase4: persistent lyrics cache(봇 재시작 후에도 재사용)
+                    cached_lines = self._cache_get_lyrics(key)
+                    if cached_lines:
+                        st.lyrics_cache[key] = cached_lines
+                        lines_lrc = cached_lines
                     else:
-                        candidates = _build_lrclib_candidates(track)
-                        lrc = await self._fetch_lrclib_multi(candidates)
-                        lines_lrc = _parse_plain_lyrics(lrc or "")
-                        if lines_lrc:
-                            st.lyrics_cache[key] = lines_lrc
-                            st.lyrics_miss_until.pop(key, None)
+                        now_ts = time.time()
+                        miss_until = st.lyrics_miss_until.get(key, 0.0)
+                        if now_ts < miss_until:
+                            lines_lrc = []
                         else:
-                            # 너무 자주 API를 두드리지 않게 짧은 TTL을 둔다.
-                            st.lyrics_miss_until[key] = now_ts + 60.0
+                            candidates = _build_lrclib_candidates(track)
+                            lrc = await self._fetch_lrclib_multi(candidates)
+                            lines_lrc = _parse_plain_lyrics(lrc or "")
+                            if lines_lrc:
+                                st.lyrics_cache[key] = lines_lrc
+                                st.lyrics_miss_until.pop(key, None)
+                                await self._cache_set_lyrics(key, lines_lrc)
+                            else:
+                                # 너무 자주 API를 두드리지 않게 짧은 TTL을 둔다.
+                                st.lyrics_miss_until[key] = now_ts + 60.0
 
             embed = self._build_lyrics_embed(guild, track, lines_lrc, pos)
             try:
