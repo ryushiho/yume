@@ -14,6 +14,7 @@ v2: bot_config, daily_rules, rule_suggestions
 v3: daily_meals
 v4: stamps opt-in + rewards/events logs
 v5: Abydos mini-game economy (debt/interest + exploration)
+v6: Abydos mini-game inventory/buffs (loot + simple one-buff system)
 """
 
 from __future__ import annotations
@@ -106,7 +107,7 @@ def init_db() -> None:
 
     now = int(time.time())
 
-    SCHEMA_VERSION = 5
+    SCHEMA_VERSION = 6
 
     with transaction() as con:
         con.execute(
@@ -326,6 +327,39 @@ def init_db() -> None:
 
             con.execute(
                 "CREATE INDEX IF NOT EXISTS idx_aby_econ_log_guild_time ON aby_economy_log(guild_id, created_at);"
+            )
+
+        # ===== v6 =====
+        if current_version < 6:
+            # Phase6-2 Phase3: Abydos 탐사 전리품/버프/인벤토리
+            # - Inventory: user_id + item_key -> qty
+            # - Buffs: 1 active buff per user (simple, safe)
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS aby_inventory (
+                  user_id INTEGER NOT NULL,
+                  item_key TEXT NOT NULL,
+                  qty INTEGER NOT NULL DEFAULT 0,
+                  updated_at INTEGER NOT NULL,
+                  PRIMARY KEY (user_id, item_key)
+                );
+                """
+            )
+
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS aby_buffs (
+                  user_id INTEGER PRIMARY KEY,
+                  buff_key TEXT NOT NULL DEFAULT '',
+                  stacks INTEGER NOT NULL DEFAULT 0,
+                  expires_at INTEGER NOT NULL DEFAULT 0,
+                  updated_at INTEGER NOT NULL
+                );
+                """
+            )
+
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_aby_inv_user ON aby_inventory(user_id);"
             )
         con.execute(
             """

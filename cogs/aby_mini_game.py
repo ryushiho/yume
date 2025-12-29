@@ -4,6 +4,7 @@ import datetime
 import logging
 import random
 import re
+import time
 from decimal import Decimal, ROUND_CEILING
 from typing import Optional
 
@@ -18,6 +19,12 @@ from yume_store import (
     ensure_world_weather_rotated,
     get_guild_debt,
     get_user_economy,
+    get_user_inventory,
+    add_user_item,
+    consume_user_item,
+    ensure_user_buff_valid,
+    set_user_buff,
+    consume_user_buff_stack,
     repay_guild_debt,
     ABY_DEFAULT_DEBT,
     ABY_DEFAULT_INTEREST_RATE,
@@ -30,6 +37,23 @@ WEATHER_LABEL = {
     "clear": "맑음",
     "cloudy": "흐림",
     "sandstorm": "대형 모래폭풍",
+}
+
+
+# Phase3: 전리품/아이템(아주 작게, 아주 안전하게)
+ITEMS = {
+    "mask": {"name": "방진마스크", "desc": "2시간 동안 모래폭풍 페널티 완화"},
+    "drone": {"name": "탐사용 드론", "desc": "다음 탐사 크레딧 +25% (1회)"},
+}
+
+
+ITEM_ALIASES = {
+    "방진": "mask",
+    "마스크": "mask",
+    "방진마스크": "mask",
+    "드론": "drone",
+    "탐사용드론": "drone",
+    "탐사드론": "drone",
 }
 
 
@@ -48,6 +72,13 @@ def _now_kst() -> datetime.datetime:
 
 def _today_ymd_kst() -> str:
     return _now_kst().date().isoformat()
+
+
+def _fmt_ts_kst(ts: int) -> str:
+    if not ts:
+        return "-"
+    dt = datetime.datetime.fromtimestamp(int(ts), tz=datetime.timezone(datetime.timedelta(hours=9)))
+    return dt.strftime("%m/%d %H:%M")
 
 
 def _fmt(n: int) -> str:
@@ -120,6 +151,8 @@ class AbyMiniGameCog(commands.Cog):
             "**기본 커맨드**\n"
             "- `!탐사` : 하루 1회 탐사해서 크레딧(가끔 물) 얻기\n"
             "- `!지갑` : 내 재화 확인\n"
+            "- `!가방` : 탐사 전리품(아이템) 확인\n"
+            "- `!사용 <아이템>` : 아이템 사용 (버프)\n"
             "- `!빚현황` : 우리 학교 빚/이자 확인\n"
             "- `!빚상환 <금액|전체>` : 내 크레딧으로 빚 상환\n\n"
             "**환경(날씨)**\n"
@@ -151,6 +184,103 @@ class AbyMiniGameCog(commands.Cog):
         await send_ctx(ctx, txt, allow_glitch=True)
 
     # ------------------------------
+    # Inventory / Items (Phase3)
+    # ------------------------------
+
+    @commands.command(name="가방", aliases=["인벤", "인벤토리", "전리품"])
+    async def bag(self, ctx: commands.Context):
+        inv = get_user_inventory(ctx.author.id)
+        buff = ensure_user_buff_valid(ctx.author.id)
+
+        hon = get_honorific(ctx.author, ctx.guild)
+
+        lines = [f"{hon} 가방 열어봤어."]
+
+        # Active buff
+        bkey = str(buff.get("buff_key") or "").strip().lower()
+        stacks = int(buff.get("stacks") or 0)
+        exp = int(buff.get("expires_at") or 0)
+        if bkey and stacks > 0:
+            if bkey == "mask":
+                lines.append(f"- 활성 버프: **방진마스크** (만료 `{_fmt_ts_kst(exp)}`)")
+            elif bkey == "drone":
+                lines.append(f"- 활성 버프: **탐사용 드론** (남은 {stacks}회, 만료 `{_fmt_ts_kst(exp)}`)")
+            else:
+                lines.append(f"- 활성 버프: **{bkey}** (만료 `{_fmt_ts_kst(exp)}`)")
+        else:
+            lines.append("- 활성 버프: 없음")
+
+        # Items
+        if not inv:
+            lines.append("- 전리품: (텅)\n탐사하다가 주워오면 여기 쌓여. 으헤~")
+        else:
+            lines.append("- 전리품:")
+            for k, qty in sorted(inv.items(), key=lambda x: x[0]):
+                meta = ITEMS.get(k)
+                name = meta.get("name") if meta else k
+                lines.append(f"  • {name}: **{_fmt(qty)}**")
+
+        lines.append("\n사용: `!사용 방진마스크` / `!사용 드론`")
+        await send_ctx(ctx, "\n".join(lines), allow_glitch=True)
+
+    @commands.command(name="사용")
+    async def use_item(self, ctx: commands.Context, *, item_name: str = ""):
+        hon = get_honorific(ctx.author, ctx.guild)
+        raw = (item_name or "").strip()
+        if not raw:
+            await send_ctx(ctx, f"{hon} 사용법: `!사용 <아이템>`\n예) `!사용 방진마스크` / `!사용 드론`", allow_glitch=True)
+            return
+
+        key = None
+        norm = re.sub(r"\s+", "", raw).lower()
+
+        # Direct alias
+        if norm in ITEM_ALIASES:
+            key = ITEM_ALIASES[norm]
+        else:
+            # Try match by display name
+            for k, meta in ITEMS.items():
+                if norm == re.sub(r"\s+", "", str(meta.get("name") or "")).lower():
+                    key = k
+                    break
+
+        if key not in ITEMS:
+            avail = ", ".join([m["name"] for m in ITEMS.values()])
+            await send_ctx(ctx, f"{hon} 그 아이템은… 잘 모르겠어.\n가능: {avail}", allow_glitch=True)
+            return
+
+        if not consume_user_item(ctx.author.id, key, 1):
+            await send_ctx(ctx, f"{hon}… 그건 가방에 없어. (`!가방` 확인!)", allow_glitch=True)
+            return
+
+        now = int(time.time())
+        prev = ensure_user_buff_valid(ctx.author.id, now=now)
+        prev_key = str(prev.get("buff_key") or "").strip().lower()
+        prev_stacks = int(prev.get("stacks") or 0)
+
+        if key == "mask":
+            exp = now + 2 * 3600
+            set_user_buff(ctx.author.id, buff_key="mask", stacks=1, expires_at=exp)
+            extra = ""
+            if prev_key and prev_stacks > 0 and prev_key != "mask":
+                extra = " (기존 버프는 덮어썼어…)"
+            await send_ctx(ctx, f"{hon} 방진마스크 장착!{extra}\n2시간 동안 모래폭풍이 좀… 덜 아파. (만료 `{_fmt_ts_kst(exp)}`)")
+            return
+
+        if key == "drone":
+            exp = now + 24 * 3600
+            set_user_buff(ctx.author.id, buff_key="drone", stacks=1, expires_at=exp)
+            extra = ""
+            if prev_key and prev_stacks > 0 and prev_key != "drone":
+                extra = " (기존 버프는 덮어썼어…)"
+            await send_ctx(ctx, f"{hon} 탐사용 드론 준비 완료!{extra}\n다음 탐사에서 크레딧이 **+25%** (1회). (만료 `{_fmt_ts_kst(exp)}`)")
+            return
+
+        # Fallback (shouldn't happen)
+        await send_ctx(ctx, f"{hon}… 음? 뭔가 이상해. (item={key})", allow_glitch=True)
+        return
+
+    # ------------------------------
     # Explore (daily)
     # ------------------------------
 
@@ -163,23 +293,44 @@ class AbyMiniGameCog(commands.Cog):
         today = _today_ymd_kst()
         hon = get_honorific(ctx.author, ctx.guild)
 
-        # Phase1: 아비도스 날씨(환경) 연동
-        # - 모래폭풍이면 성공률/보상이 살짝 깎이고, 물 드랍도 낮아짐.
-        # - 흐림은 거의 평시.
+        # 중복 지급(전리품/버프 악용) 방지: 먼저 오늘 탐사 여부를 빠르게 확인한다.
+        econ0 = get_user_economy(ctx.author.id)
+        if str(econ0.get("last_explore_ymd") or "") == today:
+            txt = (
+                f"{hon}… 오늘은 이미 탐사 다녀왔어.\n"
+                "하루 1회만! (유메 선배 수첩에 적혀있어…)\n"
+            )
+            await send_ctx(ctx, txt, allow_glitch=True)
+            return
+
+        # Phase1/2: 아비도스 날씨(환경) 연동
+        # - 모래폭풍이면 성공률/보상이 깎이고, 물 드랍도 낮아짐.
+        # - (Phase3) 방진마스크 버프가 있으면 "모래폭풍"을 계산상 "흐림"처럼 취급한다.
         try:
             ws = ensure_world_weather_rotated()
             weather = str(ws.get("weather") or "clear")
         except Exception:
             weather = "clear"
 
-        label = WEATHER_LABEL.get(weather, weather)
+        buff = ensure_user_buff_valid(ctx.author.id)
+        bkey = str(buff.get("buff_key") or "").strip().lower()
+        bstacks = int(buff.get("stacks") or 0)
 
-        if weather == "sandstorm":
+        calc_weather = weather
+        mask_used = False
+        if bkey == "mask" and bstacks > 0 and weather == "sandstorm":
+            calc_weather = "cloudy"
+            mask_used = True
+
+        label_env = WEATHER_LABEL.get(weather, weather)
+        label_calc = WEATHER_LABEL.get(calc_weather, calc_weather)
+
+        if calc_weather == "sandstorm":
             success_p = 0.55
             succ_rng = (4_000, 12_000)
             fail_rng = (0, 2_000)
             water_p = 0.02
-        elif weather == "cloudy":
+        elif calc_weather == "cloudy":
             success_p = 0.70
             succ_rng = (6_000, 15_000)
             fail_rng = (0, 3_000)
@@ -198,8 +349,39 @@ class AbyMiniGameCog(commands.Cog):
 
         water = 1 if (random.random() < water_p) else 0
 
+        # Phase3: 랜덤 조우/전리품
+        encounter_lines: list[str] = []
+        items_to_add: list[tuple[str, int]] = []
+        r = random.random()
+        if r < 0.12:
+            bonus = random.randint(2_000, 9_000)
+            credits += bonus
+            encounter_lines.append(f"- 조우: **잊혀진 상자** (+{_fmt(bonus)} 크레딧)")
+        elif r < 0.17:
+            loss = random.randint(1_000, 4_000)
+            credits -= loss
+            encounter_lines.append(f"- 조우: **모래에 미끄러짐** (-{_fmt(loss)} 크레딧)")
+        elif r < 0.21:
+            items_to_add.append(("mask", 1))
+            encounter_lines.append("- 조우: **방진마스크**를 주웠어!")
+        elif r < 0.24:
+            items_to_add.append(("drone", 1))
+            encounter_lines.append("- 조우: **탐사용 드론** 잔해를 살렸어!")
+        elif r < 0.28:
+            water += 1
+            encounter_lines.append("- 조우: **물통** 발견! (+1 물)")
+
+        # Phase3: 드론 버프(다음 탐사 크레딧 +25%, 1회)
+        drone_applied = False
+        if bkey == "drone" and bstacks > 0:
+            if credits > 0:
+                mult = Decimal("1.25")
+                credits = int((Decimal(int(credits)) * mult).to_integral_value(rounding=ROUND_CEILING))
+                drone_applied = True
+
         result = claim_daily_explore(ctx.author.id, today, credits, water)
         if result is None:
+            # 레이스 상황(거의 없음)에서도 전리품/버프가 새지 않도록 조용히 끝낸다.
             txt = (
                 f"{hon}… 오늘은 이미 탐사 다녀왔어.\n"
                 "하루 1회만! (유메 선배 수첩에 적혀있어…)\n"
@@ -207,11 +389,34 @@ class AbyMiniGameCog(commands.Cog):
             await send_ctx(ctx, txt, allow_glitch=True)
             return
 
+        # 성공적으로 반영된 후에만 전리품/버프 소모를 적용한다.
+        for k, q in items_to_add:
+            add_user_item(ctx.author.id, k, q)
+        if bkey == "drone" and bstacks > 0:
+            consume_user_buff_stack(ctx.author.id)
+
         new_credits = int(result.get("credits", 0))
         new_water = int(result.get("water", 0))
 
         # Flavor
-        if weather == "sandstorm":
+        if weather == "sandstorm" and mask_used:
+            if success:
+                flavor = random.choice(
+                    [
+                        "방진마스크 덕분에… 숨 좀 쉬겠더라. 그래도 뭐 하나 주웠어!",
+                        "바람은 미쳤는데… 마스크가 버텨줬어. 으헤~",
+                        "시야가 흐릿했지만… 마스크로 버티면서 수확 성공!",
+                    ]
+                )
+            else:
+                flavor = random.choice(
+                    [
+                        "마스크가 있어도… 오늘 바람은 진짜 무리였어…",
+                        "버텨보려 했는데… 모래가 전부 덮었어… 퇴각!",
+                        "마스크 필터가… 지지직… 다음에 다시 가자.",
+                    ]
+                )
+        elif weather == "sandstorm":
             if success:
                 flavor = random.choice(
                     [
@@ -263,17 +468,45 @@ class AbyMiniGameCog(commands.Cog):
                     ]
                 )
 
-        gained = f"**+{_fmt(credits)} 크레딧**"
+        # 획득/손실 표기(Phase3: 음수 크레딧 가능)
+        if credits > 0:
+            gained = f"**+{_fmt(credits)} 크레딧**"
+        elif credits < 0:
+            gained = f"**-{_fmt(abs(credits))} 크레딧**"
+        else:
+            gained = "0 크레딧"
+
         if water > 0:
             gained += f"  +{water} 물"
 
-        txt = (
-            f"{hon} 탐사 결과!\n"
-            f"날씨: `{label}`\n"
-            f"{flavor}\n"
-            f"획득: {gained}\n\n"
-            f"현재 보유: 크레딧 **{_fmt(new_credits)}**, 물 **{_fmt(new_water)}**\n"
-        )
+        # 전리품 메시지
+        loot_lines: list[str] = []
+        if items_to_add:
+            for k, q in items_to_add:
+                meta = ITEMS.get(k)
+                name = meta.get("name") if meta else k
+                loot_lines.append(f"- 전리품: {name} x{q}")
+
+        note = ""
+        if weather != calc_weather:
+            note = f" (버프 적용: `{label_calc}`로 계산)"
+        if drone_applied:
+            loot_lines.append("- 버프: 탐사용 드론 +25% 적용")
+
+        parts = [
+            f"{hon} 탐사 결과!",
+            f"날씨: `{label_env}`{note}",
+            flavor,
+            f"획득: {gained}",
+        ]
+
+        if encounter_lines:
+            parts.append("\n" + "\n".join(encounter_lines))
+        if loot_lines:
+            parts.append("\n" + "\n".join(loot_lines))
+
+        parts.append(f"\n현재 보유: 크레딧 **{_fmt(new_credits)}**, 물 **{_fmt(new_water)}**")
+        txt = "\n".join(parts) + "\n"
         await send_ctx(ctx, txt, allow_glitch=True)
 
     # ------------------------------

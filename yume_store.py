@@ -711,10 +711,10 @@ def claim_daily_explore(user_id: int, date_ymd: str, delta_credits: int, delta_w
     """
 
     uid = int(user_id)
+    # Phase6-2 Phase3: 탐사 중 "사고/조우"로 크레딧이 줄어드는 이벤트를 허용한다.
+    # SQL에서 MAX(0, credits + delta)로 바닥을 막고, 로그에는 음수 델타도 그대로 남긴다.
     d_credits = int(delta_credits)
     d_water = int(delta_water)
-    if d_credits < 0:
-        d_credits = 0
     if d_water < 0:
         d_water = 0
 
@@ -751,6 +751,153 @@ def claim_daily_explore(user_id: int, date_ymd: str, delta_credits: int, delta_w
         )
 
     return get_user_economy(uid)
+
+
+# ------------------------------
+# Abydos Inventory / Buffs (Phase6-2 Phase3)
+# ------------------------------
+
+
+def get_user_inventory(user_id: int) -> Dict[str, int]:
+    """Return {item_key: qty} for a user."""
+
+    uid = int(user_id)
+    rows = fetchall(
+        """
+        SELECT item_key, qty
+        FROM aby_inventory
+        WHERE user_id=? AND qty > 0
+        ORDER BY item_key ASC;
+        """,
+        (uid,),
+    )
+    inv: Dict[str, int] = {}
+    for r in rows:
+        k = str(r.get("item_key") or "").strip()
+        if not k:
+            continue
+        inv[k] = int(r.get("qty") or 0)
+    return inv
+
+
+def add_user_item(user_id: int, item_key: str, qty: int = 1) -> None:
+    uid = int(user_id)
+    key = str(item_key).strip().lower()
+    q = int(qty)
+    if not key or q <= 0:
+        return
+
+    now = now_ts()
+    with get_con() as con:
+        con.execute(
+            """
+            INSERT INTO aby_inventory(user_id, item_key, qty, updated_at)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(user_id, item_key) DO UPDATE SET
+              qty = MAX(0, qty + excluded.qty),
+              updated_at = excluded.updated_at;
+            """,
+            (uid, key, q, now),
+        )
+
+
+def consume_user_item(user_id: int, item_key: str, qty: int = 1) -> bool:
+    """Consume items, returning True on success."""
+
+    uid = int(user_id)
+    key = str(item_key).strip().lower()
+    q = int(qty)
+    if not key or q <= 0:
+        return False
+
+    now = now_ts()
+    with get_con() as con:
+        row = con.execute(
+            "SELECT qty FROM aby_inventory WHERE user_id=? AND item_key=?;",
+            (uid, key),
+        ).fetchone()
+        cur = int(row[0]) if row else 0
+        if cur < q:
+            return False
+        con.execute(
+            "UPDATE aby_inventory SET qty = qty - ?, updated_at=? WHERE user_id=? AND item_key=?;",
+            (q, now, uid, key),
+        )
+    return True
+
+
+def get_user_buff(user_id: int) -> Dict[str, Any]:
+    uid = int(user_id)
+    row = fetchone(
+        """
+        SELECT user_id, buff_key, stacks, expires_at, updated_at
+        FROM aby_buffs
+        WHERE user_id=?;
+        """,
+        (uid,),
+    )
+    if not row:
+        return {"user_id": uid, "buff_key": "", "stacks": 0, "expires_at": 0, "updated_at": 0}
+    return row
+
+
+def set_user_buff(user_id: int, *, buff_key: str, stacks: int, expires_at: int) -> None:
+    uid = int(user_id)
+    key = str(buff_key).strip().lower()
+    now = now_ts()
+    execute(
+        """
+        INSERT INTO aby_buffs(user_id, buff_key, stacks, expires_at, updated_at)
+        VALUES(?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          buff_key=excluded.buff_key,
+          stacks=excluded.stacks,
+          expires_at=excluded.expires_at,
+          updated_at=excluded.updated_at;
+        """,
+        (uid, key, int(stacks), int(expires_at), now),
+    )
+
+
+def clear_user_buff(user_id: int) -> None:
+    uid = int(user_id)
+    execute(
+        "UPDATE aby_buffs SET buff_key='', stacks=0, expires_at=0, updated_at=? WHERE user_id=?;",
+        (now_ts(), uid),
+    )
+
+
+def ensure_user_buff_valid(user_id: int, *, now: Optional[int] = None) -> Dict[str, Any]:
+    """Return buff; if expired, clear it first."""
+
+    ts = int(now or now_ts())
+    b = get_user_buff(user_id)
+    exp = int(b.get("expires_at") or 0)
+    key = str(b.get("buff_key") or "").strip()
+    stacks = int(b.get("stacks") or 0)
+    if not key or stacks <= 0:
+        return {"user_id": int(user_id), "buff_key": "", "stacks": 0, "expires_at": 0, "updated_at": int(b.get("updated_at") or 0)}
+    if exp > 0 and ts >= exp:
+        clear_user_buff(user_id)
+        return {"user_id": int(user_id), "buff_key": "", "stacks": 0, "expires_at": 0, "updated_at": ts}
+    return b
+
+
+def consume_user_buff_stack(user_id: int, *, now: Optional[int] = None) -> None:
+    """Decrease buff stacks by 1 (and clear if exhausted)."""
+
+    ts = int(now or now_ts())
+    b = get_user_buff(user_id)
+    key = str(b.get("buff_key") or "").strip().lower()
+    stacks = int(b.get("stacks") or 0)
+    exp = int(b.get("expires_at") or 0)
+    if not key or stacks <= 0:
+        return
+    stacks -= 1
+    if stacks <= 0:
+        clear_user_buff(user_id)
+        return
+    set_user_buff(user_id, buff_key=key, stacks=stacks, expires_at=exp)
 
 
 def ensure_guild_debt(guild_id: int, *, initial_debt: int = ABY_DEFAULT_DEBT, interest_rate: float = ABY_DEFAULT_INTEREST_RATE, today_ymd: Optional[str] = None) -> None:
