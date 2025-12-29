@@ -89,8 +89,15 @@ def fetchall(sql: str, params: Sequence[Any] = ()) -> List[Dict[str, Any]]:
 
 
 def init_db() -> None:
-    """Create tables if they don't exist."""
+    """Create tables / apply light migrations.
+
+    We keep migrations intentionally simple:
+    - Only additive changes (new tables / new columns)
+    - Schema version tracked via schema_meta('schema_version')
+    """
     now = int(time.time())
+
+    SCHEMA_VERSION = 2
 
     with transaction() as con:
         con.execute(
@@ -102,6 +109,15 @@ def init_db() -> None:
             );
             """
         )
+
+        # Current schema version
+        ver_row = con.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version';"
+        ).fetchone()
+        try:
+            current_version = int(ver_row[0]) if ver_row is not None else 0
+        except Exception:
+            current_version = 0
 
         con.execute(
             """
@@ -141,11 +157,50 @@ def init_db() -> None:
                 ("clear", now, now + 6 * 3600, now),
             )
 
+        # ===== Phase3 (schema v2): rules + suggestions + bot_config =====
+        if current_version < 2:
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_config (
+                  key TEXT PRIMARY KEY,
+                  value TEXT NOT NULL,
+                  updated_at INTEGER NOT NULL
+                );
+                """
+            )
+
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS daily_rules (
+                  date TEXT PRIMARY KEY,              -- YYYY-MM-DD (KST)
+                  rule_no INTEGER NOT NULL,
+                  rule_text TEXT NOT NULL,
+                  created_at INTEGER NOT NULL,
+                  posted_channel_id INTEGER,
+                  posted_at INTEGER,
+                  attempts INTEGER NOT NULL DEFAULT 0,
+                  last_error TEXT
+                );
+                """
+            )
+
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rule_suggestions (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id INTEGER NOT NULL,
+                  guild_id INTEGER,
+                  content TEXT NOT NULL,
+                  created_at INTEGER NOT NULL
+                );
+                """
+            )
+
         con.execute(
             """
             INSERT INTO schema_meta(key, value, updated_at)
-            VALUES('schema_version', '1', ?)
+            VALUES('schema_version', ?, ?)
             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;
             """,
-            (now,),
+            (str(SCHEMA_VERSION), now),
         )

@@ -14,6 +14,31 @@ from typing import Any, Dict, Optional
 from yume_db import execute, fetchone
 
 
+# =========================
+# Generic bot config
+# =========================
+
+
+def get_config(key: str, default: str | None = None) -> str | None:
+    row = fetchone("SELECT value FROM bot_config WHERE key=?;", (str(key),))
+    if not row:
+        return default
+    v = str(row.get("value") or "")
+    return v if v != "" else default
+
+
+def set_config(key: str, value: str) -> None:
+    now = int(time.time())
+    execute(
+        """
+        INSERT INTO bot_config(key, value, updated_at)
+        VALUES(?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;
+        """,
+        (str(key), str(value), now),
+    )
+
+
 def ensure_user_settings(user_id: int) -> None:
     now = int(time.time())
     execute(
@@ -84,4 +109,117 @@ def set_world_weather(weather: str, *, changed_at: Optional[int] = None, next_ch
         WHERE id=1;
         """,
         (str(weather), changed, next_at, now),
+    )
+
+
+# =========================
+# Phase3: Daily rules (교칙)
+# =========================
+
+
+def get_daily_rule(date_ymd: str) -> Optional[Dict[str, Any]]:
+    return fetchone(
+        """
+        SELECT date, rule_no, rule_text, created_at, posted_channel_id, posted_at, attempts, last_error
+        FROM daily_rules
+        WHERE date=?;
+        """,
+        (str(date_ymd),),
+    )
+
+
+def ensure_daily_rule_row(date_ymd: str) -> Dict[str, Any]:
+    """Ensure a row exists for the given date, assigning the next rule number.
+
+    This is a small "claim" step to prevent duplicates after restarts.
+    """
+    now = int(time.time())
+
+    # If already exists, return it.
+    row = get_daily_rule(date_ymd)
+    if row:
+        return row
+
+    # Create a new one with rule_no = max + 1.
+    max_row = fetchone("SELECT COALESCE(MAX(rule_no), 141) AS mx FROM daily_rules;")
+    mx = int((max_row or {}).get("mx") or 141)
+    next_no = mx + 1
+
+    execute(
+        """
+        INSERT INTO daily_rules(date, rule_no, rule_text, created_at, posted_channel_id, posted_at, attempts, last_error)
+        VALUES(?, ?, '', ?, NULL, NULL, 0, NULL)
+        ON CONFLICT(date) DO NOTHING;
+        """,
+        (str(date_ymd), int(next_no), now),
+    )
+
+    row = get_daily_rule(date_ymd)
+    return row or {
+        "date": str(date_ymd),
+        "rule_no": int(next_no),
+        "rule_text": "",
+        "created_at": now,
+        "posted_channel_id": None,
+        "posted_at": None,
+        "attempts": 0,
+        "last_error": None,
+    }
+
+
+def update_daily_rule_text(date_ymd: str, rule_text: str) -> None:
+    execute(
+        "UPDATE daily_rules SET rule_text=? WHERE date=?;",
+        (str(rule_text), str(date_ymd)),
+    )
+
+
+def mark_daily_rule_posted(date_ymd: str, *, channel_id: int) -> None:
+    now = int(time.time())
+    execute(
+        "UPDATE daily_rules SET posted_channel_id=?, posted_at=?, last_error=NULL WHERE date=?;",
+        (int(channel_id), now, str(date_ymd)),
+    )
+
+
+def bump_daily_rule_attempt(date_ymd: str, *, error: str) -> None:
+    execute(
+        """
+        UPDATE daily_rules
+        SET attempts = COALESCE(attempts, 0) + 1,
+            last_error = ?
+        WHERE date=?;
+        """,
+        (str(error)[:800], str(date_ymd)),
+    )
+
+
+def add_rule_suggestion(user_id: int, guild_id: Optional[int], content: str) -> None:
+    now = int(time.time())
+    execute(
+        """
+        INSERT INTO rule_suggestions(user_id, guild_id, content, created_at)
+        VALUES(?, ?, ?, ?);
+        """,
+        (int(user_id), int(guild_id) if guild_id is not None else None, str(content)[:600], now),
+    )
+
+
+def get_recent_rule_suggestions(limit: int = 5) -> list[Dict[str, Any]]:
+    # Avoid importing fetchall at top-level to keep API tiny.
+    from yume_db import fetchall
+
+    lim = int(limit)
+    if lim <= 0:
+        lim = 5
+    if lim > 20:
+        lim = 20
+    return fetchall(
+        """
+        SELECT id, user_id, guild_id, content, created_at
+        FROM rule_suggestions
+        ORDER BY id DESC
+        LIMIT ?;
+        """,
+        (lim,),
     )

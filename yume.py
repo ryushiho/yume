@@ -127,6 +127,7 @@ EXTENSIONS = [
     "cogs.admin",
     "cogs.noise_settings",
     "cogs.aby_environment",
+    "cogs.rule_maker",
     "cogs.blue_war",
     "cogs.music",
     "cogs.yume_diary",
