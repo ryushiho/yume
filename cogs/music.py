@@ -55,6 +55,9 @@ class _Track:
     webpage_url: str
     requester_id: Optional[int] = None
 
+    duration_sec: Optional[int] = None
+    is_live: bool = False
+
     _resolved_stream_url: Optional[str] = None
     _resolved_at: float = 0.0
 
@@ -117,21 +120,43 @@ def _select_best_audio_url(entry: dict) -> Optional[str]:
     return None
 
 
-def _ffmpeg_source(stream_url: str, volume: float, *, af_filters: Optional[str] = None) -> discord.AudioSource:
-    """FFmpeg 오디오 소스 생성.
+def _ffmpeg_source(
+    stream_url: str,
+    volume: float,
+    *,
+    af_filters: Optional[str] = None,
+    seek_sec: Optional[float] = None,
+    limit_sec: Optional[float] = None,
+) -> discord.AudioSource:
+    """ffmpeg 오디오 소스 생성.
 
-    af_filters가 주어지면 -af로 필터 체인을 적용한다.
-    (이퀄라이저/리버브 같은 FX는 여기서 처리)
+    Phase3:
+    - seek_sec: -ss (입력 앞, before_options)
+    - limit_sec: -t (출력 옵션)
     """
-    options = FFMPEG_OPTIONS
+
+    before = FFMPEG_BEFORE
+    try:
+        if seek_sec is not None and float(seek_sec) > 0:
+            before = f"{before} -ss {float(seek_sec):.3f}"
+    except Exception:
+        pass
+
+    opts = FFMPEG_OPTIONS
+    try:
+        if limit_sec is not None and float(limit_sec) > 0:
+            opts = f"{opts} -t {float(limit_sec):.3f}"
+    except Exception:
+        pass
+
     if af_filters:
-        options = f"{options} -af {af_filters}"
+        opts = f"{opts} -af {af_filters}"
 
     src = discord.FFmpegPCMAudio(
         stream_url,
+        before_options=before,
+        options=opts,
         executable=FFMPEG_EXECUTABLE,
-        before_options=FFMPEG_BEFORE,
-        options=options,
     )
     return discord.PCMVolumeTransformer(src, volume=volume)
 
@@ -304,6 +329,18 @@ class MusicState:
         self.play_started_at: float = 0.0  # loop.time() 기준
         self.paused_at: Optional[float] = None
         self.paused_total: float = 0.0
+
+        # 점프/구간 재생(Phase3)
+        self.play_seek_base: float = 0.0  # 현재 곡의 시작 오프셋(초)
+        self.seek_next_sec: Optional[float] = None  # 다음 재생에서 1회 적용
+        self.segment_start_sec: Optional[float] = None
+        self.segment_end_sec: Optional[float] = None
+        self.segment_ab_repeat: bool = False
+
+        # UI 갱신 직렬화/틱 갱신(Phase3)
+        self.ui_lock: asyncio.Lock = asyncio.Lock()
+        self.panel_tick_task: Optional[asyncio.Task] = None
+        self._panel_last_render_key: Optional[str] = None
 
         self.lock: asyncio.Lock = asyncio.Lock()
 
@@ -776,7 +813,7 @@ class MusicCog(commands.Cog):
         self.bot = bot
         self._states: Dict[int, MusicState] = {}
 
-        self._panel_cfg: Dict[str, Dict[str, int]] = self._load_panel_config()
+        self._panel_cfg: Dict[str, Dict[str, object]] = self._load_panel_config()
         self._panel_cfg_lock = asyncio.Lock()
         self._fx_cfg = self._load_fx_cfg()
         self._fx_cfg_lock = asyncio.Lock()
@@ -812,6 +849,17 @@ class MusicCog(commands.Cog):
             except Exception:
                 pass
 
+            try:
+                if st.panel_tick_task and not st.panel_tick_task.done():
+                    st.panel_tick_task.cancel()
+            except Exception:
+                pass
+            try:
+                if st.lyrics_task and not st.lyrics_task.done():
+                    st.lyrics_task.cancel()
+            except Exception:
+                pass
+
     def _state(self, guild_id: int) -> MusicState:
         st = self._states.get(guild_id)
         if st is None:
@@ -825,7 +873,15 @@ class MusicCog(commands.Cog):
         st.last_error = msg[:160]
         st.last_error_at = time.time()
 
-    def _load_panel_config(self) -> Dict[str, Dict[str, int]]:
+    def _load_panel_config(self) -> Dict[str, Dict[str, object]]:
+        """data/storage/music_panel.json
+
+        Phase3:
+        - channel_id/message_id: 고정 플레이어 패널
+        - lyrics_enabled/lyrics_channel_id/lyrics_message_id: 고정 가사 패널
+
+        호환성: 과거 파일(채널/메시지만 존재)도 그대로 읽는다.
+        """
         try:
             if not os.path.exists(PANEL_CFG_PATH):
                 return {}
@@ -833,22 +889,56 @@ class MusicCog(commands.Cog):
                 data = json.load(f)
             if not isinstance(data, dict):
                 return {}
-            out: Dict[str, Dict[str, int]] = {}
+
+            out: Dict[str, Dict[str, object]] = {}
             for k, v in data.items():
                 if not isinstance(k, str) or not isinstance(v, dict):
                     continue
                 try:
                     gid = int(k)
-                    ch = int(v.get("channel_id", 0))
-                    mid = int(v.get("message_id", 0))
                 except Exception:
                     continue
-                if gid <= 0 or ch <= 0:
+                if gid <= 0:
                     continue
-                out[str(gid)] = {"channel_id": ch, "message_id": max(0, mid)}
+
+                def _to_int(x) -> int:
+                    try:
+                        return int(x)
+                    except Exception:
+                        return 0
+
+                def _to_bool(x) -> bool:
+                    if isinstance(x, bool):
+                        return x
+                    if isinstance(x, (int, float)):
+                        return bool(int(x))
+                    if isinstance(x, str):
+                        return x.strip().lower() in {"1", "true", "yes", "y", "on"}
+                    return False
+
+                ch = _to_int(v.get("channel_id", 0))
+                mid = _to_int(v.get("message_id", 0))
+
+                lyrics_enabled = _to_bool(v.get("lyrics_enabled", False))
+                lch = _to_int(v.get("lyrics_channel_id", 0))
+                lmid = _to_int(v.get("lyrics_message_id", 0))
+
+                if ch <= 0:
+                    # 고정 패널이 없으면 이 entry는 무시(가사만 켜진 상태는 지원하지 않음)
+                    continue
+
+                out[str(gid)] = {
+                    "channel_id": ch,
+                    "message_id": max(0, mid),
+                    "lyrics_enabled": bool(lyrics_enabled),
+                    "lyrics_channel_id": max(0, lch),
+                    "lyrics_message_id": max(0, lmid),
+                }
+
             return out
         except Exception:
             return {}
+
 
     def _save_panel_config_unlocked(self) -> None:
         try:
@@ -988,14 +1078,46 @@ class MusicCog(commands.Cog):
         except Exception:
             return (None, None)
 
+    def _fixed_lyrics(self, guild_id: int) -> Tuple[bool, Optional[int], Optional[int]]:
+        """(enabled, lyrics_channel_id, lyrics_message_id)"""
+        v = self._panel_cfg.get(str(guild_id))
+        if not v:
+            return (False, None, None)
+        try:
+            enabled = bool(v.get("lyrics_enabled", False))
+            ch = int(v.get("lyrics_channel_id", 0)) or None
+            mid = int(v.get("lyrics_message_id", 0)) or None
+            return (enabled, ch, mid)
+        except Exception:
+            return (False, None, None)
+
+
     async def _set_fixed_panel(self, guild_id: int, channel_id: int, message_id: int):
         async with self._panel_cfg_lock:
-            self._panel_cfg[str(guild_id)] = {
+            cur = self._panel_cfg.get(str(guild_id))
+            if not isinstance(cur, dict):
+                cur = {}
+            cur.update({
                 "channel_id": int(channel_id),
                 "message_id": int(message_id),
-            }
+            })
+            self._panel_cfg[str(guild_id)] = cur
             self._save_panel_config_unlocked()
 
+
+
+    async def _set_fixed_lyrics(self, guild_id: int, *, enabled: bool, channel_id: Optional[int], message_id: Optional[int]):
+        async with self._panel_cfg_lock:
+            cur = self._panel_cfg.get(str(guild_id))
+            if not isinstance(cur, dict):
+                cur = {}
+            cur.update({
+                "lyrics_enabled": bool(enabled),
+                "lyrics_channel_id": int(channel_id or 0),
+                "lyrics_message_id": int(message_id or 0),
+            })
+            self._panel_cfg[str(guild_id)] = cur
+            self._save_panel_config_unlocked()
     async def _clear_fixed_panel(self, guild_id: int):
         async with self._panel_cfg_lock:
             self._panel_cfg.pop(str(guild_id), None)
@@ -1022,6 +1144,7 @@ class MusicCog(commands.Cog):
                 continue
 
             embed = self._build_embed(guild)
+            view = self.panel_view
 
             msg: Optional[discord.Message] = None
             if message_id:
@@ -1039,6 +1162,19 @@ class MusicCog(commands.Cog):
                 else:
                     msg = await ch.send(embed=embed, view=view)
                     await self._set_fixed_panel(gid, channel_id, msg.id)
+
+                # Phase3: 패널 틱 갱신 시작
+                self._start_panel_tick(gid)
+
+                # Phase3: 고정 가사 복원(켜져 있으면 동일 채널에서 계속 edit)
+                enabled, lch, lmid = self._fixed_lyrics(gid)
+                if enabled:
+                    st = self._state(gid)
+                    st.lyrics_enabled = True
+                    st.lyrics_channel_id = lch or channel_id
+                    st.lyrics_message_id = lmid or None
+                    if st.lyrics_task is None or st.lyrics_task.done():
+                        st.lyrics_task = asyncio.create_task(self._lyrics_loop(gid))
             except Exception as e:
                 logger.warning("[Music] panel restore error: %s", e)
 
@@ -1242,6 +1378,13 @@ class MusicCog(commands.Cog):
 
             try:
                 real_title = entry.get("title")
+                try:
+                    dur = entry.get('duration')
+                    if isinstance(dur, (int, float)) and int(dur) > 0:
+                        track.duration_sec = int(dur)
+                    track.is_live = bool(entry.get('is_live') or entry.get('live_status') in {'is_live','live'})
+                except Exception:
+                    pass
                 real_page = entry.get("webpage_url") or entry.get("original_url")
                 if real_title and isinstance(real_title, str):
                     track.title = real_title
@@ -1310,9 +1453,49 @@ class MusicCog(commands.Cog):
                     pass
 
             try:
-                src = _ffmpeg_source(stream_url, volume=st.volume, af_filters=self._build_af_filters(st))
+                # Phase3: 점프/구간 재생 적용
+                seek = None
+                limit = None
+                try:
+                    # 우선: 구간이 있으면 구간 우선
+                    seg_s = st.segment_start_sec
+                    seg_e = st.segment_end_sec
+                    if seg_s is not None and seg_e is not None and float(seg_e) > float(seg_s):
+                        seek = float(seg_s)
+                        limit = float(seg_e) - float(seg_s)
+
+                    # 점프(1회) 오버라이드
+                    if st.seek_next_sec is not None:
+                        j = float(st.seek_next_sec)
+                        st.seek_next_sec = None
+                        if seek is not None and limit is not None:
+                            # 구간 안에서 점프: 시작~끝 범위로 클램프
+                            j = max(float(seg_s), min(float(seg_e) - 0.5, j))
+                            limit = float(seg_e) - float(j)
+                        seek = max(0.0, j)
+
+                    # 라이브는 seek 불가
+                    if getattr(track, 'is_live', False) and ((seek or 0.0) > 0.0 or (limit is not None)):
+                        seek = None
+                        limit = None
+                        st.segment_start_sec = None
+                        st.segment_end_sec = None
+                        st.segment_ab_repeat = False
+                        self._set_error(guild_id, "라이브 스트림은 점프/구간이 안 돼.")
+                except Exception:
+                    seek = None
+                    limit = None
+
+                src = _ffmpeg_source(
+                    stream_url,
+                    volume=st.volume,
+                    af_filters=self._build_af_filters(st),
+                    seek_sec=seek,
+                    limit_sec=limit,
+                )
 
                 st.play_started_at = self.bot.loop.time()
+                st.play_seek_base = float(seek or 0.0)
                 st.paused_at = None
                 st.paused_total = 0.0
 
@@ -1329,7 +1512,32 @@ class MusicCog(commands.Cog):
                 finished = st.now_playing
                 st.now_playing = None
 
-                if st.loop_all and finished is not None and not st._suppress_requeue_once:
+                # Phase3: AB 반복(구간이 설정되어 있고 AB가 켜져 있으면, 같은 곡을 '맨 앞'에 다시 넣는다)
+                ab_requeued = False
+                try:
+                    if (
+                        finished is not None
+                        and st.segment_ab_repeat
+                        and st.segment_start_sec is not None
+                        and st.segment_end_sec is not None
+                        and float(st.segment_end_sec) > float(st.segment_start_sec)
+                        and (not st._suppress_requeue_once)
+                    ):
+                        q = getattr(st.queue, '_queue', None)
+                        if q is not None and hasattr(q, 'appendleft'):
+                            q.appendleft(finished)
+                            ab_requeued = True
+                except Exception:
+                    ab_requeued = False
+
+                # 구간(AB 아님)은 '자연 종료'일 때만 해제한다.
+                # (점프/구간 설정을 위해 vc.stop()으로 재시작하는 경우에는 유지해야 함)
+                if (not st._suppress_requeue_once) and (not ab_requeued) and (st.segment_start_sec is not None or st.segment_end_sec is not None):
+                    st.segment_start_sec = None
+                    st.segment_end_sec = None
+                    st.segment_ab_repeat = False
+
+                if st.loop_all and finished is not None and (not st._suppress_requeue_once) and (not ab_requeued):
                     try:
                         await st.queue.put(finished)
                     except Exception:
@@ -1343,6 +1551,7 @@ class MusicCog(commands.Cog):
         if st.player_task and not st.player_task.done():
             return
         st.player_task = asyncio.create_task(self._player_loop(guild_id))
+        self._start_panel_tick(guild_id)
 
 
 
@@ -1373,6 +1582,32 @@ class MusicCog(commands.Cog):
             embed.add_field(name="🎧 지금 재생", value=f"[{now_title}]({now_url})", inline=False)
         else:
             embed.add_field(name="🎧 지금 재생", value=now_title, inline=False)
+
+        # Phase3: 진행 상태(틱 갱신으로 주기적으로 업데이트)
+        if st.now_playing is not None:
+            pos = self._current_pos(st)
+            dur = getattr(st.now_playing, 'duration_sec', None)
+            seg_s = getattr(st, 'segment_start_sec', None)
+            seg_e = getattr(st, 'segment_end_sec', None)
+
+            def _fmt(t: float) -> str:
+                t = max(0.0, float(t))
+                mm = int(t // 60)
+                ss = int(t % 60)
+                return f"{mm:02d}:{ss:02d}"
+
+            extra = ""
+            if seg_s is not None and seg_e is not None and float(seg_e) > float(seg_s):
+                extra = f" | 구간: {_fmt(seg_s)}~{_fmt(seg_e)}" + (" (AB)" if st.segment_ab_repeat else "")
+
+            if isinstance(dur, int) and dur > 0:
+                # 20칸 바(스팸 적고 보기 좋게)
+                ratio = min(1.0, max(0.0, pos / float(dur)))
+                filled = int(ratio * 20)
+                bar = "■" * filled + "□" * (20 - filled)
+                embed.add_field(name="⏱ 진행", value=f"`{bar}` {_fmt(pos)} / {_fmt(dur)}{extra}", inline=False)
+            else:
+                embed.add_field(name="⏱ 진행", value=f"{_fmt(pos)}{extra}", inline=False)
 
         embed.add_field(name="📃 큐", value=f"{st.queue.qsize()}곡", inline=True)
         embed.add_field(name="🔁 반복", value="ON" if st.loop_all else "OFF", inline=True)
@@ -1420,30 +1655,33 @@ class MusicCog(commands.Cog):
         if fixed:
             _, msg_id = self._fixed_panel(guild_id)
         else:
-            st = self._state(guild_id)
             msg_id = st.temp_panel_message_id
 
         msg: Optional[discord.Message] = None
         if msg_id:
             try:
-                msg = await ch.fetch_message(msg_id)
+                msg = await ch.fetch_message(int(msg_id))
             except discord.NotFound:
                 msg = None
             except Exception:
                 msg = None
 
         try:
-            if msg:
-                await msg.edit(embed=embed, view=view)
-                return (channel_id, msg.id)
+            async with st.ui_lock:
+                if msg:
+                    await msg.edit(embed=embed, view=view)
+                    if fixed:
+                        self._start_panel_tick(guild_id)
+                    return (channel_id, msg.id)
 
-            msg = await ch.send(embed=embed, view=view)
-            if fixed:
-                await self._set_fixed_panel(guild_id, channel_id, msg.id)
-            else:
-                st.temp_panel_channel_id = channel_id
-                st.temp_panel_message_id = msg.id
-            return (channel_id, msg.id)
+                msg = await ch.send(embed=embed, view=view)
+                if fixed:
+                    await self._set_fixed_panel(guild_id, channel_id, msg.id)
+                    self._start_panel_tick(guild_id)
+                else:
+                    st.temp_panel_channel_id = channel_id
+                    st.temp_panel_message_id = msg.id
+                return (channel_id, msg.id)
         except Exception:
             return (None, None)
 
@@ -1470,10 +1708,109 @@ class MusicCog(commands.Cog):
 
         await self._ensure_panel_message(guild_id, channel_id, fixed=False)
 
+
+
+    # =========================
+    # Phase3: 패널 틱(주기) 갱신
+    # =========================
+
+    def _start_panel_tick(self, guild_id: int):
+        st = self._state(guild_id)
+        if st.panel_tick_task and not st.panel_tick_task.done():
+            return
+        st.panel_tick_task = asyncio.create_task(self._panel_tick_loop(guild_id))
+
+    def _stop_panel_tick(self, guild_id: int):
+        st = self._state(guild_id)
+        if st.panel_tick_task and not st.panel_tick_task.done():
+            try:
+                st.panel_tick_task.cancel()
+            except Exception:
+                pass
+        st.panel_tick_task = None
+        st._panel_last_render_key = None
+
+    async def _panel_tick_loop(self, guild_id: int):
+        """고정/임시 패널 메시지를 2~5초 간격으로 edit한다.
+
+        - panel_mode가 main일 때만 업데이트 (큐/이퀄라이저 화면을 덮어쓰지 않기)
+        - 임베드가 동일하면 skip
+        """
+        await self.bot.wait_until_ready()
+        while True:
+            st = self._state(guild_id)
+            fixed_ch, fixed_mid = self._fixed_panel(guild_id)
+            ch_id = fixed_ch or st.temp_panel_channel_id
+            mid = fixed_mid or st.temp_panel_message_id
+
+            if not ch_id or not mid:
+                return
+
+            # 큐/사운드 패널 열어둔 중엔 자동 갱신 금지
+            if st.panel_mode != 'main':
+                await asyncio.sleep(2.5)
+                continue
+
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                await asyncio.sleep(2.5)
+                continue
+
+            vc = guild.voice_client
+            interval = 3.0 if (vc and (vc.is_playing() or vc.is_paused())) else 5.0
+
+            embed = self._build_embed(guild)
+            try:
+                render_key = json.dumps(embed.to_dict(), ensure_ascii=False, sort_keys=True)
+            except Exception:
+                render_key = None
+
+            if render_key and render_key == st._panel_last_render_key:
+                await asyncio.sleep(interval)
+                continue
+            st._panel_last_render_key = render_key
+
+            ch = self.bot.get_channel(int(ch_id))
+            if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                await asyncio.sleep(interval)
+                continue
+
+            try:
+                async with st.ui_lock:
+                    pm = ch.get_partial_message(int(mid))
+                    await pm.edit(embed=embed, view=self.panel_view)
+            except discord.NotFound:
+                # 메시지가 사라졌으면 재생성
+                try:
+                    if fixed_ch:
+                        await self._ensure_panel_message(guild_id, int(fixed_ch), fixed=True)
+                    else:
+                        st.temp_panel_message_id = None
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+            await asyncio.sleep(interval)
     async def _refresh_from_interaction(self, interaction: discord.Interaction):
         if interaction.guild is None:
             return
-        await self._refresh_panel(interaction.guild.id, hint_channel_id=interaction.channel_id)
+        gid = interaction.guild.id
+        st = self._state(gid)
+
+        if st.panel_mode == 'queue':
+            embed = self._build_queue_embed(interaction.guild)
+            view = self.queue_view
+        elif st.panel_mode == 'sound':
+            embed = self._build_sound_embed(interaction.guild)
+            view = self.sound_view
+        else:
+            embed = self._build_embed(interaction.guild)
+            view = self.panel_view
+
+        # 가능한 한 interaction.message를 바로 수정해서 '즉시 반영'되게 한다.
+        await self._edit_panel_message(gid, embed=embed, view=view, interaction=interaction)
+        self._start_panel_tick(gid)
 
     async def _enqueue_from_interaction(self, interaction: discord.Interaction, query: str):
         try:
@@ -1512,7 +1849,10 @@ class MusicCog(commands.Cog):
             title = str(entry.get("title") or "제목 없음")
             webpage_url = str(entry.get("webpage_url") or entry.get("original_url") or q)
 
-            track = _Track(title=title, webpage_url=webpage_url, requester_id=interaction.user.id)
+            dur = entry.get("duration")
+            is_live = bool(entry.get("is_live") or entry.get("live_status") == "is_live")
+
+            track = _Track(title=title, webpage_url=webpage_url, requester_id=interaction.user.id, duration_sec=int(dur) if isinstance(dur, (int, float)) else None, is_live=is_live)
 
             st = self._state(interaction.guild.id)
             await st.queue.put(track)
@@ -1680,6 +2020,10 @@ class MusicCog(commands.Cog):
             return
 
         st._suppress_requeue_once = True
+        st.seek_next_sec = None
+        st.segment_start_sec = None
+        st.segment_end_sec = None
+        st.segment_ab_repeat = False
         try:
             vc.stop()
         except Exception:
@@ -1697,6 +2041,10 @@ class MusicCog(commands.Cog):
 
         st = self._state(interaction.guild.id)
         st._suppress_requeue_once = True
+        st.seek_next_sec = None
+        st.segment_start_sec = None
+        st.segment_end_sec = None
+        st.segment_ab_repeat = False
 
         vc = interaction.guild.voice_client
         if vc and vc.is_connected():
@@ -2109,33 +2457,34 @@ class MusicCog(commands.Cog):
         view: discord.ui.View,
         interaction: Optional[discord.Interaction] = None,
     ) -> bool:
-        # 버튼 상호작용이면 가능한 한 "해당 메시지"를 바로 수정한다.
-        if interaction is not None and getattr(interaction, "message", None) is not None:
+        st = self._state(guild_id)
+        async with st.ui_lock:
+            # 버튼 상호작용이면 가능한 한 '해당 메시지'를 즉시 수정한다.
+            if interaction is not None and getattr(interaction, "message", None) is not None:
+                try:
+                    if not interaction.response.is_done():
+                        await interaction.response.edit_message(embed=embed, view=view)
+                    else:
+                        await interaction.message.edit(embed=embed, view=view)  # type: ignore[union-attr]
+                    return True
+                except Exception:
+                    pass
+
+            fixed_ch, fixed_mid = self._fixed_panel(guild_id)
+            ch_id = fixed_ch or st.temp_panel_channel_id
+            mid = fixed_mid or st.temp_panel_message_id
+            if not ch_id or not mid:
+                return False
+
+            ch = self.bot.get_channel(int(ch_id))
+            if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                return False
             try:
-                if not interaction.response.is_done():
-                    await interaction.response.edit_message(embed=embed, view=view)
-                else:
-                    await interaction.message.edit(embed=embed, view=view)  # type: ignore[union-attr]
+                msg = await ch.fetch_message(int(mid))
+                await msg.edit(embed=embed, view=view)
                 return True
             except Exception:
-                pass
-
-        fixed_ch, fixed_mid = self._fixed_panel(guild_id)
-        st = self._state(guild_id)
-        ch_id = fixed_ch or st.temp_panel_channel_id
-        mid = fixed_mid or st.temp_panel_message_id
-        if not ch_id or not mid:
-            return False
-
-        ch = self.bot.get_channel(int(ch_id))
-        if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-            return False
-        try:
-            msg = await ch.fetch_message(int(mid))
-            await msg.edit(embed=embed, view=view)
-            return True
-        except Exception:
-            return False
+                return False
 
     async def _open_queue_manage(self, interaction: discord.Interaction):
         if interaction.guild is None:
@@ -2177,7 +2526,7 @@ class MusicCog(commands.Cog):
         now = self.bot.loop.time()
         if st.paused_at is not None:
             now = st.paused_at
-        pos = now - st.play_started_at - st.paused_total
+        pos = now - st.play_started_at - st.paused_total + float(getattr(st, 'play_seek_base', 0.0) or 0.0)
         if pos < 0:
             pos = 0.0
         return float(pos)
@@ -2185,6 +2534,11 @@ class MusicCog(commands.Cog):
     async def _disable_lyrics(self, guild_id: int, *, delete_message: bool):
         st = self._state(guild_id)
         st.lyrics_enabled = False
+
+        # 고정 패널이 있으면 가사 설정도 저장해둔다
+        fixed_ch, _ = self._fixed_panel(guild_id)
+        if fixed_ch:
+            await self._set_fixed_lyrics(guild_id, enabled=False, channel_id=None, message_id=None)
 
         if st.lyrics_task and not st.lyrics_task.done():
             try:
@@ -2212,7 +2566,6 @@ class MusicCog(commands.Cog):
             return
         gid = interaction.guild.id
         st = self._state(gid)
-        st.panel_mode = 'sound'
 
         if st.lyrics_enabled:
             await self._disable_lyrics(gid, delete_message=True)
@@ -2224,10 +2577,12 @@ class MusicCog(commands.Cog):
 
         st.lyrics_enabled = True
 
-        cid, _mid = self._fixed_panel(gid)
-        if not cid:
-            cid = interaction.channel_id
+        fixed_ch, _mid = self._fixed_panel(gid)
+        cid = fixed_ch or interaction.channel_id
         st.lyrics_channel_id = cid
+
+        if fixed_ch:
+            await self._set_fixed_lyrics(gid, enabled=True, channel_id=fixed_ch, message_id=None)
 
         if st.lyrics_task is None or st.lyrics_task.done():
             st.lyrics_task = asyncio.create_task(self._lyrics_loop(gid))
@@ -2348,12 +2703,20 @@ class MusicCog(commands.Cog):
                 except Exception:
                     st.lyrics_message_id = None
                     msg = None
+                    fixed_ch, _ = self._fixed_panel(guild_id)
+                    if fixed_ch:
+                        await self._set_fixed_lyrics(guild_id, enabled=True, channel_id=st.lyrics_channel_id, message_id=None)
+
 
             if msg is None:
                 try:
                     m = await ch.send(embed=discord.Embed(title="🎤 유메 - 가사", description="가사를 준비하는 중..."))
                     st.lyrics_message_id = m.id
                     msg = m
+                    fixed_ch, _ = self._fixed_panel(guild_id)
+                    if fixed_ch:
+                        await self._set_fixed_lyrics(guild_id, enabled=True, channel_id=st.lyrics_channel_id, message_id=st.lyrics_message_id)
+
                 except Exception:
                     await asyncio.sleep(2.0)
                     continue
@@ -2390,7 +2753,8 @@ class MusicCog(commands.Cog):
             last_embed_key = embed_key
 
             try:
-                await msg.edit(embed=embed)
+                async with st.ui_lock:
+                    await msg.edit(embed=embed)
             except Exception:
                 st.lyrics_message_id = None
 
@@ -2590,19 +2954,62 @@ class MusicCog(commands.Cog):
         embed = self._build_queue_embed(interaction.guild)
         await self._edit_panel_message(gid, embed=embed, view=self.queue_view, interaction=interaction)
 
+
     @commands.command(name="음악채널지정")
     @commands.has_permissions(manage_guild=True)
     async def set_music_channel(self, ctx: commands.Context, channel: discord.TextChannel):
-        """!음악채널지정 <채널ID>: 지정한 채널에 음악 패널을 항상 고정한다."""
+        """!음악채널지정 <채널>: 지정한 채널에 음악 패널을 항상 고정한다."""
         if ctx.guild is None:
             await ctx.send("서버 채널에서만 쓸 수 있어.")
             return
 
-        cid, mid = await self._ensure_panel_message(ctx.guild.id, channel.id, fixed=True)
+        gid = ctx.guild.id
+
+        # 기존 고정 패널/가사 메시지 정리(채널 이동 시)
+        old_ch, old_mid = self._fixed_panel(gid)
+        old_ly_enabled, old_lch, old_lmid = self._fixed_lyrics(gid)
+
+        if old_ch and old_mid and int(old_ch) != int(channel.id):
+            old_channel = self.bot.get_channel(int(old_ch))
+            if isinstance(old_channel, (discord.TextChannel, discord.Thread)):
+                try:
+                    await old_channel.get_partial_message(int(old_mid)).delete()
+                except Exception:
+                    try:
+                        msg = await old_channel.fetch_message(int(old_mid))
+                        await msg.delete()
+                    except Exception:
+                        pass
+
+        if old_ly_enabled and old_lch and old_lmid and int(old_lch) != int(channel.id):
+            old_lc = self.bot.get_channel(int(old_lch))
+            if isinstance(old_lc, (discord.TextChannel, discord.Thread)):
+                try:
+                    await old_lc.get_partial_message(int(old_lmid)).delete()
+                except Exception:
+                    try:
+                        m = await old_lc.fetch_message(int(old_lmid))
+                        await m.delete()
+                    except Exception:
+                        pass
+
+        # 새 채널에 패널 생성/갱신
+        cid, mid = await self._ensure_panel_message(gid, channel.id, fixed=True)
         if not cid or not mid:
             await ctx.send("그 채널에 패널을 만들 수 없었어(권한을 확인해줘).")
             return
 
+        # 가사 설정 유지: 이전에 켜져있으면 새 채널로 옮겨서 계속 edit
+        st = self._state(gid)
+        if old_ly_enabled or st.lyrics_enabled:
+            st.lyrics_enabled = True
+            st.lyrics_channel_id = channel.id
+            st.lyrics_message_id = None
+            await self._set_fixed_lyrics(gid, enabled=True, channel_id=channel.id, message_id=None)
+            if st.lyrics_task is None or st.lyrics_task.done():
+                st.lyrics_task = asyncio.create_task(self._lyrics_loop(gid))
+
+        self._start_panel_tick(gid)
         await ctx.send(f"음악 패널 채널을 {channel.mention}로 지정했어. 이제 여기만 갱신할게.")
 
     @set_music_channel.error
@@ -2610,7 +3017,7 @@ class MusicCog(commands.Cog):
         if isinstance(error, commands.MissingPermissions):
             await ctx.send("이건 서버 관리 권한(서버 관리)이 필요해.")
             return
-        await ctx.send("사용법: `!음악채널지정 <채널ID>`")
+        await ctx.send("사용법: `!음악채널지정 <채널>`")
 
     @commands.command(name="음악채널해제")
     @commands.has_permissions(manage_guild=True)
@@ -2619,7 +3026,42 @@ class MusicCog(commands.Cog):
         if ctx.guild is None:
             await ctx.send("서버 채널에서만 쓸 수 있어.")
             return
-        await self._clear_fixed_panel(ctx.guild.id)
+
+        gid = ctx.guild.id
+        ch_id, mid = self._fixed_panel(gid)
+        ly_enabled, lch, lmid = self._fixed_lyrics(gid)
+
+        # 가사 메시지 삭제(best-effort)
+        if ly_enabled and lch and lmid:
+            ch = self.bot.get_channel(int(lch))
+            if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                try:
+                    await ch.get_partial_message(int(lmid)).delete()
+                except Exception:
+                    try:
+                        msg = await ch.fetch_message(int(lmid))
+                        await msg.delete()
+                    except Exception:
+                        pass
+
+        # 설정 제거 + 루프 정리
+        await self._clear_fixed_panel(gid)
+        self._stop_panel_tick(gid)
+        await self._disable_lyrics(gid, delete_message=True)
+
+        # 패널 메시지 삭제(best-effort)
+        if ch_id and mid:
+            ch = self.bot.get_channel(int(ch_id))
+            if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                try:
+                    await ch.get_partial_message(int(mid)).delete()
+                except Exception:
+                    try:
+                        msg = await ch.fetch_message(int(mid))
+                        await msg.delete()
+                    except Exception:
+                        pass
+
         await ctx.send("고정 음악 패널 설정을 지웠어. 이제 `!음악`을 누른 채널에 임시 패널이 떠.")
 
     @commands.command(name="음악")
@@ -2647,6 +3089,173 @@ class MusicCog(commands.Cog):
         st.temp_panel_channel_id = ctx.channel.id
         st.temp_panel_message_id = msg.id
 
+
+
+
+    # =========================
+    # Phase3: 점프/구간 명령어
+    # =========================
+
+    def _parse_time_to_sec(self, s: str) -> Optional[float]:
+        s = (s or '').strip()
+        if not s:
+            return None
+        # mm:ss
+        if re.match(r"^\d{1,3}:\d{1,2}$", s):
+            mm, ss = s.split(':', 1)
+            try:
+                return float(int(mm) * 60 + int(ss))
+            except Exception:
+                return None
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+    @commands.command(name="점프")
+    async def cmd_seek(self, ctx: commands.Context, t: str):
+        """!점프 <초|mm:ss>: 현재 곡을 해당 시점으로 이동"""
+        if ctx.guild is None:
+            return
+        st = self._state(ctx.guild.id)
+        vc = ctx.guild.voice_client
+        if vc is None or not vc.is_connected() or not (vc.is_playing() or vc.is_paused()):
+            await ctx.send("지금 재생 중이 아니야.")
+            return
+
+        sec = self._parse_time_to_sec(t)
+        if sec is None or sec < 0:
+            await ctx.send("사용법: `!점프 45` 또는 `!점프 1:23`")
+            return
+
+        if st.now_playing and getattr(st.now_playing, 'is_live', False):
+            await ctx.send("라이브 스트림은 점프가 안 돼…")
+            return
+
+        # 현재 곡을 맨 앞으로 다시 넣고 stop -> 다음 루프에서 seek 적용
+        cur = st.now_playing
+        if cur is None:
+            await ctx.send("지금 재생 중인 곡 정보를 못 찾았어…")
+            return
+
+        q = getattr(st.queue, '_queue', None)
+        if q is not None and hasattr(q, 'appendleft'):
+            q.appendleft(cur)
+        else:
+            # fallback: 재구성
+            items = []
+            try:
+                while not st.queue.empty():
+                    items.append(st.queue.get_nowait())
+            except Exception:
+                pass
+            try:
+                st.queue.put_nowait(cur)
+            except Exception:
+                pass
+            for it in items:
+                try:
+                    st.queue.put_nowait(it)
+                except Exception:
+                    pass
+
+        st.seek_next_sec = float(sec)
+        st._suppress_requeue_once = True
+        try:
+            vc.stop()
+        except Exception:
+            pass
+
+        await ctx.send(f"{int(sec)}초로 점프할게.")
+        self._start_player_if_needed(ctx.guild.id)
+        self._start_panel_tick(ctx.guild.id)
+
+    @commands.command(name="구간")
+    async def cmd_segment(self, ctx: commands.Context, start: str, end: str, mode: str = ""):
+        """!구간 <시작> <끝> [AB]: 현재 곡을 구간 재생(AB면 반복)"""
+        if ctx.guild is None:
+            return
+        st = self._state(ctx.guild.id)
+        vc = ctx.guild.voice_client
+        if vc is None or not vc.is_connected() or not (vc.is_playing() or vc.is_paused()):
+            await ctx.send("지금 재생 중이 아니야.")
+            return
+
+        if st.now_playing and getattr(st.now_playing, 'is_live', False):
+            await ctx.send("라이브 스트림은 구간 재생이 안 돼…")
+            return
+
+        s = self._parse_time_to_sec(start)
+        e = self._parse_time_to_sec(end)
+        if s is None or e is None:
+            await ctx.send("사용법: `!구간 30 90` 또는 `!구간 0:30 1:30 AB`")
+            return
+
+        if e <= s:
+            await ctx.send("끝 시간이 시작보다 커야 해.")
+            return
+
+        st.segment_start_sec = float(s)
+        st.segment_end_sec = float(e)
+        st.segment_ab_repeat = (mode or '').strip().upper() in {"AB", "A", "R", "REPEAT"}
+        st.seek_next_sec = float(s)
+
+        # 현재 곡을 맨 앞으로 다시 넣고 stop
+        cur = st.now_playing
+        if cur is not None:
+            q = getattr(st.queue, '_queue', None)
+            if q is not None and hasattr(q, 'appendleft'):
+                q.appendleft(cur)
+
+        st._suppress_requeue_once = True
+        try:
+            vc.stop()
+        except Exception:
+            pass
+
+        
+        def _fmt_time(x: float) -> str:
+            mm = int(x // 60)
+            ss = int(x % 60)
+            return f"{mm:02d}:{ss:02d}"
+
+        await ctx.send(f"구간 {_fmt_time(s)}~{_fmt_time(e)}" + (" (AB 반복)" if st.segment_ab_repeat else "") + "으로 재생할게.")
+        self._start_player_if_needed(ctx.guild.id)
+        self._start_panel_tick(ctx.guild.id)
+
+    @commands.command(name="구간해제")
+    async def cmd_segment_clear(self, ctx: commands.Context):
+        """!구간해제: 구간/AB 반복 해제"""
+        if ctx.guild is None:
+            return
+        st = self._state(ctx.guild.id)
+        vc = ctx.guild.voice_client
+
+        st.segment_start_sec = None
+        st.segment_end_sec = None
+        st.segment_ab_repeat = False
+
+        if vc and vc.is_connected() and (vc.is_playing() or vc.is_paused()):
+            # 현재 위치로 이어 재생(가능한 경우)
+            if st.now_playing and not getattr(st.now_playing, 'is_live', False):
+                pos = self._current_pos(st)
+                cur = st.now_playing
+                q = getattr(st.queue, '_queue', None)
+                if cur is not None and q is not None and hasattr(q, 'appendleft'):
+                    q.appendleft(cur)
+                st.seek_next_sec = float(pos)
+                st._suppress_requeue_once = True
+                try:
+                    vc.stop()
+                except Exception:
+                    pass
+                await ctx.send("구간 재생을 해제했어.")
+            else:
+                await ctx.send("구간 재생을 해제했어.")
+        else:
+            await ctx.send("구간 재생을 해제했어.")
+
+        self._start_panel_tick(ctx.guild.id)
 
 async def setup(bot: commands.Bot):
     cog = MusicCog(bot)
