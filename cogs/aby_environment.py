@@ -9,7 +9,7 @@ import discord
 from discord.ext import commands
 
 from yume_send import send_ctx
-from yume_store import get_world_state, set_world_weather
+from yume_store import ensure_world_weather_rotated, get_world_state, set_world_weather
 
 
 OWNER_ID = 1433962010785349634
@@ -65,7 +65,8 @@ class AbyEnvironmentCog(commands.Cog):
     async def weather_status(self, ctx: commands.Context) -> None:
         """현재 아비도스 가상 날씨를 보여줘요."""
         try:
-            state = get_world_state()
+            # Phase1: lazy rotation (no background task)
+            state = ensure_world_weather_rotated()
         except Exception:
             await send_ctx(ctx, "날씨 기록을 읽다가 모래가… 들어갔나 봐. 잠깐 뒤에 다시 해줄래?", allow_glitch=False)
             return

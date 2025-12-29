@@ -16,6 +16,7 @@ We keep this module intentionally tiny and boring:
 
 from __future__ import annotations
 
+import random
 import time
 from typing import Any, Dict, Optional
 
@@ -264,6 +265,56 @@ def set_world_weather(weather: str, *, changed_at: Optional[int] = None, next_ch
         """,
         (str(weather), changed, next_at, now),
     )
+
+
+def ensure_world_weather_rotated(*, now_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Return current world_state, rotating weather if it's past next_change_at.
+
+    Design:
+    - No background task required.
+    - Rotation is triggered lazily when features query the world state.
+
+    Weather weights (Phase1):
+    - clear: 55%
+    - cloudy: 30%
+    - sandstorm: 15%
+
+    Returns the (possibly updated) state dict.
+    """
+
+    state = get_world_state()
+    now = int(now_ts or time.time())
+
+    weather = str(state.get("weather") or "clear")
+    next_at = int(state.get("weather_next_change_at") or 0)
+    changed_at = int(state.get("weather_changed_at") or 0)
+
+    # If next_at is missing (older DB), initialize it.
+    if next_at <= 0:
+        next_at = now + 6 * 3600
+        set_world_weather(weather, changed_at=changed_at or now, next_change_at=next_at)
+        state = get_world_state()
+        return state
+
+    if now < next_at:
+        return state
+
+    # Roll a new weather. Avoid repeating sandstorm too often.
+    # (It can repeat, but keep it rare.)
+    def _roll(prev: str) -> str:
+        if prev == "sandstorm":
+            choices = ["clear", "cloudy", "sandstorm"]
+            weights = [0.65, 0.30, 0.05]
+        else:
+            choices = ["clear", "cloudy", "sandstorm"]
+            weights = [0.55, 0.30, 0.15]
+        return random.choices(choices, weights=weights, k=1)[0]
+
+    new_weather = _roll(weather)
+    # 4~6 hours
+    new_next = int(now + random.randint(4 * 3600, 6 * 3600))
+    set_world_weather(new_weather, changed_at=now, next_change_at=new_next)
+    return get_world_state()
 
 
 # =========================

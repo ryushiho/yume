@@ -4,7 +4,8 @@ import datetime
 import logging
 import random
 import re
-from typing import Optional, Tuple
+from decimal import Decimal, ROUND_CEILING
+from typing import Optional
 
 import discord
 from discord.ext import commands
@@ -14,6 +15,7 @@ from yume_send import send_ctx
 from yume_store import (
     apply_guild_interest_upto_today,
     claim_daily_explore,
+    ensure_world_weather_rotated,
     get_guild_debt,
     get_user_economy,
     repay_guild_debt,
@@ -22,6 +24,22 @@ from yume_store import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+WEATHER_LABEL = {
+    "clear": "맑음",
+    "cloudy": "흐림",
+    "sandstorm": "대형 모래폭풍",
+}
+
+
+def _apply_interest_once(debt: int, rate: float) -> int:
+    """Match yume_store._apply_interest_once rounding (ceil)."""
+
+    d = Decimal(int(debt))
+    r = Decimal(str(rate))
+    new_val = (d * (Decimal("1") + r)).to_integral_value(rounding=ROUND_CEILING)
+    return int(new_val) if new_val > 0 else 0
 
 
 def _now_kst() -> datetime.datetime:
@@ -104,6 +122,9 @@ class AbyMiniGameCog(commands.Cog):
             "- `!지갑` : 내 재화 확인\n"
             "- `!빚현황` : 우리 학교 빚/이자 확인\n"
             "- `!빚상환 <금액|전체>` : 내 크레딧으로 빚 상환\n\n"
+            "**환경(날씨)**\n"
+            "- `!날씨` : 아비도스 가상 날씨 확인\n"
+            "- 날씨에 따라 `!탐사` 성공률/보상이 조금 변해\n\n"
             "**스토리**\n"
             f"- 시작 빚: **{_fmt(ABY_DEFAULT_DEBT)} 크레딧**\n"
             f"- 일일 이자율: **{ABY_DEFAULT_INTEREST_RATE * 100:.2f}%** (매일 한 번 적용)\n\n"
@@ -142,17 +163,40 @@ class AbyMiniGameCog(commands.Cog):
         today = _today_ymd_kst()
         hon = get_honorific(ctx.author, ctx.guild)
 
-        # Reward balance (MVP)
-        # Success: 7~16k credits; Fail: 0~3k
-        success = random.random() < 0.72
-        if success:
-            credits = random.randint(7_000, 16_000)
-        else:
-            credits = random.randint(0, 3_000)
+        # Phase1: 아비도스 날씨(환경) 연동
+        # - 모래폭풍이면 성공률/보상이 살짝 깎이고, 물 드랍도 낮아짐.
+        # - 흐림은 거의 평시.
+        try:
+            ws = ensure_world_weather_rotated()
+            weather = str(ws.get("weather") or "clear")
+        except Exception:
+            weather = "clear"
 
-        water = 0
-        if random.random() < 0.06:
-            water = 1
+        label = WEATHER_LABEL.get(weather, weather)
+
+        if weather == "sandstorm":
+            success_p = 0.55
+            succ_rng = (4_000, 12_000)
+            fail_rng = (0, 2_000)
+            water_p = 0.02
+        elif weather == "cloudy":
+            success_p = 0.70
+            succ_rng = (6_000, 15_000)
+            fail_rng = (0, 3_000)
+            water_p = 0.06
+        else:
+            success_p = 0.72
+            succ_rng = (7_000, 16_000)
+            fail_rng = (0, 3_000)
+            water_p = 0.06
+
+        success = random.random() < success_p
+        if success:
+            credits = random.randint(*succ_rng)
+        else:
+            credits = random.randint(*fail_rng)
+
+        water = 1 if (random.random() < water_p) else 0
 
         result = claim_daily_explore(ctx.author.id, today, credits, water)
         if result is None:
@@ -167,22 +211,57 @@ class AbyMiniGameCog(commands.Cog):
         new_water = int(result.get("water", 0))
 
         # Flavor
-        if success:
-            flavor = random.choice(
-                [
-                    "모래 사이에서 반짝이는 걸 발견했어!",
-                    "오아시스…는 아니지만, 그 근처였던 것 같아…",
-                    "호시노 짱이랑 같이 걸었다고 상상하니까 힘이 나네…",
-                ]
-            )
+        if weather == "sandstorm":
+            if success:
+                flavor = random.choice(
+                    [
+                        "모래폭풍 속에서도… 뭔가 반짝이는 걸 주웠어! 으헤~",
+                        "시야가 거의 안 보였는데… 손에 잡히는 게 있더라…!",
+                        "입에 모래… 퉤퉤… 그래도 성과는 있었어.",
+                    ]
+                )
+            else:
+                flavor = random.choice(
+                    [
+                        "바람이 너무 세서… 거의 아무것도 못 챙겼어… 지지직…",
+                        "모래가 다 내 편지를… 아니 내 포스터를…!",
+                        "퇴각! 퇴각! 오늘은… 진짜 무리야…",
+                    ]
+                )
+        elif weather == "cloudy":
+            if success:
+                flavor = random.choice(
+                    [
+                        "하늘이 흐려도… 발밑은 반짝이네!",
+                        "기분은 좀 축축하지만, 수확은 괜찮아.",
+                        "구름 아래에서… 의외로 찾기 쉬웠어.",
+                    ]
+                )
+            else:
+                flavor = random.choice(
+                    [
+                        "흐린 날은… 길을 자꾸 헷갈려.",
+                        "오늘은 꽝… 다음엔 더 잘할 수 있어.",
+                        "발자국만 잔뜩 남겼다…",
+                    ]
+                )
         else:
-            flavor = random.choice(
-                [
-                    "바람이 너무 세서 거의 아무것도 못 챙겼어… 퉤퉤.",
-                    "발자국만 잔뜩 남겼다… 다음엔 더 잘할 수 있어.",
-                    "모래가… 입에… 들어왔어… 으아아…",
-                ]
-            )
+            if success:
+                flavor = random.choice(
+                    [
+                        "모래 사이에서 반짝이는 걸 발견했어!",
+                        "오아시스…는 아니지만, 그 근처였던 것 같아…",
+                        "호시노 짱이랑 같이 걸었다고 상상하니까 힘이 나네…",
+                    ]
+                )
+            else:
+                flavor = random.choice(
+                    [
+                        "바람이 너무 세서 거의 아무것도 못 챙겼어… 퉤퉤.",
+                        "발자국만 잔뜩 남겼다… 다음엔 더 잘할 수 있어.",
+                        "모래가… 입에… 들어왔어… 으아아…",
+                    ]
+                )
 
         gained = f"**+{_fmt(credits)} 크레딧**"
         if water > 0:
@@ -190,6 +269,7 @@ class AbyMiniGameCog(commands.Cog):
 
         txt = (
             f"{hon} 탐사 결과!\n"
+            f"날씨: `{label}`\n"
             f"{flavor}\n"
             f"획득: {gained}\n\n"
             f"현재 보유: 크레딧 **{_fmt(new_credits)}**, 물 **{_fmt(new_water)}**\n"
@@ -214,12 +294,16 @@ class AbyMiniGameCog(commands.Cog):
         rate = float(s.get("interest_rate", ABY_DEFAULT_INTEREST_RATE))
         last = str(s.get("last_interest_ymd", ""))
 
+        tomorrow_debt = _apply_interest_once(debt, rate)
+        tomorrow_interest = max(0, int(tomorrow_debt - debt))
+
         hon = get_honorific(ctx.author, ctx.guild)
         txt = (
             f"{hon}… 아비도스 재정 보고서 가져왔어.\n"
             f"- 현재 빚: **{_fmt(debt)} 크레딧**\n"
             f"- 일일 이자율: **{rate * 100:.2f}%**\n"
-            f"- 오늘 기준 적용일: `{last}`\n\n"
+            f"- 오늘 기준 적용일: `{last}`\n"
+            f"- 내일 예상 이자: **+{_fmt(tomorrow_interest)}** (예상 빚 **{_fmt(tomorrow_debt)}**)\n\n"
             "이 숫자… 계속 커져. 그래서 더… 다 같이 버티는 거야. 으헤~\n"
         )
         await send_ctx(ctx, txt, allow_glitch=True)
