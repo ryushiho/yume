@@ -16,6 +16,7 @@ v4: stamps opt-in + rewards/events logs
 v5: Abydos mini-game economy (debt/interest + exploration)
 v6: Abydos mini-game inventory/buffs (loot + simple one-buff system)
 v7: Abydos quest board + weekly points + explore meta
+v8: Abydos incidents + broadcast logs
 """
 
 from __future__ import annotations
@@ -108,7 +109,7 @@ def init_db() -> None:
 
     now = int(time.time())
 
-    SCHEMA_VERSION = 7
+    SCHEMA_VERSION = 8
 
     with transaction() as con:
         con.execute(
@@ -440,6 +441,39 @@ def init_db() -> None:
             con.execute(
                 "CREATE INDEX IF NOT EXISTS idx_aby_wp_week ON aby_weekly_points(guild_id, week_key, points);"
             )
+
+        # ===== v8 =====
+        if current_version < 8:
+            # Phase6-2 Phase7: 사건/조우(incident) + 주간 리포트용 로그
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS aby_incident_state (
+                  guild_id INTEGER PRIMARY KEY,
+                  next_incident_at INTEGER NOT NULL DEFAULT 0,
+                  last_incident_at INTEGER NOT NULL DEFAULT 0,
+                  updated_at INTEGER NOT NULL
+                );
+                """
+            )
+
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS aby_incident_log (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  guild_id INTEGER NOT NULL,
+                  kind TEXT NOT NULL,
+                  title TEXT NOT NULL,
+                  description TEXT NOT NULL,
+                  delta_debt INTEGER NOT NULL DEFAULT 0,
+                  created_at INTEGER NOT NULL
+                );
+                """
+            )
+
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_aby_incident_log_guild_time ON aby_incident_log(guild_id, created_at);"
+            )
+
         con.execute(
             """
             INSERT INTO schema_meta(key, value, updated_at)

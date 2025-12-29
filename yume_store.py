@@ -644,6 +644,9 @@ from decimal import Decimal, ROUND_CEILING
 import datetime
 
 
+KST = datetime.timezone(datetime.timedelta(hours=9))
+
+
 ABY_DEFAULT_DEBT = 900_000_000  # 9억 크레딧
 # NOTE: "0.35"는 0.35% (퍼센트) 의미로 사용한다. (즉, 0.0035)
 #       9억 * 0.35% = 3,150,000/day 수준이라, "갚기 어려운" 서사에 맞는다.
@@ -671,7 +674,7 @@ def _ymd_iter_exclusive(start_ymd: str, end_ymd: str):
 def ensure_user_economy(user_id: int) -> None:
     uid = int(user_id)
     now = now_ts()
-    with get_con() as con:
+    with transaction() as con:
         con.execute(
             """
             INSERT INTO aby_user_economy(user_id, credits, water, last_explore_ymd, created_at, updated_at)
@@ -721,7 +724,7 @@ def claim_daily_explore(user_id: int, date_ymd: str, delta_credits: int, delta_w
     ensure_user_economy(uid)
     now = now_ts()
 
-    with get_con() as con:
+    with transaction() as con:
         row = con.execute(
             "SELECT credits, water, last_explore_ymd FROM aby_user_economy WHERE user_id=?;",
             (uid,),
@@ -788,7 +791,7 @@ def add_user_item(user_id: int, item_key: str, qty: int = 1) -> None:
         return
 
     now = now_ts()
-    with get_con() as con:
+    with transaction() as con:
         con.execute(
             """
             INSERT INTO aby_inventory(user_id, item_key, qty, updated_at)
@@ -811,7 +814,7 @@ def consume_user_item(user_id: int, item_key: str, qty: int = 1) -> bool:
         return False
 
     now = now_ts()
-    with get_con() as con:
+    with transaction() as con:
         row = con.execute(
             "SELECT qty FROM aby_inventory WHERE user_id=? AND item_key=?;",
             (uid, key),
@@ -873,7 +876,7 @@ def craft_user_items(
 
     now = now_ts()
 
-    with get_con() as con:
+    with transaction() as con:
         u = con.execute("SELECT credits FROM aby_user_economy WHERE user_id=?;", (uid,)).fetchone()
         credits = int(u[0]) if u else 0
         if credits < cost:
@@ -958,7 +961,7 @@ def sell_user_item(
     ensure_user_economy(uid)
     now = now_ts()
 
-    with get_con() as con:
+    with transaction() as con:
         row = con.execute(
             "SELECT qty FROM aby_inventory WHERE user_id=? AND item_key=?;",
             (uid, key),
@@ -1082,7 +1085,7 @@ def ensure_guild_debt(guild_id: int, *, initial_debt: int = ABY_DEFAULT_DEBT, in
         # Use UTC date as a fallback; callers should pass KST date.
         today_ymd = datetime.date.today().isoformat()
 
-    with get_con() as con:
+    with transaction() as con:
         con.execute(
             """
             INSERT INTO aby_guild_debt(guild_id, debt, interest_rate, last_interest_ymd, created_at, updated_at)
@@ -1112,7 +1115,7 @@ def apply_guild_interest_upto_today(guild_id: int, today_ymd: str) -> Dict[str, 
     gid = int(guild_id)
     ensure_guild_debt(gid, today_ymd=today_ymd)
 
-    with get_con() as con:
+    with transaction() as con:
         row = con.execute(
             "SELECT debt, interest_rate, last_interest_ymd FROM aby_guild_debt WHERE guild_id=?;",
             (gid,),
@@ -1225,7 +1228,7 @@ def repay_guild_debt(guild_id: int, user_id: int, amount: int, today_ymd: str) -
     ensure_user_economy(uid)
 
     now = now_ts()
-    with get_con() as con:
+    with transaction() as con:
         u = con.execute(
             "SELECT credits FROM aby_user_economy WHERE user_id=?;",
             (uid,),
@@ -1706,7 +1709,7 @@ def _insert_quests(guild_id: int, scope: str, board_key: str, quests: list[dict]
     bk = str(board_key)
     now = now_ts()
 
-    with get_con() as con:
+    with transaction() as con:
         for q in quests:
             con.execute(
                 """
@@ -1843,7 +1846,7 @@ def add_user_weekly_points(guild_id: int, week_key: str, user_id: int, delta: in
     if d == 0:
         return
     now = now_ts()
-    with get_con() as con:
+    with transaction() as con:
         con.execute(
             """
             INSERT INTO aby_weekly_points(guild_id, week_key, user_id, points, updated_at)
@@ -2010,7 +2013,7 @@ def claim_aby_quest(
     week_key = bk if sc == "weekly" else week_key_from_ymd(str(today_ymd))
     now = now_ts()
 
-    with get_con() as con:
+    with transaction() as con:
         # claim check (re-check)
         row = con.execute(
             """
@@ -2103,3 +2106,249 @@ def claim_aby_quest(
         "reward_item_qty": reward_item_qty,
         "week_key": week_key,
     }
+
+
+# ------------------------------
+# Phase6-2 Phase7: Incidents + Weekly report helpers
+# ------------------------------
+
+
+def ensure_aby_incident_state(guild_id: int, *, now_override: Optional[int] = None) -> Dict[str, Any]:
+    """Ensure a guild incident scheduler row exists.
+
+    next_incident_at is randomized on first creation or when missing.
+    """
+
+    gid = int(guild_id)
+    now = int(now_override) if now_override is not None else now_ts()
+    # default: 2~6 hours
+    default_next = now + random.randint(2 * 3600, 6 * 3600)
+
+    row = fetchone(
+        "SELECT guild_id, next_incident_at, last_incident_at, updated_at FROM aby_incident_state WHERE guild_id=?;",
+        (gid,),
+    )
+    if row:
+        nxt = int(row.get("next_incident_at") or 0)
+        if nxt <= 0:
+            execute(
+                "UPDATE aby_incident_state SET next_incident_at=?, updated_at=? WHERE guild_id=?;",
+                (default_next, now, gid),
+            )
+            row["next_incident_at"] = default_next
+            row["updated_at"] = now
+        return row
+
+    execute(
+        """
+        INSERT INTO aby_incident_state(guild_id, next_incident_at, last_incident_at, updated_at)
+        VALUES(?, ?, 0, ?)
+        ON CONFLICT(guild_id) DO NOTHING;
+        """,
+        (gid, default_next, now),
+    )
+    return {
+        "guild_id": gid,
+        "next_incident_at": default_next,
+        "last_incident_at": 0,
+        "updated_at": now,
+    }
+
+
+def set_aby_next_incident_at(guild_id: int, next_incident_at: int, *, now_override: Optional[int] = None) -> None:
+    gid = int(guild_id)
+    now = int(now_override) if now_override is not None else now_ts()
+    execute(
+        """
+        INSERT INTO aby_incident_state(guild_id, next_incident_at, last_incident_at, updated_at)
+        VALUES(?, ?, 0, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET next_incident_at=excluded.next_incident_at, updated_at=excluded.updated_at;
+        """,
+        (gid, int(next_incident_at), now),
+    )
+
+
+
+def update_aby_incident_state(
+    guild_id: int,
+    *,
+    next_incident_at: int,
+    last_incident_at: Optional[int] = None,
+    now_override: Optional[int] = None,
+) -> None:
+    """Update incident scheduler state for a guild."""
+
+    gid = int(guild_id)
+    now = int(now_override) if now_override is not None else now_ts()
+    last = int(last_incident_at) if last_incident_at is not None else 0
+    execute(
+        """
+        INSERT INTO aby_incident_state(guild_id, next_incident_at, last_incident_at, updated_at)
+        VALUES(?, ?, ?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET
+          next_incident_at=excluded.next_incident_at,
+          last_incident_at=excluded.last_incident_at,
+          updated_at=excluded.updated_at;
+        """,
+        (gid, int(next_incident_at), last, now),
+    )
+
+def add_aby_incident_log(guild_id: int, *, kind: str, title: str, description: str, delta_debt: int) -> None:
+    gid = int(guild_id)
+    k = str(kind or "incident")[:40]
+    t = str(title or "")[:120]
+    d = str(description or "")[:500]
+    dd = int(delta_debt)
+    now = now_ts()
+    execute(
+        """
+        INSERT INTO aby_incident_log(guild_id, kind, title, description, delta_debt, created_at)
+        VALUES(?, ?, ?, ?, ?, ?);
+        """,
+        (gid, k, t, d, dd, now),
+    )
+
+
+def list_recent_aby_incidents(guild_id: int, limit: int = 10) -> list[Dict[str, Any]]:
+    lim = int(limit)
+    if lim <= 0:
+        lim = 10
+    if lim > 50:
+        lim = 50
+    rows = fetchall(
+        """
+        SELECT id, guild_id, kind, title, description, delta_debt, created_at
+        FROM aby_incident_log
+        WHERE guild_id=?
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?;
+        """,
+        (int(guild_id), lim),
+    )
+    return rows or []
+
+
+def apply_guild_incident(
+    guild_id: int,
+    *,
+    title: str,
+    description: str,
+    delta_debt: int,
+    today_ymd: str,
+) -> Dict[str, Any]:
+    """Apply an incident effect to guild debt and log it.
+
+    - Updates aby_guild_debt.debt (clamped at >=0)
+    - Inserts into aby_economy_log(kind='incident', delta_debt, memo=today_ymd)
+    - Inserts into aby_incident_log
+    """
+
+    gid = int(guild_id)
+    dd = int(delta_debt)
+    ymd = str(today_ymd)
+    now = now_ts()
+
+    ensure_guild_debt(gid, today_ymd=ymd)
+
+    with transaction() as con:
+        row = con.execute(
+            "SELECT debt FROM aby_guild_debt WHERE guild_id=?;",
+            (gid,),
+        ).fetchone()
+        debt = int(row[0]) if row else ABY_DEFAULT_DEBT
+        new_debt = max(0, debt + dd)
+
+        con.execute(
+            "UPDATE aby_guild_debt SET debt=?, updated_at=? WHERE guild_id=?;",
+            (new_debt, now, gid),
+        )
+
+        con.execute(
+            """
+            INSERT INTO aby_economy_log(guild_id, user_id, kind, delta_credits, delta_water, delta_debt, memo, created_at)
+            VALUES(?, NULL, 'incident', 0, 0, ?, ?, ?);
+            """,
+            (gid, dd, ymd, now),
+        )
+
+    add_aby_incident_log(gid, kind="incident", title=title, description=description, delta_debt=dd)
+
+    return {"ok": True, "old_debt": debt, "new_debt": new_debt, "delta_debt": dd}
+
+
+def _sum_debt_delta_for_ymds(guild_id: int, ymds: list[str], kind: str) -> int:
+    gid = int(guild_id)
+    days = [str(x) for x in (ymds or []) if str(x)]
+    if not days:
+        return 0
+    ph = ",".join(["?"] * len(days))
+    row = fetchone(
+        f"""
+        SELECT COALESCE(SUM(delta_debt), 0) AS total
+        FROM aby_economy_log
+        WHERE guild_id=? AND kind=? AND memo IN ({ph});
+        """,
+        (gid, str(kind), *days),
+    )
+    return int((row or {}).get("total") or 0)
+
+
+def _sum_repay_credits_for_ymds(guild_id: int, ymds: list[str]) -> int:
+    gid = int(guild_id)
+    days = [str(x) for x in (ymds or []) if str(x)]
+    if not days:
+        return 0
+    ph = ",".join(["?"] * len(days))
+    row = fetchone(
+        f"""
+        SELECT COALESCE(SUM(-delta_credits), 0) AS total
+        FROM aby_economy_log
+        WHERE guild_id=? AND kind='repay' AND memo IN ({ph});
+        """,
+        (gid, *days),
+    )
+    return int((row or {}).get("total") or 0)
+
+
+def top_repay_users_for_week(guild_id: int, week_key: str, limit: int = 5) -> list[Dict[str, Any]]:
+    gid = int(guild_id)
+    ymds = week_ymds_from_week_key(str(week_key))
+    if not ymds:
+        return []
+    lim = int(limit)
+    if lim <= 0:
+        lim = 5
+    if lim > 20:
+        lim = 20
+    ph = ",".join(["?"] * len(ymds))
+    rows = fetchall(
+        f"""
+        SELECT user_id, COALESCE(SUM(-delta_credits), 0) AS total
+        FROM aby_economy_log
+        WHERE guild_id=? AND kind='repay' AND memo IN ({ph}) AND user_id IS NOT NULL
+        GROUP BY user_id
+        ORDER BY total DESC
+        LIMIT ?;
+        """,
+        (gid, *ymds, lim),
+    )
+    return rows or []
+
+
+def get_weekly_debt_summary(guild_id: int, week_key: str) -> Dict[str, Any]:
+    ymds = week_ymds_from_week_key(str(week_key))
+    interest = _sum_debt_delta_for_ymds(guild_id, ymds, "interest")
+    incidents = _sum_debt_delta_for_ymds(guild_id, ymds, "incident")
+    repays = _sum_debt_delta_for_ymds(guild_id, ymds, "repay")  # negative
+    repaid_credits = _sum_repay_credits_for_ymds(guild_id, ymds)
+
+    return {
+        "week_key": str(week_key),
+        "ymds": ymds,
+        "interest_delta": int(interest),
+        "incident_delta": int(incidents),
+        "repay_delta": int(repays),
+        "net_delta": int(interest + incidents + repays),
+        "repaid_credits": int(repaid_credits),
+    }
+
