@@ -86,6 +86,156 @@ def _pick_entry(info: dict) -> dict:
     return info
 
 
+
+# =========================
+# Phase2: ytsearch 후보 채점 선택
+# =========================
+
+_WORD_RE = re.compile(r"[^0-9a-zA-Z가-힣\s]+")
+
+def _norm_for_match(s: str) -> str:
+    s = (s or "").lower()
+    # 구분자/괄호류는 공백으로
+    s = s.replace("—", " ").replace("–", " ").replace("-", " ").replace("|", " ")
+    s = re.sub(r"[\[\]\(\)\{\}<>]", " ", s)
+    s = _WORD_RE.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _tokens(s: str) -> List[str]:
+    s = _norm_for_match(s)
+    toks = [t for t in s.split() if len(t) >= 2]
+    # 중복 제거(순서 유지)
+    seen = set()
+    out = []
+    for t in toks:
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+def _wanted_meta(track: "_Track", query_text: Optional[str]) -> Tuple[str, str]:
+    """후보 선택에 쓸 (want_title, want_artist)를 만든다."""
+    want_title = (track.meta_track or "").strip()
+    want_artist = (track.meta_artist or "").strip()
+
+    if not want_title:
+        gt, ga = _guess_artist_title(track.title or "")
+        want_title = (gt or "").strip()
+        if not want_artist:
+            want_artist = (ga or "").strip()
+
+    if not want_title and query_text:
+        want_title = str(query_text).strip()
+
+    return (want_title, want_artist)
+
+def _score_yt_candidate(entry: dict, want_title: str, want_artist: str) -> float:
+    title = str(entry.get("title") or "")
+    uploader = str(entry.get("uploader") or entry.get("channel") or entry.get("uploader_id") or "")
+    t = _norm_for_match(title)
+    u = _norm_for_match(uploader)
+    full = f"{t} {u}".strip()
+
+    score = 0.0
+
+    # 라이브/스트림은 웬만하면 제외
+    try:
+        if entry.get("is_live") or str(entry.get("live_status") or "").lower() in {"is_live", "live"}:
+            score -= 120.0
+    except Exception:
+        pass
+
+    # 제목/아티스트 매칭 가점
+    if want_title:
+        wt = _norm_for_match(want_title)
+        if wt and wt in t:
+            score += 30.0
+        for tok in _tokens(wt):
+            score += 6.0 if tok in t else -2.0
+
+    if want_artist:
+        wa = _norm_for_match(want_artist)
+        if wa and wa in full:
+            score += 20.0
+        for tok in _tokens(wa):
+            score += 4.0 if tok in full else -1.0
+
+    # 좋은 신호
+    if "topic" in u:
+        score += 10.0
+    if "official" in u or "official" in t:
+        score += 4.0
+    if "official audio" in t:
+        score += 8.0
+
+    # 나쁜 신호(강한 페널티)
+    bad_kw = [
+        "cover", "karaoke", "instrumental", "inst", "remix", "nightcore",
+        "8d", "sped up", "slowed", "teaser", "shorts", "fanmade", "edit",
+        "reaction", "compilation", "mix",
+    ]
+    for kw in bad_kw:
+        if kw in t:
+            score -= 18.0
+
+    # 컴필/모음집 류는 큰 페널티(지금처럼 'Greatest Hits' 문제 방지)
+    comp_kw = ["greatest hits", "best of", "the best", "hits", "collection"]
+    for kw in comp_kw:
+        if kw in t:
+            score -= 25.0
+
+    # lyric video는 완전 배제까진 하지 않되, 살짝만 감점
+    if ("lyric" in t) or ("lyrics" in t) or ("가사" in t) or ("자막" in t):
+        score -= 3.0
+
+    # 길이 sanity check(너무 짧거나 너무 길면 감점)
+    try:
+        dur = entry.get("duration")
+        if isinstance(dur, (int, float)):
+            d = int(dur)
+            if d < 60 or d > 900:
+                score -= 10.0
+    except Exception:
+        pass
+
+    return score
+
+def _pick_best_ytsearch_entry(entries: List[dict], track: "_Track", query_text: Optional[str]) -> dict:
+    clean = [e for e in (entries or []) if e]
+    if not clean:
+        return {}
+
+    want_title, want_artist = _wanted_meta(track, query_text)
+
+    scored: List[Tuple[float, dict]] = []
+    for e in clean:
+        try:
+            s = _score_yt_candidate(e, want_title, want_artist)
+        except Exception:
+            s = -9999.0
+        scored.append((s, e))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_score, best = scored[0]
+
+    if logger.isEnabledFor(logging.DEBUG):
+        try:
+            top = scored[:3]
+            dbg = ", ".join([f"{sc:.1f}:{str(en.get('title') or '')[:40]}" for sc, en in top])
+            logger.debug("[Music][Phase2] ytsearch pick=%.1f want=(%s/%s) top=%s", best_score, want_title, want_artist, dbg)
+        except Exception:
+            pass
+
+    # 점수가 너무 낮으면(모두 엉망) 첫 번째 fallback
+    if best_score < -50.0:
+        for e in clean:
+            if e:
+                return e
+    return best
+
+
 def _select_best_audio_url(entry: dict) -> Optional[str]:
     """
     yt_dlp 결과(entry)에서 ffmpeg가 재생 가능한 bestaudio URL을 고른다.
@@ -250,6 +400,109 @@ def _guess_artist_title(raw_title: str) -> Tuple[str, Optional[str]]:
             return (_clean_title(left), _clean_title(right) or None)
     return (t, None)
 
+
+
+def _normalize_lyric_term(s: str) -> str:
+    """LRCLIB 질의용 문자열 정규화(트랙/아티스트 공용)."""
+    s = _clean_title(s or "")
+    if not s:
+        return ""
+    # 따옴표/장식 제거
+    s = re.sub(r"[\"\'’`]", "", s).strip()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _split_bracket_variants(s: str) -> List[str]:
+    """괄호/대괄호에 들어있는 별칭까지 포함해서 여러 후보를 만든다.
+
+    예) '비밀정원 (Secret Garden)' -> ['비밀정원 (Secret Garden)', '비밀정원', 'Secret Garden']
+    예) '오마이걸 (OH MY GIRL)' -> ['오마이걸 (OH MY GIRL)', '오마이걸', 'OH MY GIRL']
+    """
+    s = (s or "").strip()
+    if not s:
+        return []
+    out: List[str] = []
+    def _add(x: str):
+        x = _normalize_lyric_term(x)
+        if x and x not in out:
+            out.append(x)
+
+    _add(s)
+
+    # () 안/밖 분리
+    base = re.sub(r"\([^)]*\)", "", s).strip()
+    if base:
+        _add(base)
+    for inner in re.findall(r"\(([^)]{1,80})\)", s):
+        _add(inner)
+
+    # [] 안/밖 분리
+    base2 = re.sub(r"\[[^\]]*\]", "", s).strip()
+    if base2:
+        _add(base2)
+    for inner in re.findall(r"\[([^\]]{1,80})\]", s):
+        _add(inner)
+
+    return out
+
+def _build_lrclib_candidates(track: "_Track") -> List[Tuple[str, Optional[str]]]:
+    """LRCLIB 검색 후보(track_name, artist_name) 목록을 '우선순위' 순으로 만든다."""
+    cands: List[Tuple[str, Optional[str]]] = []
+
+    # 1) Spotify 메타가 있으면 최우선
+    meta_t = _normalize_lyric_term(getattr(track, "meta_track", "") or "")
+    meta_a = _normalize_lyric_term(getattr(track, "meta_artist", "") or "") or _normalize_lyric_term(getattr(track, "artist", "") or "")
+
+    # 2) YouTube/표시 제목에서 추정
+    base_t, base_a = _guess_artist_title(track.title or "")
+    base_t = _normalize_lyric_term(base_t)
+    base_a = _normalize_lyric_term(base_a or "")
+
+    # 후보 문자열 리스트(우선순위 유지)
+    track_terms: List[str] = []
+    artist_terms: List[str] = []
+
+    def _push_term(lst: List[str], term: str):
+        term = _normalize_lyric_term(term)
+        if term and term not in lst:
+            lst.append(term)
+
+    for t in _split_bracket_variants(meta_t) + _split_bracket_variants(base_t):
+        _push_term(track_terms, t)
+    for a in _split_bracket_variants(meta_a) + _split_bracket_variants(base_a):
+        _push_term(artist_terms, a)
+
+    # (track, artist) 조합 생성 (폭발 방지: 상위 몇 개만)
+    track_terms = track_terms[:4]
+    artist_terms = artist_terms[:3]
+
+    def _add_pair(t: str, a: Optional[str]):
+        t = _normalize_lyric_term(t)
+        a2 = _normalize_lyric_term(a or "") if a else ""
+        if not t:
+            return
+        key = (t.lower(), a2.lower() if a2 else "")
+        for (et, ea) in cands:
+            if (et.lower(), (ea or "").lower()) == key:
+                return
+        cands.append((t, a2 or None))
+
+    # 우선: 아티스트 포함
+    for t in track_terms:
+        for a in artist_terms:
+            _add_pair(t, a)
+
+    # 다음: track만으로도 시도
+    for t in track_terms:
+        _add_pair(t, None)
+
+    # 마지막 보험: 원본 제목을 한 번 더(정규화)로
+    raw_t = _normalize_lyric_term(track.title or "")
+    if raw_t:
+        _add_pair(raw_t, None)
+
+    return cands[:10]
+
 def _parse_lrc(lrc_text: str) -> List[Tuple[float, str]]:
     """
     LRC 텍스트 -> [(sec, line), ...] 로 파싱.
@@ -376,6 +629,7 @@ class MusicState:
         self.lyrics_channel_id: Optional[int] = None
         self.lyrics_message_id: Optional[int] = None
         self.lyrics_cache: Dict[str, List[Tuple[float, str]]] = {}
+        self.lyrics_miss_until: Dict[str, float] = {}  # key -> epoch seconds (짧은 재시도 방지)
         self._lyrics_last_track_key: Optional[str] = None
         self._lyrics_last_render_key: Optional[str] = None
 
@@ -1526,8 +1780,27 @@ class MusicCog(commands.Cog):
             return track._resolved_stream_url
 
         try:
-            info = await _extract_info(track.webpage_url)
-            entry = _pick_entry(info)
+            src = track.webpage_url
+            entry: dict = {}
+            info: Optional[dict] = None
+
+            # Phase2: ytsearch 후보를 채점해서 가장 그럴듯한 영상을 고른다.
+            # - Spotify 트랙은 (아티스트 + 곡명) 기반으로 ytsearch1:... 로 큐에 들어오므로,
+            #   여기서 ytsearch10으로 확장 후 후보를 스코어링해서 선택한다.
+            if isinstance(src, str) and (src.startswith("ytsearch") or not re.match(r"^https?://", src)):
+                m = re.match(r"^ytsearch\d*:(.*)$", src)
+                qtxt = (m.group(1).strip() if m else src.strip())
+                search_q = f"ytsearch10:{qtxt}" if qtxt else src
+
+                info = await _extract_info(search_q)
+                if isinstance(info, dict) and isinstance(info.get("entries"), list):
+                    entry = _pick_best_ytsearch_entry(info.get("entries") or [], track, qtxt)
+                else:
+                    entry = _pick_entry(info or {})
+            else:
+                info = await _extract_info(src)
+                entry = _pick_entry(info)
+
             if not entry:
                 return None
 
@@ -2936,31 +3209,77 @@ class MusicCog(commands.Cog):
                 st.lyrics_channel_id = cid
 
 
-    async def _fetch_lrclib(self, track_name: str, artist_name: Optional[str]) -> Optional[str]:
-        params = {"track_name": track_name}
-        if artist_name:
-            params["artist_name"] = artist_name
-
-        timeout = aiohttp.ClientTimeout(total=8)
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(LRCLIB_API_BASE, params=params) as resp:
-                    if resp.status != 200:
-                        return None
-                    data = await resp.json()
-        except Exception:
-            return None
-
-        plain = data.get("plainLyrics") or data.get("plain_lyrics") or data.get("plainlyrics")
-        if isinstance(plain, str) and plain.strip():
-            return plain.strip()
-
-        lrc = data.get("syncedLyrics") or data.get("synced_lyrics") or data.get("syncedlyrics")
-        if isinstance(lrc, str) and lrc.strip():
-            # syncedLyrics만 있을 때는 타임코드를 제거해서 순수 가사로 변환
-            return _strip_lrc_to_plain(lrc)
-
+async def _fetch_lrclib_once(
+    self,
+    session: aiohttp.ClientSession,
+    track_name: str,
+    artist_name: Optional[str],
+) -> Optional[str]:
+    track_name = _normalize_lyric_term(track_name)
+    artist_name = _normalize_lyric_term(artist_name or "") or None
+    if not track_name:
         return None
+
+    params = {"track_name": track_name}
+    if artist_name:
+        params["artist_name"] = artist_name
+
+    try:
+        async with session.get(LRCLIB_API_BASE, params=params) as resp:
+            if resp.status != 200:
+                return None
+            # 일부 환경에서 content-type이 애매하게 오는 경우가 있어 안전하게 처리
+            data = await resp.json(content_type=None)
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    plain = data.get("plainLyrics") or data.get("plain_lyrics") or data.get("plainlyrics")
+    if isinstance(plain, str) and plain.strip():
+        return plain.strip()
+
+    lrc = data.get("syncedLyrics") or data.get("synced_lyrics") or data.get("syncedlyrics")
+    if isinstance(lrc, str) and lrc.strip():
+        # syncedLyrics만 있을 때는 타임코드를 제거해서 순수 가사로 변환
+        return _strip_lrc_to_plain(lrc)
+
+    return None
+
+async def _fetch_lrclib_multi(self, candidates: List[Tuple[str, Optional[str]]]) -> Optional[str]:
+    """LRCLIB를 여러 후보로 순차 시도해서 성공 확률을 올린다."""
+    # 후보 정리(중복 제거 + 길이 제한)
+    uniq: List[Tuple[str, Optional[str]]] = []
+    seen: set[tuple[str, str]] = set()
+    for tn, ar in (candidates or []):
+        tn2 = _normalize_lyric_term(tn)
+        ar2 = _normalize_lyric_term(ar or "") if ar else ""
+        if not tn2:
+            continue
+        key = (tn2.lower(), ar2.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append((tn2, ar2 or None))
+    uniq = uniq[:10]
+    if not uniq:
+        return None
+
+    timeout = aiohttp.ClientTimeout(total=10)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for tn, ar in uniq:
+                hit = await self._fetch_lrclib_once(session, tn, ar)
+                if hit and hit.strip():
+                    return hit.strip()
+    except Exception:
+        return None
+    return None
+
+async def _fetch_lrclib(self, track_name: str, artist_name: Optional[str]) -> Optional[str]:
+    """(호환용) 단일 후보로 LRCLIB 조회."""
+    return await self._fetch_lrclib_multi([(track_name, artist_name)])
 
     def _build_lyrics_embed(
         self,
@@ -3066,14 +3385,21 @@ class MusicCog(commands.Cog):
                 if key in st.lyrics_cache:
                     lines_lrc = st.lyrics_cache[key]
                 else:
-                    tn, ar = _guess_artist_title(track.title)
-                    # Phase1: Spotify 메타 우선
-                    tn = (getattr(track, "meta_track", None) or tn).strip()
-                    ar = (getattr(track, "meta_artist", None) or ar or getattr(track, 'artist', None))
-                    lrc = await self._fetch_lrclib(tn, ar)
 
-                    lines_lrc = _parse_plain_lyrics(lrc or "")
-                    st.lyrics_cache[key] = lines_lrc
+                    now_ts = time.time()
+                    miss_until = st.lyrics_miss_until.get(key, 0.0)
+                    if now_ts < miss_until:
+                        lines_lrc = []
+                    else:
+                        candidates = _build_lrclib_candidates(track)
+                        lrc = await self._fetch_lrclib_multi(candidates)
+                        lines_lrc = _parse_plain_lyrics(lrc or "")
+                        if lines_lrc:
+                            st.lyrics_cache[key] = lines_lrc
+                            st.lyrics_miss_until.pop(key, None)
+                        else:
+                            # 너무 자주 API를 두드리지 않게 짧은 TTL을 둔다.
+                            st.lyrics_miss_until[key] = now_ts + 60.0
 
             embed = self._build_lyrics_embed(guild, track, lines_lrc, pos)
             try:
