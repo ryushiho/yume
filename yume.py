@@ -112,7 +112,6 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.guilds = True
-intents.voice_states = True
 intents.reactions = True
 
 bot = commands.Bot(
@@ -130,9 +129,7 @@ EXTENSIONS = [
     "cogs.rule_maker",
     "cogs.survival_cooking",
     "cogs.stamps",
-    "cogs.blue_war",
-    "cogs.music",
-    "cogs.yume_diary",
+"cogs.yume_diary",
     "cogs.yume_chat",
     "cogs.social",
 ]
