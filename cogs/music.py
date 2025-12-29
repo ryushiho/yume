@@ -58,6 +58,10 @@ class _Track:
     duration_sec: Optional[int] = None
     is_live: bool = False
 
+
+    # Phase1: Spotify 등 외부 소스 메타(가사 검색/표시 정확도)
+    meta_track: Optional[str] = None
+    meta_artist: Optional[str] = None
     _resolved_stream_url: Optional[str] = None
     _resolved_at: float = 0.0
 
@@ -1371,36 +1375,108 @@ class MusicCog(commands.Cog):
         except Exception:
             return None
 
-    async def _spotify_track_query(self, session: aiohttp.ClientSession, track_id: str, fallback_url: str) -> str:
+    
+    async def _spotify_track_meta(
+        self,
+        session: aiohttp.ClientSession,
+        track_id: str,
+        fallback_url: str,
+    ) -> Tuple[str, Optional[str], Optional[str], str]:
+        """Spotify 트랙 URL/ID를 (검색쿼리, track_name, artist_name, display_title)로 변환한다.
+
+        Phase1 목표:
+        - Spotify URL 자체로 ytsearch 하지 않는다(엉뚱한 결과가 잘 뜸).
+        - 가능한 한 '아티스트 + 곡명' 형태의 검색 키워드를 만들어 유튜브에서 더 정확히 찾는다.
+        - 가사 검색에도 쓸 수 있게 (track_name, artist_name) 힌트를 함께 반환한다.
+
+        우선순위:
+        1) Spotify Web API (CLIENT_ID/SECRET 있을 때)
+        2) Spotify oEmbed (키 없이 가능)
+        3) Spotify 트랙 페이지 HTML의 og:title 파싱(best-effort)
         """
-        트랙을 (곡명 + 아티스트) 검색어로 변환.
-        API가 있으면 API 우선, 없으면 oEmbed로 best-effort.
-        """
+
+        def _norm_sep(t: str) -> str:
+            return (t or "").replace("—", "-").replace("–", "-").replace("·", "-").strip()
+
+        def _split_title_author(title: str, author: str) -> Tuple[Optional[str], Optional[str]]:
+            title = _norm_sep(title)
+            author = (author or "").strip()
+            if not title:
+                return (None, None)
+
+            # 흔한 포맷: "Track - Artist"
+            if " - " in title:
+                left, right = [x.strip() for x in title.split(" - ", 1)]
+                # author가 한쪽에 포함되면 그쪽을 artist로 본다.
+                if author:
+                    if author.lower() in left.lower() and author.lower() not in right.lower():
+                        return (right or None, author)
+                    if author.lower() in right.lower() and author.lower() not in left.lower():
+                        return (left or None, author)
+                # 애매하면 기본을 Track(left) / Artist(right)로 둔다.
+                return (left or None, right or None)
+
+            # 구분자가 없으면 title=track, author=artist로 본다.
+            return (title or None, author or None)
+
+        # 1) Spotify Web API (있으면 가장 정확)
         if self._spotify_enabled():
             js = await self._spotify_api_get(session, f"https://api.spotify.com/v1/tracks/{track_id}")
             if js:
                 name = str(js.get("name") or "").strip()
                 artists = js.get("artists") or []
                 artist = str(artists[0].get("name") or "").strip() if artists else ""
-                q = f"{name} {artist}".strip()
-                return q or fallback_url
+                track_name = name or None
+                artist_name = artist or None
+                display = f"{name} - {artist}".strip(" -") if (name or artist) else fallback_url
+                # 유튜브 검색은 '아티스트 곡명' 순서가 더 잘 맞는 편
+                query = f"{artist} {name}".strip() if (name or artist) else fallback_url
+                return (query or fallback_url, track_name, artist_name, display)
 
+        # 2) oEmbed (키 없이 가능)
         oembed = f"https://open.spotify.com/oembed?url={quote(fallback_url, safe='')}"
         try:
             async with session.get(oembed, headers={"User-Agent": "YumeBot"}) as r:
-                if r.status != 200:
-                    return fallback_url
-                data = await r.json()
+                if r.status == 200:
+                    data = await r.json()
+                else:
+                    data = None
         except Exception:
-            return fallback_url
+            data = None
 
-        title = str(data.get("title") or "").strip()
-        author = str(data.get("author_name") or "").strip()
-        if not title:
-            return fallback_url
-        if author and author.lower() not in title.lower():
-            return f"{title} {author}"
-        return title
+        if isinstance(data, dict):
+            title = str(data.get("title") or "").strip()
+            author = str(data.get("author_name") or "").strip()
+            track_name, artist_name = _split_title_author(title, author)
+            if track_name or artist_name:
+                display = f"{track_name or title} - {artist_name or author}".strip(" -")
+                query = f"{artist_name or author} {track_name or title}".strip()
+                return (query or fallback_url, track_name, artist_name, display or fallback_url)
+
+        # 3) HTML og:title 파싱(best-effort)
+        try:
+            async with session.get(fallback_url, headers={"User-Agent": "YumeBot", "Accept": "text/html"}) as r:
+                if r.status == 200:
+                    html = await r.text()
+                else:
+                    html = ""
+        except Exception:
+            html = ""
+
+        if html:
+            # <meta property="og:title" content="Secret Garden - song by OH MY GIRL | Spotify">
+            mt = re.search(r'property="og:title"\s+content="([^"]+)"', html)
+            if mt:
+                og = (mt.group(1) or "").strip()
+                og = og.split("|", 1)[0].strip()
+                track_name, artist_name = _split_title_author(og, "")
+                if track_name or artist_name:
+                    display = f"{track_name or og} - {artist_name or ''}".strip(" -")
+                    query = f"{artist_name or ''} {track_name or og}".strip()
+                    return (query or fallback_url, track_name, artist_name, display or fallback_url)
+
+        # 마지막 fallback: 그래도 URL은 넘긴다(완전 실패)
+        return (fallback_url, None, None, fallback_url)
 
     async def _spotify_playlist_queries(self, session: aiohttp.ClientSession, playlist_id: str) -> Optional[List[str]]:
         """
@@ -2015,13 +2091,34 @@ class MusicCog(commands.Cog):
                 except Exception:
                     pass
                 return
-
             if kind == "track" and sid:
                 url = f"https://open.spotify.com/track/{sid}"
-                q = await self._spotify_track_query(session, sid, url)
-                await self._enqueue_from_interaction(interaction, q)
-                return
+                q, tn, ar, disp = await self._spotify_track_meta(session, sid, url)
 
+                st = self._state(interaction.guild.id)
+
+                # Phase1: Spotify 트랙은 URL 자체로 ytsearch 하지 않고,
+                # (아티스트 + 곡명) 기반으로 ytsearch1:... 를 큐에 넣는다.
+                webpage = q
+                if q and not re.match(r"^https?://", q):
+                    webpage = f"ytsearch1:{q}"
+
+                track = _Track(
+                    title=(disp or q or url),
+                    webpage_url=str(webpage),
+                    requester_id=interaction.user.id,
+                    meta_track=tn,
+                    meta_artist=ar,
+                )
+                await st.queue.put(track)
+                self._start_player_if_needed(interaction.guild.id)
+
+                try:
+                    await interaction.followup.send(f"큐에 추가: **{track.title}**", ephemeral=True)
+                except Exception:
+                    pass
+                await self._refresh_from_interaction(interaction)
+                return
             await self._enqueue_from_interaction(interaction, raw)
 
     async def _set_volume_from_interaction(self, interaction: discord.Interaction, raw: str):
@@ -2748,8 +2845,10 @@ class MusicCog(commands.Cog):
 
 
     def _lyrics_cache_key(self, track: _Track) -> str:
+        # Phase1: Spotify 등에서 얻은 메타가 있으면 그걸 우선 사용(가사 적중률↑)
         tn, ar = _guess_artist_title(track.title)
-        ar = ar or getattr(track, 'artist', None) or ""
+        tn = (getattr(track, "meta_track", None) or tn).strip()
+        ar = (getattr(track, "meta_artist", None) or ar or getattr(track, 'artist', None) or "").strip()
         return f"{tn}|||{ar}".strip()
 
     def _current_pos(self, st: MusicState) -> float:
@@ -2968,8 +3067,11 @@ class MusicCog(commands.Cog):
                     lines_lrc = st.lyrics_cache[key]
                 else:
                     tn, ar = _guess_artist_title(track.title)
-                    ar = ar or getattr(track, 'artist', None)
+                    # Phase1: Spotify 메타 우선
+                    tn = (getattr(track, "meta_track", None) or tn).strip()
+                    ar = (getattr(track, "meta_artist", None) or ar or getattr(track, 'artist', None))
                     lrc = await self._fetch_lrclib(tn, ar)
+
                     lines_lrc = _parse_plain_lyrics(lrc or "")
                     st.lyrics_cache[key] = lines_lrc
 
