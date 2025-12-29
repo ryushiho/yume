@@ -1182,11 +1182,24 @@ class MusicCog(commands.Cog):
 
         self._spotify_client_id = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
         self._spotify_client_secret = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
+        # Spotify 디버그 로그 (서비스 로그가 지저분해지는 걸 막기 위해 기본 OFF)
+        # - 1/true/yes/on 중 하나면 활성화
+        self._spotify_debug = str(os.getenv("YUME_SPOTIFY_DEBUG", "0")).strip().lower() in {"1", "true", "yes", "y", "on"}
+        self._spotify_last_error: str = ""
         self._spotify_token: Optional[str] = None
         self._spotify_token_exp: float = 0.0
         self._spotify_token_lock: asyncio.Lock = asyncio.Lock()
 
     async def cog_load(self):
+        try:
+            if self._spotify_enabled():
+                logger.info("[Music] Spotify API enabled: SPOTIFY_CLIENT_ID/SECRET loaded.")
+            else:
+                logger.info("[Music] Spotify API disabled: missing SPOTIFY_CLIENT_ID/SECRET.")
+            if getattr(self, "_spotify_debug", False):
+                logger.info("[Music] Spotify debug logging is ON (YUME_SPOTIFY_DEBUG=1).")
+        except Exception:
+            pass
         self._restore_task = asyncio.create_task(self._restore_fixed_panels())
 
     async def cog_unload(self):
@@ -1741,6 +1754,18 @@ class MusicCog(commands.Cog):
     def _spotify_enabled(self) -> bool:
         return bool(self._spotify_client_id and self._spotify_client_secret)
 
+    def _spotify_dbg(self, fmt: str, *args) -> None:
+        """Spotify 관련 디버그 로그.
+
+        서비스 로그는 기본적으로 깔끔해야 하니, 환경변수로 켠 경우에만 출력한다.
+        """
+        if not getattr(self, "_spotify_debug", False):
+            return
+        try:
+            logger.info("[Spotify] " + fmt, *args)
+        except Exception:
+            pass
+
     async def _spotify_get_token(self, session: aiohttp.ClientSession) -> Optional[str]:
         now = time.time()
         if self._spotify_token and now < (self._spotify_token_exp - 30):
@@ -1759,33 +1784,107 @@ class MusicCog(commands.Cog):
             data = {"grant_type": "client_credentials"}
 
             try:
-                async with session.post(url, data=data, headers={"Authorization": f"Basic {basic}"}) as r:
+                async with session.post(
+                    url,
+                    data=data,
+                    headers={
+                        "Authorization": f"Basic {basic}",
+                        "Accept": "application/json",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
+                ) as r:
                     if r.status != 200:
+                        body = ""
+                        try:
+                            body = (await r.text())[:300]
+                        except Exception:
+                            body = ""
+                        self._spotify_last_error = f"token status={r.status}"
+                        self._spotify_dbg("token request failed: status=%s body=%s", r.status, body)
+                        # 토큰이 꼬인 상태면 강제로 비운다.
+                        self._spotify_token = None
+                        self._spotify_token_exp = 0.0
                         return None
                     js = await r.json()
-            except Exception:
+            except Exception as e:
+                self._spotify_last_error = f"token exception={type(e).__name__}"
+                self._spotify_dbg("token exception: %r", e)
                 return None
 
             access = str(js.get("access_token") or "")
             expires_in = int(js.get("expires_in") or 0)
             if not access or expires_in <= 0:
+                self._spotify_last_error = "token missing access_token"
                 return None
 
             self._spotify_token = access
             self._spotify_token_exp = time.time() + expires_in
+            self._spotify_last_error = ""
             return access
 
     async def _spotify_api_get(self, session: aiohttp.ClientSession, url: str) -> Optional[dict]:
         tok = await self._spotify_get_token(session)
         if not tok:
             return None
-        try:
-            async with session.get(url, headers={"Authorization": f"Bearer {tok}"}) as r:
-                if r.status != 200:
-                    return None
-                return await r.json()
-        except Exception:
-            return None
+
+        async def _do_get(bearer: str) -> Tuple[int, Optional[dict], str]:
+            try:
+                async with session.get(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {bearer}",
+                        "Accept": "application/json",
+                    },
+                ) as r:
+                    if r.status == 200:
+                        return (200, await r.json(), "")
+                    body = ""
+                    try:
+                        body = (await r.text())[:300]
+                    except Exception:
+                        body = ""
+                    return (int(r.status), None, body)
+            except Exception as e:
+                return (0, None, f"exception={type(e).__name__}")
+
+        # 1차 호출
+        status, js, body = await _do_get(tok)
+        if status == 200 and js is not None:
+            self._spotify_last_error = ""
+            return js
+
+        # 401/403이면 토큰을 비우고 1회 재시도
+        if status in {401, 403}:
+            self._spotify_dbg("api status=%s -> clearing token and retrying once (url=%s)", status, url)
+            self._spotify_token = None
+            self._spotify_token_exp = 0.0
+            tok2 = await self._spotify_get_token(session)
+            if tok2:
+                status2, js2, body2 = await _do_get(tok2)
+                if status2 == 200 and js2 is not None:
+                    self._spotify_last_error = ""
+                    return js2
+                status, body = status2, body2
+
+        # 429(rate limit)은 짧게 기다렸다가 1회 재시도
+        if status == 429:
+            self._spotify_dbg("api rate limited (429). sleeping 1s then retry (url=%s)", url)
+            try:
+                await asyncio.sleep(1.0)
+            except Exception:
+                pass
+            status2, js2, body2 = await _do_get(tok)
+            if status2 == 200 and js2 is not None:
+                self._spotify_last_error = ""
+                return js2
+            status, body = status2, body2
+
+        if status == 0:
+            self._spotify_last_error = f"api exception ({body})"
+        else:
+            self._spotify_last_error = f"api status={status}"
+        self._spotify_dbg("api get failed: status=%s body=%s url=%s", status, body, url)
+        return None
 
     
     async def _spotify_track_meta(
@@ -1846,14 +1945,29 @@ class MusicCog(commands.Cog):
                 return (query or fallback_url, track_name, artist_name, display)
 
         # 2) oEmbed (키 없이 가능)
+        # - 간혹 403/429가 날 수 있으니, 디버그 모드에서만 상태를 남기고
+        #   실패하면 HTML fallback로 간다.
         oembed = f"https://open.spotify.com/oembed?url={quote(fallback_url, safe='')}"
         try:
-            async with session.get(oembed, headers={"User-Agent": "YumeBot"}) as r:
+            async with session.get(
+                oembed,
+                headers={
+                    "User-Agent": "YumeBot",
+                    "Accept": "application/json",
+                },
+            ) as r:
                 if r.status == 200:
                     data = await r.json()
                 else:
+                    body = ""
+                    try:
+                        body = (await r.text())[:200]
+                    except Exception:
+                        body = ""
+                    self._spotify_dbg("oembed failed: status=%s body=%s", r.status, body)
                     data = None
-        except Exception:
+        except Exception as e:
+            self._spotify_dbg("oembed exception: %r", e)
             data = None
 
         if isinstance(data, dict):
@@ -1906,10 +2020,12 @@ class MusicCog(commands.Cog):
 
         out: List[str] = []
         url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks?limit=100"
+        had_error = False
 
         while url and len(out) < max_n:
             js = await self._spotify_api_get(session, url)
             if not js:
+                had_error = True
                 break
             items = js.get("items") or []
             for it in items:
@@ -1924,6 +2040,10 @@ class MusicCog(commands.Cog):
                     break
             url = js.get("next")
 
+        # 플레이리스트가 비어있어서 out이 []인 것과,
+        # API가 실패해서 아무 것도 못 가져온(out==[] && had_error) 경우를 구분한다.
+        if had_error and not out:
+            return None
         return out
 
     async def _resolve_stream_url(self, track: _Track) -> Optional[str]:
@@ -2526,13 +2646,29 @@ class MusicCog(commands.Cog):
         async with aiohttp.ClientSession(timeout=timeout) as session:
             if kind == "playlist" and sid:
                 qs = await self._spotify_playlist_queries(session, sid)
-                if not qs:
-                    msg = (
-                        "플레이리스트를 가져오려면 Spotify API 키가 필요해.\n"
-                        "서버 .env에 SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET 넣고 재시작해줘."
-                    )
+                if qs is None:
+                    if not self._spotify_enabled():
+                        msg = (
+                            "플레이리스트를 가져오려면 Spotify API 키가 필요해.\n"
+                            "서버 .env에 SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET 넣고 재시작해줘."
+                        )
+                    else:
+                        # 키는 있는데 인증/호출이 실패한 케이스
+                        reason = (self._spotify_last_error or "알 수 없는 오류").strip()
+                        msg = (
+                            "Spotify 플레이리스트를 가져오지 못했어.\n"
+                            "CLIENT_ID/SECRET 확인해줘.\n"
+                            f"(상태: {reason})"
+                        )
                     try:
                         await interaction.followup.send(msg, ephemeral=True)
+                    except Exception:
+                        pass
+                    return
+
+                if len(qs) == 0:
+                    try:
+                        await interaction.followup.send("플레이리스트에 곡이 없네…", ephemeral=True)
                     except Exception:
                         pass
                     return
