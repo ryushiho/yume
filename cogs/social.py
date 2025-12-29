@@ -297,7 +297,7 @@ class HelpCog(commands.Cog):
         if irritation > 0.5:
             desc = "명령어는 `!`로 시작해. 필요한 것만 빠르게 적어둘게."
         elif mood >= 0.4:
-            desc = "명령어는 `!`로 시작해. 중요한 것만 딱 정리해둘게, 으헤~"
+            desc = "명령어는 `!`로 시작해. 중요한 것만 딱 정리해둘게~ 에헤헤."
         else:
             desc = "명령어는 `!`로 시작해. 헷갈릴 때는 여기만 보면 돼."
 
@@ -365,7 +365,7 @@ class HelpCog(commands.Cog):
 
 
 class ReactionsCog(commands.Cog):
-    """유메 리액션 / 바보 놀리기 / 육포 패널티 / 랜덤 '으헤~'"""
+    """유메 리액션 / 바보 놀리기 / 육포 패널티 / 랜덤 '에헤헤~'"""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -407,7 +407,7 @@ class ReactionsCog(commands.Cog):
 
     def _build_babo_message(self, target: discord.Member) -> str:
         name = discord.utils.escape_mentions(target.display_name or target.name)
-        return f"{name} 바보. (…라고 누가 그러더라, 유메가 그런 거 아냐. 으헤~)"
+        return f"{name} 바보. (…라고 누가 그러더라, 유메가 그런 거 아냐~ 에헤헤.)"
 
     def _core(self):
         return getattr(self.bot, "yume_core", None)
@@ -530,7 +530,7 @@ class ReactionsCog(commands.Cog):
         if brain is None:
             # 시스템 안내/에러는 템플릿 허용
             await message.channel.send(
-                "지금은 유메 머리가 잠깐 멈췄어… 으헤~\n"
+                "지금은 유메 머리가 잠깐 멈췄어… 흐음~\n"
                 "(OPENAI_API_KEY나 한도 설정을 한 번만 확인해줘.)"
             )
             return
@@ -560,11 +560,11 @@ class ReactionsCog(commands.Cog):
             reason = result.get("reason")
             if reason == "limit_exceeded":
                 await message.channel.send(
-                    "이번 달엔 유메가 너무 많이 떠들어서… 잠깐 쉬어야겠어. 으헤~"
+                    "이번 달엔 유메가 너무 많이 떠들어서… 잠깐 쉬어야겠어. 흐음~"
                 )
             else:
                 await message.channel.send(
-                    "지금은 말이 잘 안 나와… 잠깐만 다시 불러줘. 으헤~"
+                    "지금은 말이 잘 안 나와… 잠깐만 다시 불러줘. 흐음~"
                 )
             return
 
@@ -600,7 +600,7 @@ class ReactionsCog(commands.Cog):
             self._block_yukpo(message.author.id, minutes=5)
             try:
                 await message.channel.send(
-                    f"{message.author.mention} 육포 냄새가 진동해서… 잠깐 명령어는 못 쓰게 막아 둘게. 으헤~",
+                    f"{message.author.mention} 육포 냄새가 진동해서… 잠깐 명령어는 못 쓰게 막아 둘게. 에헤헤~",
                     delete_after=10,
                 )
             except Exception:
@@ -611,18 +611,18 @@ class ReactionsCog(commands.Cog):
             await self._handle_mention_chat(message)
 
     async def _hehe_loop(self):
-        """특정 채널에 가끔 랜덤으로 '으헤~' 한마디씩 던지는 태스크."""
+        """특정 채널에 가끔 랜덤으로 '에헤헤~' 한마디씩 던지는 태스크."""
         await self.bot.wait_until_ready()
         while not self.bot.is_closed():
             try:
                 await asyncio.sleep(random.randint(60 * 300, 60 * 600))
                 channel = self.bot.get_channel(HEHE_CHANNEL_ID)
                 if isinstance(channel, discord.TextChannel):
-                    await channel.send("으헤~")
+                    await channel.send("에헤헤~")
             except asyncio.CancelledError:
                 break
             except Exception:
-                logger.exception("으헤~ 루프에서 오류 발생")
+                logger.exception("에헤헤~ 루프에서 오류 발생")
 
 
 async def setup(bot: commands.Bot):

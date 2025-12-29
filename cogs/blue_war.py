@@ -23,6 +23,7 @@ from words_core import load_words_from_file, pick_words_source
 from bluewar_wordlists import sync_wordlists, load_local_meta
 from config import BLUEWAR_CACHED_SUGGESTION_FILE, WORDS_FILE
 from records_core import ensure_records, load_records, save_records, add_match_record, calc_rankings
+from yume_prompt import YUME_ROLE_PROMPT_KR
 
 logger = logging.getLogger(__name__)
 
@@ -51,13 +52,15 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 YUME_OPENAI_MODEL = os.getenv("YUME_OPENAI_MODEL") or "gpt-4o-mini"
 YUME_BLUEWAR_USE_LLM = os.getenv("YUME_BLUEWAR_USE_LLM", "1").lower() in ("1", "true", "yes", "y", "on")
 
-YUME_SYSTEM_PROMPT = """너는 디스코드 봇 '유메'의 말투로 말한다.
-유메는 블루 아카이브의 쿠치나시 유메 모티브의 학생회장 '선배'다.
-기본은 다정하고 마이페이스지만 할 일은 다 처리한다.
-상대는 '후배'지만 가능하면 닉네임(표시 이름)으로 부른다.
-장난스럽거나 민망할 때 '으헤~'를 섞는다.
-너무 과장되게 귀엽지 말고 자연스럽게.
-"""
+YUME_SYSTEM_PROMPT = (
+    YUME_ROLE_PROMPT_KR
+    + "\n\n[추가 지침: 블루전(끝말잇기) 대사]\n"
+    + "- 지금은 디스코드 끝말잇기(블루전) 진행/결과/규칙 안내 대사를 만든다.\n"
+    + "- 1~2문장으로 짧고 명확하게.\n"
+    + "- 상대 호칭은 기본 '선생님' (필요하면 '후배 님'도 가능).\n"
+    + "- '으헤~'는 거의 쓰지 말고, 대신 '에헤헤', '와아!', '흐음~'을 가끔 사용.\n"
+    + "- 폭력적/모욕적 표현 금지.\n"
+)
 
 DEFAULT_DOOUM_MAP: Dict[str, Set[str]] = {
     "녀": {"여"},
@@ -943,8 +946,8 @@ class BlueWarCog(commands.Cog):
     async def _speak_practice_result(self, user: discord.Member, user_is_winner: bool, word_history: List[str]) -> str:
         if not (self.openai and YUME_BLUEWAR_USE_LLM):
             if user_is_winner:
-                return f"{user.display_name}, 오늘은 네가 이겼네. 잘했어, 으헤~"
-            return f"{user.display_name}, 다음엔 더 잘할 수 있을 거야. 유메가 응원할게, 으헤~"
+                return f"{user.display_name} 선생님, 오늘은 선생님이 이겼네. 잘했어~ 에헤헤."
+            return f"{user.display_name} 선생님, 다음엔 더 잘할 수 있을 거야. 유메가 응원할게~"
 
         tone = "neutral"
         try:
@@ -955,7 +958,7 @@ class BlueWarCog(commands.Cog):
             tone = "neutral"
 
         prompt = f"""
-상황: 디스코드 끝말잇기 연습 모드(블루전). 유저 vs 유메(AI).
+상황: 디스코드 끝말잇기 연습 모드(블루전). 유저 vs 유메.
 유저: {user.display_name}
 결과: {"유저 승리" if user_is_winner else "유메 승리"}
 진행 단어 기록: {" / ".join(word_history)}
@@ -973,12 +976,12 @@ class BlueWarCog(commands.Cog):
                 temperature=0.7,
             )
             text_out = (resp.choices[0].message.content or "").strip()
-            return text_out if text_out else (f"{user.display_name}, 수고했어. 으헤~")
+            return text_out if text_out else (f"{user.display_name} 선생님, 수고했어~ 에헤헤.")
         except Exception as e:
             logger.warning("[BlueWar] LLM practice result 실패: %s", e)
             if user_is_winner:
-                return f"{user.display_name}, 오늘은 네가 이겼네. 잘했어, 으헤~"
-            return f"{user.display_name}, 다음엔 더 잘할 수 있을 거야. 유메가 응원할게, 으헤~"
+                return f"{user.display_name} 선생님, 오늘은 선생님이 이겼네. 잘했어~ 에헤헤."
+            return f"{user.display_name} 선생님, 다음엔 더 잘할 수 있을 거야. 유메가 응원할게~"
 
     async def _run_practice_game(self, ctx: commands.Context, user: discord.Member, game_no: int, *, key: Tuple[int, int], stop_event: asyncio.Event, ai_depth: int = AI_SEARCH_DEPTH):
         channel = ctx.channel
@@ -1048,7 +1051,7 @@ class BlueWarCog(commands.Cog):
                     except asyncio.TimeoutError:
                         await channel.send(
                             f"{user.display_name}, 시간이 초과됐어.\n"
-                            "이번 판은 유메가 이긴 걸로 할게… 으헤~"
+                            "이번 판은 유메가 이긴 걸로 할게… 흐음~"
                         )
                         user_is_winner = False
                         end_reason = "timeout"
@@ -1077,7 +1080,7 @@ class BlueWarCog(commands.Cog):
                     if not _has_any_move_from_last(_last_char(current_word), used_words):
                         await channel.send(
                             "으으… 다음으로 이어질 단어가 없어졌네.\n"
-                            f"이번 판은 **{user.display_name}** 의 승리야. 잘했어, 으헤~"
+                            f"이번 판은 **{user.display_name}** 선생님의 승리야. 잘했어~ 에헤헤."
                         )
                         user_is_winner = True
                         end_reason = "ai_no_move"
@@ -1112,7 +1115,7 @@ class BlueWarCog(commands.Cog):
                     if not ai_word:
                         await channel.send(
                             "으으… 이어지는 단어가 더 이상 떠오르지 않아.\n"
-                            f"이번 판은 **{user.display_name}** 의 승리야. 잘했어, 으헤~"
+                            f"이번 판은 **{user.display_name}** 선생님의 승리야. 잘했어~ 에헤헤."
                         )
                         user_is_winner = True
                         end_reason = "ai_no_word"
@@ -1126,7 +1129,7 @@ class BlueWarCog(commands.Cog):
                     if not _has_any_move_from_last(_last_char(current_word), used_words):
                         await channel.send(
                             f"다음으로 이어질 단어가 없네.\n"
-                            "이번 판은 유메가 이긴 걸로 할게… 으헤~"
+                            "이번 판은 유메가 이긴 걸로 할게… 흐음~"
                         )
                         user_is_winner = False
                         end_reason = "user_no_move"
@@ -1140,7 +1143,7 @@ class BlueWarCog(commands.Cog):
 
         if end_reason == "forced_stop":
             try:
-                await channel.send("연습을 종료했어. 으헤~")
+                await channel.send("연습을 종료했어. 에헤헤~")
             except Exception:
                 pass
             return
@@ -1241,7 +1244,7 @@ class BlueWarCog(commands.Cog):
         if start_mode == "starter_word":
             chosen = await _ask_starter_word(timeout=60.0)
             if not chosen:
-                await channel.send("제시어 입력이 없어서… 이번엔 랜덤 제시어로 갈게. 으헤~")
+                await channel.send("제시어 입력이 없어서… 이번엔 랜덤 제시어로 갈게. 에헤헤~")
                 start_mode = "random"
             else:
                 start_word = chosen
@@ -1530,7 +1533,7 @@ class BlueWarCog(commands.Cog):
             return
         if session.stop_event:
             session.stop_event.set()
-        await ctx.send("연습 종료할게. 으헤~")
+        await ctx.send("연습 종료할게. 에헤헤~")
 
     @commands.command(name="블루전전적", help="블루전 전적을 확인합니다.")
     async def cmd_bluewar_records(self, ctx: commands.Context):

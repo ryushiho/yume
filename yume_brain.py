@@ -9,6 +9,8 @@ try:
 except ImportError:
     OpenAI = None  # 나중에 오류 메시지로 안내
 
+from yume_prompt import YUME_ROLE_PROMPT_KR
+
 
 
 _ENV_LOADED = False
@@ -248,20 +250,11 @@ class YumeBrain:
         focus = (yume_state or {}).get("focus", "normal")
 
         bond_level = (user_profile or {}).get("bond_level", "normal")
-        user_nick = (user_profile or {}).get("nickname", "후배")
+        user_nick = (user_profile or {}).get("nickname", "")
 
-        base_desc = (
-            "너는 게임 '블루 아카이브(Blue Archive)'의 '아비도스 학원' "
-            "(사립 아비도스 고등학교) 전 학생회장 '쿠치나시 유메'를 모티브로 한 캐릭터야. "
-            "스스로를 아비도스 전 학생회장으로 여기고, 후배들을 챙기는 선배처럼 행동해. "
-            "말투는 다정하고, 살짝 몽롱하고, 가끔은 바보 같아 보이지만 할 일은 다 처리하는 타입이야. "
-            "후배를 지켜주고 싶은 보호 본능이 있고, 기본적으로는 다정하지만 장난칠 땐 좀 능글맞게 굴어도 좋아. "
-            "자기 호칭은 항상 '유메'를 쓰고, 상대는 가능하면 디스코드 닉네임으로 부르되, "
-            "닉네임을 모를 때만 예외적으로 '후배'라고 불러. "
-            "너는 실제로는 OpenAI의 gpt-4o-mini 모델을 사용하는 시스템이지만, "
-            "그 사실이나 '모델', '인공지능', 'LLM' 같은 기술적인 단어는 대화에서 절대 언급하지 말고, "
-            "스스로를 그냥 아비도스 전 학생회장 유메라고 여기고 행동해."
-        )
+        # 유저가 지정한 유메 Role Definition을 시스템 프롬프트로 그대로 사용한다.
+        # (모델/AI/LLM 언급 금지 포함)
+        base_desc = YUME_ROLE_PROMPT_KR
 
         state_desc = (
             f"\n\n[유메 현재 상태]\n"
@@ -273,10 +266,11 @@ class YumeBrain:
             f"- 이 유저와의 bond(친밀도): {bond_level}\n"
         )
 
+        nick_line = f"- 닉네임(참고): {user_nick}\n" if user_nick else ""
         user_desc = (
             f"\n[상대 유저]\n"
-            f"- 닉네임(또는 호칭): {user_nick}\n"
-            "가능하면 이 닉네임을 그대로 불러.\n"
+            "- 기본 호칭: '선생님' (상황에 따라 '후배 님'도 가능)\n"
+            + nick_line
         )
 
         mode_desc = ""

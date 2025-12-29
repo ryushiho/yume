@@ -2358,7 +2358,7 @@ class MusicCog(commands.Cog):
         if st.last_error and (time.time() - st.last_error_at) < 300:
             embed.add_field(name="⚠️ 상태", value=st.last_error, inline=False)
 
-        embed.set_footer(text="버튼으로 조작해줘. 으헤~")
+        embed.set_footer(text="버튼으로 조작해줘~ 에헤헤.")
         return embed
 
     async def _ensure_panel_message(
@@ -2775,7 +2775,7 @@ class MusicCog(commands.Cog):
                     st.paused_total += max(0.0, self.bot.loop.time() - st.paused_at)
                     st.paused_at = None
                 vc.resume()
-                await interaction.response.send_message("다시 재생할게. 으헤~", ephemeral=True)
+                await interaction.response.send_message("다시 재생할게~ 에헤헤.", ephemeral=True)
             else:
                 await interaction.response.send_message("지금 재생 중이 아니야.", ephemeral=True)
         except Exception as e:
@@ -2811,7 +2811,7 @@ class MusicCog(commands.Cog):
         self._start_player_if_needed(interaction.guild.id)
 
         try:
-            await interaction.response.send_message("넘길게. 으헤~", ephemeral=True)
+            await interaction.response.send_message("넘길게~ 에헤헤.", ephemeral=True)
         except Exception:
             pass
 
@@ -2846,7 +2846,7 @@ class MusicCog(commands.Cog):
         st.now_playing = None
 
         try:
-            await interaction.response.send_message("멈췄어. 으헤~", ephemeral=True)
+            await interaction.response.send_message("멈췄어~ 에헤헤.", ephemeral=True)
         except Exception:
             pass
         await self._refresh_from_interaction(interaction)
@@ -3215,7 +3215,7 @@ class MusicCog(commands.Cog):
         if self._human_count(channel) > 0:
             return
 
-        await self._disconnect_and_cleanup(guild_id, reason="아무도 없어서 유메가 나갈게. 큐도 정리했어. 으헤~")
+        await self._disconnect_and_cleanup(guild_id, reason="아무도 없어서 유메가 나갈게. 큐도 정리했어~")
 
     @commands.Cog.listener()
     async def on_voice_state_update(

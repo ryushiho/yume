@@ -116,7 +116,7 @@ class YumeDiaryCog(commands.Cog):
             msg = self._short_say(
                 kind="cmd_yume_diary_brain_not_ready",
                 user=ctx.author,
-                fallback="유메가 지금은 긴 이야기를 하기 힘들어. 설정을 한 번 봐줘, 으헤~",
+                fallback="유메가 지금은 긴 이야기를 하기 힘들어. 설정을 한 번 봐줘… 흐음~",
             )
             await ctx.send(msg)
             return
@@ -159,7 +159,7 @@ class YumeDiaryCog(commands.Cog):
         reply = str(result.get("reply", "")).strip() or self._short_say(
             kind="cmd_yume_diary_empty",
             user=user,
-            fallback="오늘은 별일 없었지만… 그래도 후배들 덕분에 나름 괜찮은 하루였어, 으헤~",
+            fallback="오늘은 별일 없었지만… 그래도 선생님 덕분에 나름 괜찮은 하루였어~ 에헤헤.",
         )
 
         memory = self._get_memory()
@@ -181,7 +181,7 @@ class YumeDiaryCog(commands.Cog):
             msg = self._short_say(
                 kind="cmd_yume_today_short_brain_not_ready",
                 user=ctx.author,
-                fallback="지금은 유메 머리가 좀 복잡해서, 하루를 정리하기가 어려워… 으헤~",
+                fallback="지금은 유메 머리가 좀 복잡해서, 하루를 정리하기가 어려워… 흐음~",
             )
             await ctx.send(msg)
             return
@@ -272,7 +272,7 @@ class YumeDiaryCog(commands.Cog):
         reply = str(result.get("reply", "")).strip() or self._short_say(
             kind="cmd_yume_mood_empty",
             user=user,
-            fallback="음… 완전 최고는 아니어도, 후배들이랑 얘기할 힘 정도는 있는 기분이야. 으헤~",
+            fallback="음… 완전 최고는 아니어도, 선생님이랑 얘기할 힘 정도는 있는 기분이야~",
         )
 
         await ctx.send(reply)
@@ -355,7 +355,7 @@ class YumeDiaryCog(commands.Cog):
             msg = self._short_say(
                 kind="daily_feedback_brain_not_ready",
                 user=None,
-                fallback="오늘 하루를 정리해 주고 싶은데… 지금은 유메 머리가 좀 과열됐어. 내일은 꼭 말해줄게, 으헤~",
+                fallback="오늘 하루를 정리해 주고 싶은데… 지금은 유메 머리가 좀 과열됐어. 내일은 꼭 말해줄게~",
             )
             await channel.send(msg)
             return
@@ -393,7 +393,7 @@ class YumeDiaryCog(commands.Cog):
             reply = self._short_say(
                 kind="daily_feedback_empty_reply",
                 user=None,
-                fallback="오늘 하루도 고생 많았어. 유메는 여기서 살짝 쉬었다가, 내일 또 힘낼게. 으헤~",
+                fallback="오늘 하루도 고생 많았어. 유메는 여기서 살짝 쉬었다가, 내일 또 힘낼게~",
             )
 
         await channel.send(reply)
