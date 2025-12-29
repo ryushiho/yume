@@ -632,9 +632,8 @@ async def setup(bot: commands.Bot):
     rcog = ReactionsCog(bot)
     await bot.add_cog(rcog)
 
-    @bot.check
-    async def _global_yukpo_check(ctx: commands.Context) -> bool:  # type: ignore[unused-ignore]
-        rc: ReactionsCog | None = bot.get_cog("ReactionsCog")  # type: ignore[assignment]
-        if rc is None:
-            return True
-        return not rc._is_yukpo_blocked(ctx.author.id)
+    # NOTE:
+    # 이전 빌드에선 '육포' 패널티를 전역 bot.check로 걸어서,
+    # 특정 유저가 잠깐 막히는 동안 모든 명령어가 "아무 반응 없이" 실패할 수 있었다.
+    # (on_command_error 핸들러가 없으면 CheckFailure가 채팅으로 표기되지 않음)
+    # 운영 안정성을 위해 전역 차단은 제거하고, 필요한 커맨드 내부에서만 제한한다.

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
+import math
 import os
 import signal
 from typing import Optional, Literal
@@ -211,6 +213,66 @@ async def on_ready():
         logger.info("슬래시 명령어 동기화 완료: %d개", len(synced))
     except Exception as e:  # pylint: disable=broad-except
         logger.exception("슬래시 명령어 동기화 중 오류: %s", e)
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: Exception):
+    """전역 명령어 에러 핸들러.
+
+    - 운영 중 '아무 반응 없음'을 줄이기 위해 최소한의 안내를 출력한다.
+    - CommandNotFound는 조용히 무시한다.
+    """
+
+    # 1) 존재하지 않는 커맨드: 무시
+    if isinstance(error, commands.CommandNotFound):
+        return
+
+    # 2) 체크 실패(권한/쿨타임/커스텀 체크 등)
+    if isinstance(error, commands.CheckFailure):
+        # social.ReactionsCog의 '육포' 패널티(과거 전역 check였던 것) 안내
+        rcog = bot.get_cog("ReactionsCog")
+        until = None
+        try:
+            # type: ignore[attr-defined]
+            until = getattr(rcog, "_yukpo_block_until", {}).get(ctx.author.id) if rcog else None
+        except Exception:
+            until = None
+
+        if isinstance(until, datetime.datetime):
+            remain_sec = int((until - datetime.datetime.utcnow()).total_seconds())
+            if remain_sec > 0:
+                mins = max(1, int(math.ceil(remain_sec / 60.0)))
+                try:
+                    await ctx.send(
+                        f"{ctx.author.mention} 지금은 잠깐 명령어를 못 써… ({mins}분 정도)",
+                        delete_after=8,
+                    )
+                except Exception:
+                    pass
+                return
+
+        # 기타 체크 실패는 조용히 무시(불필요한 스팸 방지)
+        return
+
+    # 3) 인자 누락 등: 간단 안내
+    if isinstance(error, commands.MissingRequiredArgument):
+        try:
+            await ctx.send("인자가 부족해. `!탐사지원` 같은 도움말을 확인해줘.", delete_after=8)
+        except Exception:
+            pass
+        return
+
+    # 4) 나머지: 로그에 남기고, 개발자에겐 최소 디버그 힌트를 준다.
+    logger.exception("명령어 처리 중 오류: %r", error)
+
+    msg = "명령어 처리 중 오류가 발생했어… 잠깐만 보고 고칠게."
+    if getattr(ctx.author, "id", None) == DEV_USER_ID:
+        msg += f"\n[디버그] {type(error).__name__}: {error}"
+
+    try:
+        await ctx.send(msg, delete_after=12)
+    except Exception:
+        pass
 
 
 async def main():
