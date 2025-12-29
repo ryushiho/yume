@@ -21,7 +21,7 @@ JUNIOR_ROLE_ID = 1453334977319276665
 SPECIAL_JUNIOR_USER_ID = 1433962010785349634
 
 
-def get_honorific(user: discord.abc.User, guild: Optional[discord.Guild]) -> str:
+def get_honorific(user: discord.abc.User, guild: Optional[discord.Guild] = None) -> str:
     """Return the honorific string for this user within a guild context."""
     if int(getattr(user, "id", 0)) == SPECIAL_JUNIOR_USER_ID:
         return "후배"

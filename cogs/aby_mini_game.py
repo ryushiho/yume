@@ -96,7 +96,7 @@ class AbyMiniGameCog(commands.Cog):
 
     @commands.command(name="탐사지원")
     async def explore_help(self, ctx: commands.Context):
-        hon = get_honorific(ctx.author)
+        hon = get_honorific(ctx.author, ctx.guild)
         txt = (
             f"{hon}~ 아비도스 탐사 지원센터야. (유메 선배가 만든... 잔뜩 허술한 안내서)\n\n"
             "**기본 커맨드**\n"
@@ -120,7 +120,7 @@ class AbyMiniGameCog(commands.Cog):
         econ = get_user_economy(ctx.author.id)
         credits = int(econ.get("credits", 0))
         water = int(econ.get("water", 0))
-        hon = get_honorific(ctx.author)
+        hon = get_honorific(ctx.author, ctx.guild)
 
         txt = (
             f"{hon} 지갑 확인~\n"
@@ -140,7 +140,7 @@ class AbyMiniGameCog(commands.Cog):
             return
 
         today = _today_ymd_kst()
-        hon = get_honorific(ctx.author)
+        hon = get_honorific(ctx.author, ctx.guild)
 
         # Reward balance (MVP)
         # Success: 7~16k credits; Fail: 0~3k
@@ -214,7 +214,7 @@ class AbyMiniGameCog(commands.Cog):
         rate = float(s.get("interest_rate", ABY_DEFAULT_INTEREST_RATE))
         last = str(s.get("last_interest_ymd", ""))
 
-        hon = get_honorific(ctx.author)
+        hon = get_honorific(ctx.author, ctx.guild)
         txt = (
             f"{hon}… 아비도스 재정 보고서 가져왔어.\n"
             f"- 현재 빚: **{_fmt(debt)} 크레딧**\n"
@@ -253,7 +253,7 @@ class AbyMiniGameCog(commands.Cog):
             return
 
         res = repay_guild_debt(ctx.guild.id, ctx.author.id, amt, today)
-        hon = get_honorific(ctx.author)
+        hon = get_honorific(ctx.author, ctx.guild)
         if not res.get("ok"):
             reason = res.get("reason")
             if reason == "no_credits":
