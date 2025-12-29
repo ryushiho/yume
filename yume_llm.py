@@ -273,3 +273,88 @@ def generate_survival_meal(
         "**'Double-Baked Wheat Cracker with Desert Air' (두 번 구운 건빵과 사막 공기 곁들임)**\n"
         "바삭함은 확실해! 목이 좀 막힐 수도 있지만… 그게 또 매력이지, 에헤헤~ 🌵"
     )
+
+
+# =========================
+# Phase5: Stamps (참 잘했어요! 도장판)
+# =========================
+
+
+async def generate_stamp_reward_letter(
+    *,
+    honorific: str,
+    user_display_name: str,
+    milestone: int,
+    title: str,
+    weather_label: str,
+) -> str:
+    """Generate a short 'handwritten' style reward letter.
+
+    - 잔상/관측/상상 분위기 유지 (현실 사실 단정 금지)
+    - DM 한 번에 들어갈 정도로 짧게
+    - OpenAI 미설정/오류 시 규칙 기반 fallback
+    """
+
+    fallback = (
+        f"{user_display_name} {honorific},\n"
+        f"오늘도 아비도스 학생회실에 들러줘서 고마워.\n"
+        f"도장 {milestone}개… 이건 정말 대단한 일이야.\n"
+        f"선물로 \"{title}\" 임명장을 적어뒀어.\n"
+        f"모래바람이 불어도, {honorific}만큼은 꼭 챙기고 싶었거든.\n"
+        f"내일도 무사하면, 그걸로 충분해.\n"
+        f"- 유메"
+    ).strip()
+
+    # If OpenAI isn't configured, return fallback.
+    if _get_client() is None:
+        return fallback
+
+    instructions = (
+        YUME_ROLE_PROMPT_KR
+        + "\n\n[출력 규칙]"
+        + "\n- 한국어"
+        + "\n- 6~10줄"
+        + "\n- 잔상/관측/상상 분위기 유지 (현실 사실 단정 금지)"
+        + "\n- 너무 길면 안 됨 (최대 900자)"
+        + "\n- 마지막 줄은 반드시 '- 유메'로 끝내기"
+        + "\n- AI/모델/LLM/프롬프트 같은 기술 언급 금지"
+        + "\n- 머리말/해설 금지 (편지 본문만 출력)"
+    )
+
+    prompt = (
+        f"[수신자 호칭]: {honorific}\n"
+        f"[수신자 표시이름]: {user_display_name}\n"
+        f"[아비도스 날씨(가상)]: {weather_label}\n"
+        f"[도장 마일스톤]: {int(milestone)}\n"
+        f"[부여 칭호]: {title}\n\n"
+        "위 정보를 참고해서, 다정하지만 사막 느낌이 나는 짧은 손편지를 써라.\n"
+        "편지 본문만 출력하라."
+    )
+
+    try:
+        # LLM 호출은 rare-path(마일스톤)이라 blocking 이어도 괜찮지만,
+        # 그래도 이벤트 루프를 덜 막기 위해 to_thread 사용.
+        import asyncio
+        from functools import partial
+
+        fn = partial(
+            generate_text_multiline,
+            instructions=instructions,
+            input_text=prompt,
+            max_output_tokens=420,
+            max_lines=12,
+            max_chars=900,
+        )
+        text = await asyncio.to_thread(fn)
+        text = (text or "").strip()
+        if not text:
+            return fallback
+        if not text.endswith("- 유메"):
+            # Ensure signature line exists.
+            if not text.endswith("유메"):
+                text = text.rstrip() + "\n- 유메"
+        if len(text) > 900:
+            text = text[:900].rstrip()
+        return text
+    except Exception:
+        return fallback

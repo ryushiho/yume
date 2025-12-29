@@ -1,12 +1,18 @@
 """yume_db.py
 
-Phase0 foundation: a tiny SQLite wrapper for YumeBot.
+SQLite helper for YumeBot.
 
-- Single file DB at config.YUME_DB_FILE
-- Safe to call from multiple tasks (opens a new connection per operation)
-- Keeps schema creation centralized (init_db)
+Design goals
+- Boring and predictable.
+- Single file DB at config.YUME_DB_FILE.
+- Safe with asyncio (opens a new connection per operation).
+- Light migrations only (additive tables/columns).
 
-We intentionally keep this *boring* and predictable.
+Schema versions
+v1: user_settings, world_state
+v2: bot_config, daily_rules, rule_suggestions
+v3: daily_meals
+v4: stamps opt-in + rewards/events logs
 """
 
 from __future__ import annotations
@@ -15,7 +21,7 @@ import os
 import sqlite3
 import time
 from contextlib import contextmanager
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
 from config import YUME_DB_FILE
 
@@ -25,7 +31,7 @@ def _connect() -> sqlite3.Connection:
     con = sqlite3.connect(
         YUME_DB_FILE,
         timeout=10,
-        isolation_level=None,  # autocommit; we'll manage transactions explicitly
+        isolation_level=None,  # autocommit; we manage transactions explicitly
         check_same_thread=False,
     )
     con.row_factory = sqlite3.Row
@@ -52,6 +58,7 @@ def connect() -> Iterator[sqlite3.Connection]:
 @contextmanager
 def transaction() -> Iterator[sqlite3.Connection]:
     """BEGIN IMMEDIATE transaction to avoid writer starvation."""
+
     with connect() as con:
         con.execute("BEGIN IMMEDIATE;")
         try:
@@ -95,9 +102,10 @@ def init_db() -> None:
     - Only additive changes (new tables / new columns)
     - Schema version tracked via schema_meta('schema_version')
     """
+
     now = int(time.time())
 
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     with transaction() as con:
         con.execute(
@@ -119,6 +127,18 @@ def init_db() -> None:
         except Exception:
             current_version = 0
 
+        def _add_column(table: str, col_def: str) -> None:
+            """Add a column if missing (idempotent)."""
+
+            try:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {col_def};")
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if "duplicate column" in msg or "already exists" in msg:
+                    return
+                raise
+
+        # ===== v1 =====
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS user_settings (
@@ -157,7 +177,7 @@ def init_db() -> None:
                 ("clear", now, now + 6 * 3600, now),
             )
 
-        # ===== Phase3 (schema v2): rules + suggestions + bot_config =====
+        # ===== v2 =====
         if current_version < 2:
             con.execute(
                 """
@@ -196,7 +216,7 @@ def init_db() -> None:
                 """
             )
 
-        # ===== Phase4 (schema v3): daily meals cache =====
+        # ===== v3 =====
         if current_version < 3:
             con.execute(
                 """
@@ -205,6 +225,41 @@ def init_db() -> None:
                   meal_text TEXT NOT NULL,
                   created_at INTEGER NOT NULL,
                   last_requested_at INTEGER NOT NULL
+                );
+                """
+            )
+
+        # ===== v4 =====
+        if current_version < 4:
+            _add_column("user_settings", "stamps_opt_in INTEGER NOT NULL DEFAULT 1")
+            _add_column("user_settings", "stamps_rewarded INTEGER NOT NULL DEFAULT 0")
+            _add_column("user_settings", "stamp_title TEXT NOT NULL DEFAULT ''")
+            _add_column("user_settings", "last_reward_at INTEGER NOT NULL DEFAULT 0")
+
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS stamp_events (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id INTEGER NOT NULL,
+                  guild_id INTEGER,
+                  reason TEXT,
+                  delta INTEGER NOT NULL,
+                  stamps_after INTEGER NOT NULL,
+                  created_at INTEGER NOT NULL
+                );
+                """
+            )
+
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS stamp_rewards (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id INTEGER NOT NULL,
+                  guild_id INTEGER,
+                  milestone INTEGER NOT NULL,
+                  title TEXT NOT NULL,
+                  letter TEXT NOT NULL,
+                  created_at INTEGER NOT NULL
                 );
                 """
             )

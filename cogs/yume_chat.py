@@ -12,6 +12,7 @@ from discord.ext import commands
 from yume_brain import YumeBrain
 from yume_honorific import get_honorific
 from yume_send import reply_message
+from yume_stamps import maybe_award_stamp_message
 
 logger = logging.getLogger(__name__)
 
@@ -313,6 +314,9 @@ class YumeChatCog(commands.Cog):
             reply = "..."  # 비어 있으면 최소한 무언가 응답
 
         await reply_message(message, reply, mention_author=False, allow_glitch=True)
+
+        # Phase5: daily stamp (KST) on meaningful interaction
+        await maybe_award_stamp_message(message, reason="chat")
 
         if sess:
             sess.last_user_id = message.author.id

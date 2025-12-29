@@ -129,6 +129,7 @@ EXTENSIONS = [
     "cogs.aby_environment",
     "cogs.rule_maker",
     "cogs.survival_cooking",
+    "cogs.stamps",
     "cogs.blue_war",
     "cogs.music",
     "cogs.yume_diary",
