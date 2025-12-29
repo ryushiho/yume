@@ -2108,11 +2108,18 @@ class MusicCog(commands.Cog):
         except Exception:
             pass
 
+        # 혹시라도 player_task가 예외로 종료된 상태면 스킵 후에 다음 곡으로 못 넘어갈 수 있다.
+        # 스킵은 "다음 큐로 즉시 진행"을 보장해야 하므로 여기서 한 번 더 킥한다.
+        self._start_player_if_needed(interaction.guild.id)
+
         try:
             await interaction.response.send_message("넘길게. 으헤~", ephemeral=True)
         except Exception:
             pass
-        await self._refresh_from_interaction(interaction)
+
+        # UI 갱신은 비동기로 돌려서(버튼 콜백이 오래 걸리지 않게)
+        # 플레이어 루프가 다음 곡 시작을 늦추는 상황을 최대한 피한다.
+        asyncio.create_task(self._refresh_from_interaction(interaction))
 
     async def _stop(self, interaction: discord.Interaction):
         if interaction.guild is None:
