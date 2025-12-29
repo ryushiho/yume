@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import datetime
+import logging
 import random
+import re
 import time
 from typing import Optional
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from yume_send import send_ctx
-from yume_store import ensure_world_weather_rotated, get_world_state, set_world_weather
+from yume_store import ensure_world_weather_rotated, get_config, get_world_state, set_config, set_world_weather
+
+
+logger = logging.getLogger(__name__)
 
 
 OWNER_ID = 1433962010785349634
@@ -31,8 +36,15 @@ def _fmt_kst(ts: int) -> str:
     return dt.strftime("%m/%d %H:%M")
 
 
-def _roll_next_change_at(now: int) -> int:
-    return int(now + random.randint(4 * 3600, 6 * 3600))
+def _roll_next_change_at(now: int, weather: str) -> int:
+    """Phase2: 날씨별 지속 시간을 랜덤으로 굴려요."""
+
+    w = (weather or "clear").strip()
+    if w == "sandstorm":
+        return int(now + random.randint(45 * 60, 120 * 60))
+    if w == "cloudy":
+        return int(now + random.randint(3 * 3600, 6 * 3600))
+    return int(now + random.randint(4 * 3600, 8 * 3600))
 
 
 def _normalize_weather(arg: str) -> Optional[str]:
@@ -56,16 +68,103 @@ def _weather_one_liner(weather: str) -> str:
 
 
 class AbyEnvironmentCog(commands.Cog):
-    """Phase1: 아비도스 가상 날씨(환경) 조회/관리"""
+    """Phase2: 아비도스 가상 날씨(환경)
+
+    - 자동(백그라운드) 로테이션: next_change_at이 지나면 주기적으로 알아서 갱신
+    - 변화 시간 랜덤(날씨별 지속 시간 범위)
+    - (옵션) 날씨 변화 알림 채널 지원
+    """
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        if not self._weather_loop.is_running():
+            self._weather_loop.start()
+
+    def cog_unload(self) -> None:
+        try:
+            self._weather_loop.cancel()
+        except Exception:
+            pass
+
+    @tasks.loop(seconds=60)
+    async def _weather_loop(self) -> None:
+        """Background weather rotation.
+
+        - Safe: only writes when the scheduled time has passed.
+        - Does not spam by default; announcements are opt-in.
+        """
+
+        try:
+            prev = get_world_state()
+            now = int(time.time())
+            next_at = int(prev.get("weather_next_change_at") or 0)
+            if next_at > 0 and now < next_at:
+                return
+
+            prev_weather = str(prev.get("weather") or "clear")
+            prev_changed_at = int(prev.get("weather_changed_at") or 0)
+
+            new_state = ensure_world_weather_rotated(now_ts=now)
+            new_weather = str(new_state.get("weather") or "clear")
+            new_changed_at = int(new_state.get("weather_changed_at") or 0)
+
+            # If rotated (changed_at updated), announce if configured.
+            if new_changed_at != prev_changed_at:
+                await self._maybe_announce_change(prev_weather, new_weather, new_state)
+
+        except Exception:
+            logger.exception("AbyEnvironment: weather loop failed")
+
+    @_weather_loop.before_loop
+    async def _before_weather_loop(self) -> None:
+        await self.bot.wait_until_ready()
+
+    async def _maybe_announce_change(self, prev_weather: str, new_weather: str, state: dict) -> None:
+        chan_id_s = get_config("aby_weather_announce_channel_id", None)
+        if not chan_id_s:
+            return
+
+        try:
+            chan_id = int(chan_id_s)
+        except Exception:
+            return
+
+        ch = self.bot.get_channel(chan_id)
+        if ch is None:
+            try:
+                ch = await self.bot.fetch_channel(chan_id)
+            except Exception:
+                return
+
+        if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+            return
+
+        label_prev = WEATHER_LABEL.get(prev_weather, prev_weather)
+        label_new = WEATHER_LABEL.get(new_weather, new_weather)
+
+        changed_at = int(state.get("weather_changed_at") or 0)
+        next_at = int(state.get("weather_next_change_at") or 0)
+
+        embed = discord.Embed(
+            title="아비도스 환경 변화",
+            description=_weather_one_liner(new_weather),
+            color=discord.Color.orange(),
+        )
+        embed.add_field(name="변화", value=f"`{label_prev}` → `{label_new}`", inline=False)
+        embed.add_field(name="변화 시각", value=f"`{_fmt_kst(changed_at)}`", inline=True)
+        embed.add_field(name="다음 변화(예상)", value=f"`{_fmt_kst(next_at)}`", inline=True)
+
+        try:
+            await ch.send(embed=embed)
+        except Exception:
+            # Ignore send failures (missing perms etc.)
+            return
 
     @commands.command(name="날씨")
     async def weather_status(self, ctx: commands.Context) -> None:
         """현재 아비도스 가상 날씨를 보여줘요."""
         try:
-            # Phase1: lazy rotation (no background task)
+            # Phase2: background loop also rotates; this is still safe and idempotent.
             state = ensure_world_weather_rotated()
         except Exception:
             await send_ctx(ctx, "날씨 기록을 읽다가 모래가… 들어갔나 봐. 잠깐 뒤에 다시 해줄래?", allow_glitch=False)
@@ -88,6 +187,56 @@ class AbyEnvironmentCog(commands.Cog):
 
         await ctx.send(embed=embed)
 
+    @commands.command(name="날씨알림")
+    async def weather_announce(self, ctx: commands.Context, *, arg: str = "") -> None:
+        """!날씨알림 [#채널|끄기]
+
+        - 설정하면 날씨가 바뀔 때 자동으로 공지해요.
+        - 기본은 OFF(스팸 방지).
+        """
+
+        if ctx.guild is not None:
+            is_manager = bool(getattr(ctx.author, "guild_permissions", None) and ctx.author.guild_permissions.manage_guild)
+        else:
+            is_manager = False
+
+        if int(ctx.author.id) != OWNER_ID and not is_manager:
+            await send_ctx(ctx, "이건… 공지 채널 설정이라서, 관리자만 만질 수 있어.", allow_glitch=False)
+            return
+
+        a = (arg or "").strip()
+        if not a:
+            cur = get_config("aby_weather_announce_channel_id", None)
+            if cur:
+                await send_ctx(ctx, f"날씨 알림: ON (채널 ID `{cur}`)")
+            else:
+                await send_ctx(ctx, "날씨 알림: OFF\n켜려면 `!날씨알림 #채널` 또는 끄려면 `!날씨알림 끄기`")
+            return
+
+        if a in {"끄기", "off", "OFF", "해제", "없음"}:
+            set_config("aby_weather_announce_channel_id", "")
+            await send_ctx(ctx, "오케이~ 이제부터 날씨 변화 공지는 안 해. (OFF)")
+            return
+
+        # Accept channel mention: <#id>
+        ch = None
+        if ctx.message.channel_mentions:
+            ch = ctx.message.channel_mentions[0]
+        else:
+            # Try parse raw id
+            try:
+                cid = int(re.sub(r"[^0-9]", "", a))
+                ch = self.bot.get_channel(cid)
+            except Exception:
+                ch = None
+
+        if ch is None:
+            await send_ctx(ctx, "음… 채널을 못 찾았어. `#채널`로 지정해줘.")
+            return
+
+        set_config("aby_weather_announce_channel_id", str(int(ch.id)))
+        await send_ctx(ctx, f"좋아! 이제 날씨 바뀌면 {ch.mention} 에 공지할게.")
+
     @commands.command(name="날씨설정")
     async def weather_set(self, ctx: commands.Context, *, weather_arg: str) -> None:
         """!날씨설정 <맑음|흐림|모래폭풍>
@@ -109,7 +258,7 @@ class AbyEnvironmentCog(commands.Cog):
             return
 
         now = int(time.time())
-        next_at = _roll_next_change_at(now)
+        next_at = _roll_next_change_at(now, w)
         try:
             set_world_weather(w, changed_at=now, next_change_at=next_at)
         except Exception:

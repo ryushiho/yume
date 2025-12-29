@@ -271,8 +271,8 @@ def ensure_world_weather_rotated(*, now_ts: Optional[int] = None) -> Dict[str, A
     """Return current world_state, rotating weather if it's past next_change_at.
 
     Design:
-    - No background task required.
-    - Rotation is triggered lazily when features query the world state.
+    - Rotation can be triggered lazily when features query the world state.
+    - (Phase2) A background task may also call this to keep the world updated.
 
     Weather weights (Phase1):
     - clear: 55%
@@ -299,20 +299,40 @@ def ensure_world_weather_rotated(*, now_ts: Optional[int] = None) -> Dict[str, A
     if now < next_at:
         return state
 
-    # Roll a new weather. Avoid repeating sandstorm too often.
-    # (It can repeat, but keep it rare.)
+    def _roll_next_change_at(now_ts: int, w: str) -> int:
+        """Phase2: weather duration is random (per weather).
+
+        - clear: 4~8 hours
+        - cloudy: 3~6 hours
+        - sandstorm: 45~120 minutes
+        """
+
+        if w == "sandstorm":
+            return int(now_ts + random.randint(45 * 60, 120 * 60))
+        if w == "cloudy":
+            return int(now_ts + random.randint(3 * 3600, 6 * 3600))
+        return int(now_ts + random.randint(4 * 3600, 8 * 3600))
+
+    # Roll a new weather.
+    # - Avoid repeating the same weather back-to-back when possible.
+    # - Avoid repeating sandstorm too often.
     def _roll(prev: str) -> str:
         if prev == "sandstorm":
             choices = ["clear", "cloudy", "sandstorm"]
-            weights = [0.65, 0.30, 0.05]
+            weights = [0.70, 0.28, 0.02]
         else:
             choices = ["clear", "cloudy", "sandstorm"]
             weights = [0.55, 0.30, 0.15]
+
+        # Try a few times to avoid exact repeat.
+        for _ in range(3):
+            w = random.choices(choices, weights=weights, k=1)[0]
+            if w != prev:
+                return w
         return random.choices(choices, weights=weights, k=1)[0]
 
     new_weather = _roll(weather)
-    # 4~6 hours
-    new_next = int(now + random.randint(4 * 3600, 6 * 3600))
+    new_next = _roll_next_change_at(now, new_weather)
     set_world_weather(new_weather, changed_at=now, next_change_at=new_next)
     return get_world_state()
 
