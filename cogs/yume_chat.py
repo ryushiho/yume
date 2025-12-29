@@ -11,6 +11,7 @@ from discord.ext import commands
 
 from yume_brain import YumeBrain
 from yume_honorific import get_honorific
+from yume_send import reply_message
 
 logger = logging.getLogger(__name__)
 
@@ -245,10 +246,12 @@ class YumeChatCog(commands.Cog):
             if message.author.id == DEV_USER_ID and self.brain_error:
                 debug_suffix = f"\n\n[디버그 brain_error: {self.brain_error}]"
 
-            await message.reply(
+            await reply_message(
+                message,
                 "현재 대사를 생성하는 엔진 초기화에 실패해서, 프리토킹을 사용할 수 없습니다."
                 + debug_suffix,
                 mention_author=False,
+                allow_glitch=False,
             )
             return
 
@@ -277,10 +280,12 @@ class YumeChatCog(commands.Cog):
         reason = result.get("reason", "ok")
 
         if not ok and reason == "limit_exceeded":
-            await message.reply(
+            await reply_message(
+                message,
                 "이번 달에 유메가 쓸 수 있는 말 예산을 다 써버렸어요. "
                 "다음 달에 다시 이야기해요.",
                 mention_author=False,
+                allow_glitch=False,
             )
             return
         elif not ok:
@@ -296,16 +301,18 @@ class YumeChatCog(commands.Cog):
             else:
                 reply = reply + dev_suffix
 
-            await message.reply(
+            await reply_message(
+                message,
                 reply,
                 mention_author=False,
+                allow_glitch=False,
             )
             return
 
         if not reply.strip():
             reply = "..."  # 비어 있으면 최소한 무언가 응답
 
-        await message.reply(reply, mention_author=False)
+        await reply_message(message, reply, mention_author=False, allow_glitch=True)
 
         if sess:
             sess.last_user_id = message.author.id

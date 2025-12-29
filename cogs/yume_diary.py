@@ -6,6 +6,7 @@ from discord.ext import commands, tasks
 
 from yume_brain import YumeBrain
 from yume_honorific import get_honorific
+from yume_send import send_ctx
 
 
 DAILY_FEEDBACK_TIME_UTC = datetime.time(hour=14, minute=59)
@@ -120,7 +121,7 @@ class YumeDiaryCog(commands.Cog):
                 user=ctx.author,
                 fallback="유메가 지금은 긴 이야기를 하기 힘들어. 설정을 한 번 봐줘… 흐음~",
             )
-            await ctx.send(msg)
+            await send_ctx(ctx, msg)
             return
 
         user = ctx.author
@@ -172,7 +173,7 @@ class YumeDiaryCog(commands.Cog):
             except Exception:
                 pass
 
-        await ctx.send(reply)
+        await send_ctx(ctx, reply)
 
     @commands.command(name="유메오늘어땠어", help="오늘 유메가 느끼는 하루 총평을 짧게 들어요.")
     async def cmd_yume_today_short(self, ctx: commands.Context):
@@ -186,7 +187,7 @@ class YumeDiaryCog(commands.Cog):
                 user=ctx.author,
                 fallback="지금은 유메 머리가 좀 복잡해서, 하루를 정리하기가 어려워… 흐음~",
             )
-            await ctx.send(msg)
+            await send_ctx(ctx, msg)
             return
 
         user = ctx.author
@@ -227,7 +228,7 @@ class YumeDiaryCog(commands.Cog):
             fallback="크게 특별한 건 없었지만… 조용히 버티긴 했어. 후배들이랑 얘기한 순간들은 좋았고.",
         )
 
-        await ctx.send(reply)
+        await send_ctx(ctx, reply)
 
     @commands.command(name="유메기분", help="지금 유메의 기분이 어떤지 설명해줘요.")
     async def cmd_yume_mood(self, ctx: commands.Context):
@@ -241,7 +242,7 @@ class YumeDiaryCog(commands.Cog):
                 user=ctx.author,
                 fallback="지금은 유메도 스스로 기분을 잘 정리 못 하겠어… 조금만 있다가 다시 물어봐줄래?",
             )
-            await ctx.send(msg)
+            await send_ctx(ctx, msg)
             return
 
         user = ctx.author
@@ -280,7 +281,7 @@ class YumeDiaryCog(commands.Cog):
             fallback="음… 완전 최고는 아니어도, 선생님이랑 얘기할 힘 정도는 있는 기분이야~",
         )
 
-        await ctx.send(reply)
+        await send_ctx(ctx, reply)
 
     @commands.command(name="유메관계", help="지금 유메와 나의 관계를 들려줘요.")
     async def cmd_yume_relation(self, ctx: commands.Context):
@@ -294,7 +295,7 @@ class YumeDiaryCog(commands.Cog):
                 user=ctx.author,
                 fallback="지금은 관계 이야기를 정리할 여유가 없네… 나중에 다시 물어봐줘.",
             )
-            await ctx.send(msg)
+            await send_ctx(ctx, msg)
             return
 
         user = ctx.author
@@ -336,7 +337,7 @@ class YumeDiaryCog(commands.Cog):
             fallback="적어도 유메 기준으론, 꽤 신경 쓰이는 후배 쪽에 들어가. 너무 도망만 치지만 않으면 좋겠는데?",
         )
 
-        await ctx.send(reply)
+        await send_ctx(ctx, reply)
 
 
     @tasks.loop(time=DAILY_FEEDBACK_TIME_UTC)

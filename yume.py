@@ -125,6 +125,7 @@ DEV_USER_ID = 1433962010785349634
 
 EXTENSIONS = [
     "cogs.admin",
+    "cogs.noise_settings",
     "cogs.aby_environment",
     "cogs.blue_war",
     "cogs.music",

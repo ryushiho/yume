@@ -66,7 +66,7 @@ class AbyEnvironmentCog(commands.Cog):
         try:
             state = get_world_state()
         except Exception:
-            await ctx.send("날씨 기록을 읽다가 모래가… 들어갔나 봐. 잠깐 뒤에 다시 해줄래?")
+            await send_ctx(ctx, "날씨 기록을 읽다가 모래가… 들어갔나 봐. 잠깐 뒤에 다시 해줄래?", allow_glitch=False)
             return
 
         weather = str(state.get("weather") or "clear")
@@ -98,12 +98,12 @@ class AbyEnvironmentCog(commands.Cog):
             is_manager = False
 
         if int(ctx.author.id) != OWNER_ID and not is_manager:
-            await ctx.send("이건… 학생회장(유메) 비상 스위치라서, 아무나 만지면 안 돼~")
+            await send_ctx(ctx, "이건… 학생회장(유메) 비상 스위치라서, 아무나 만지면 안 돼~", allow_glitch=False)
             return
 
         w = _normalize_weather(weather_arg)
         if not w:
-            await ctx.send("음… 그건 날씨로 인식이 안 돼. `맑음/흐림/모래폭풍` 중에서 골라줘~")
+            await send_ctx(ctx, "음… 그건 날씨로 인식이 안 돼. `맑음/흐림/모래폭풍` 중에서 골라줘~", allow_glitch=False)
             return
 
         now = int(time.time())
@@ -111,10 +111,10 @@ class AbyEnvironmentCog(commands.Cog):
         try:
             set_world_weather(w, changed_at=now, next_change_at=next_at)
         except Exception:
-            await ctx.send("설정하다가 모래폭풍이… 덮쳤어. 다시 한 번만!")
+            await send_ctx(ctx, "설정하다가 모래폭풍이… 덮쳤어. 다시 한 번만!", allow_glitch=False)
             return
 
-        await ctx.send(f"오케이~ 지금부터 `{WEATHER_LABEL.get(w, w)}`! 다음 변화는 `{_fmt_kst(next_at)}`쯤이야.")
+        await send_ctx(ctx, f"오케이~ 지금부터 `{WEATHER_LABEL.get(w, w)}`! 다음 변화는 `{_fmt_kst(next_at)}`쯤이야.")
 
 
 async def setup(bot: commands.Bot):
