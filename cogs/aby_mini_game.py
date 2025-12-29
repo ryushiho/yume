@@ -106,7 +106,7 @@ class AbyMiniGameCog(commands.Cog):
             "- `!빚상환 <금액|전체>` : 내 크레딧으로 빚 상환\n\n"
             "**스토리**\n"
             f"- 시작 빚: **{_fmt(ABY_DEFAULT_DEBT)} 크레딧**\n"
-            f"- 일일 이자율: **{ABY_DEFAULT_INTEREST_RATE:.2f}** (매일 한 번 적용)\n\n"
+            f"- 일일 이자율: **{ABY_DEFAULT_INTEREST_RATE * 100:.2f}%** (매일 한 번 적용)\n\n"
             "으헤헤… 갚을 수 있을지는 모르겠지만, 그래도… 같이 노력해보자.\n"
         )
         await send_ctx(ctx, txt, allow_glitch=True)
@@ -218,7 +218,7 @@ class AbyMiniGameCog(commands.Cog):
         txt = (
             f"{hon}… 아비도스 재정 보고서 가져왔어.\n"
             f"- 현재 빚: **{_fmt(debt)} 크레딧**\n"
-            f"- 일일 이자율: **{rate:.2f}**\n"
+            f"- 일일 이자율: **{rate * 100:.2f}%**\n"
             f"- 오늘 기준 적용일: `{last}`\n\n"
             "이 숫자… 계속 커져. 그래서 더… 다 같이 버티는 거야. 으헤~\n"
         )

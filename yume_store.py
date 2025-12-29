@@ -19,7 +19,23 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, Optional
 
-from yume_db import execute, fetchone, fetchall
+from yume_db import execute, fetchone, fetchall, transaction
+
+
+def now_ts() -> int:
+    """Return current unix timestamp (seconds)."""
+
+    return int(time.time())
+
+
+def get_con():
+    """Write transaction context (alias).
+
+    Some features need multi-step updates; we keep them atomic by reusing
+    yume_db.transaction().
+    """
+
+    return transaction()
 
 
 # =========================
@@ -558,7 +574,9 @@ import datetime
 
 
 ABY_DEFAULT_DEBT = 900_000_000  # 9억 크레딧
-ABY_DEFAULT_INTEREST_RATE = 0.35  # 일일 이자율 (35%)
+# NOTE: "0.35"는 0.35% (퍼센트) 의미로 사용한다. (즉, 0.0035)
+#       9억 * 0.35% = 3,150,000/day 수준이라, "갚기 어려운" 서사에 맞는다.
+ABY_DEFAULT_INTEREST_RATE = 0.0035  # 일일 이자율 (0.35%)
 
 
 def _date_from_ymd(ymd: str) -> datetime.date:
@@ -716,6 +734,15 @@ def apply_guild_interest_upto_today(guild_id: int, today_ymd: str) -> Dict[str, 
 
         debt = int(row[0])
         rate = float(row[1])
+
+        # Backward-compat: older builds accidentally stored "0.35" as 35%.
+        # If it looks like a percent value, convert to a fraction.
+        if rate > 0.05:  # >5%/day is not our intended scale
+            rate = rate / 100.0
+            con.execute(
+                "UPDATE aby_guild_debt SET interest_rate=?, updated_at=? WHERE guild_id=?;",
+                (rate, now_ts(), gid),
+            )
         last_ymd = str(row[2] or "")
         if not last_ymd:
             last_ymd = today_ymd
