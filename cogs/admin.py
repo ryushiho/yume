@@ -1,4 +1,6 @@
 
+import datetime
+
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -6,6 +8,15 @@ from discord import app_commands
 from yume_store import get_world_state
 
 OWNER_ID = 1433962010785349634
+
+KST = datetime.timezone(datetime.timedelta(hours=9))
+
+
+def _fmt_kst(ts: int) -> str:
+    if not ts:
+        return "-"
+    dt = datetime.datetime.fromtimestamp(int(ts), tz=KST)
+    return dt.strftime("%m/%d %H:%M")
 
 
 class AdminCog(commands.Cog):
@@ -91,11 +102,15 @@ class AdminCog(commands.Cog):
         # Phase0: show virtual world state (weather) for debugging.
         try:
             world = get_world_state()
+            w = str(world.get("weather") or "clear")
+            changed_at = int(world.get("weather_changed_at") or 0)
+            next_at = int(world.get("weather_next_change_at") or 0)
             embed.add_field(
                 name="아비도스 환경(가상 날씨)",
                 value=(
-                    f"weather: `{world.get('weather')}`\n"
-                    f"next_change_at: `{world.get('next_change_at')}`"
+                    f"weather: `{w}`\n"
+                    f"changed_at(KST): `{_fmt_kst(changed_at)}`\n"
+                    f"next_change_at(KST): `{_fmt_kst(next_at)}`"
                 ),
                 inline=False,
             )

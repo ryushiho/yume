@@ -29,6 +29,7 @@ from discord.ext import commands
 
 from yume_prompt import YUME_ROLE_PROMPT_KR
 from yume_honorific import get_honorific
+from yume_store import get_world_state
 
 try:
     from openai import OpenAI  # type: ignore
@@ -38,6 +39,13 @@ except Exception:  # pragma: no cover
 logger = logging.getLogger("yume.ai")
 
 BASE_DIR = Path(__file__).parent
+
+
+WEATHER_LABEL = {
+    "clear": "맑음",
+    "cloudy": "흐림",
+    "sandstorm": "대형 모래폭풍",
+}
 SYSTEM_DIR = BASE_DIR / "data" / "system"
 USER_STATE_DIR = BASE_DIR / "data" / "user_state"
 
@@ -319,6 +327,14 @@ class YumeSpeaker:
             affection_score = self.core.get_affection(str(user_id))
             stage = self.core.get_affection_stage(str(user_id))
 
+        # Phase1: virtual "Abydos weather" context (kept lightweight).
+        try:
+            world = get_world_state()
+            weather = str(world.get("weather") or "clear")
+        except Exception:
+            weather = "clear"
+        weather_label = WEATHER_LABEL.get(weather, weather)
+
         if self.client is None:
             return "OpenAI 설정 오류로 인해 유메 대사를 생성할 수 없습니다."
 
@@ -328,6 +344,8 @@ class YumeSpeaker:
             "- 반드시 유메(쿠치나시 유메)로서 말한다. AI/모델/LLM 같은 기술 언급 금지.\n"
             "- 자기 호칭은 '나(유메)' 1인칭으로 자연스럽게.\n"
             f"- 상대 호칭은 기본 '{honorific}'. (user_name은 참고용)\n"
+            f"- 현재 아비도스 날씨(가상): {weather_label}. "
+            "모래폭풍이면 모래/통신 장애로 잠깐 당황하는 묘사를 한 번 정도 넣어도 된다(가독성 유지).\n"
             "- '으헤~'는 거의 쓰지 않는다. 대신 '에헤헤', '와아!', '흐음~' 같은 감탄사를 가끔 사용.\n"
             "- '아저씨' 같은 말투는 절대 금지.\n"
             "- 1~2문장, 최대 90자 정도로 짧게.\n"
@@ -343,6 +361,7 @@ class YumeSpeaker:
             f"[상황 설명]: {event_hint}\n"
             f"[유저 이름(참고)]: {user_name}\n"
             f"[기본 호칭]: {honorific}\n"
+            f"[아비도스 날씨(가상)]: {weather_label}\n"
             f"[유저는 개발자인가?]: {'예' if is_dev else '아니오'}\n"
             f"[호감도 점수]: {affection_score:.1f} (-100~100)\n"
             f"[호감도 단계]: {stage} "

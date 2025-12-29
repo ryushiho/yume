@@ -10,6 +10,14 @@ except ImportError:
     OpenAI = None  # 나중에 오류 메시지로 안내
 
 from yume_prompt import YUME_ROLE_PROMPT_KR
+from yume_store import get_world_state
+
+
+WEATHER_LABEL = {
+    "clear": "맑음",
+    "cloudy": "흐림",
+    "sandstorm": "대형 모래폭풍",
+}
 
 
 
@@ -253,6 +261,14 @@ class YumeBrain:
         user_nick = (user_profile or {}).get("nickname", "")
         honorific = (user_profile or {}).get("honorific", "선생님")
 
+        # Phase1: virtual "Abydos weather" context.
+        try:
+            world = get_world_state()
+            weather = str(world.get("weather") or "clear")
+        except Exception:
+            weather = "clear"
+        weather_label = WEATHER_LABEL.get(weather, weather)
+
         # 유저가 지정한 유메 Role Definition을 시스템 프롬프트로 그대로 사용한다.
         # (모델/AI/LLM 언급 금지 포함)
         base_desc = YUME_ROLE_PROMPT_KR
@@ -265,7 +281,14 @@ class YumeBrain:
             f"- loneliness(외로움): {loneliness}\n"
             f"- focus(집중도): {focus}\n"
             f"- 이 유저와의 bond(친밀도): {bond_level}\n"
+            f"- 아비도스 날씨(가상): {weather_label}\n"
         )
+
+        if weather == "sandstorm":
+            state_desc += (
+                "- (연출) 대형 모래폭풍이라서, 가끔 모래/통신 장애로 잠깐 당황하는 묘사를 섞어도 돼. "
+                "단, 가독성은 유지하고 잡음(지…지지직…)은 0~1회만.\n"
+            )
 
         nick_line = f"- 닉네임(참고): {user_nick}\n" if user_nick else ""
         user_desc = (
