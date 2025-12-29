@@ -40,21 +40,55 @@ WEATHER_LABEL = {
 }
 
 
-# Phase3: 전리품/아이템(아주 작게, 아주 안전하게)
+
+# Phase3~4: 전리품/아이템(가벼운 제작/판매 재료 포함)
+# - usable: mask, drone, kit
+# - materials: scrap/cloth/filter/battery/circuit (공방 재료)
 ITEMS = {
     "mask": {"name": "방진마스크", "desc": "2시간 동안 모래폭풍 페널티 완화"},
     "drone": {"name": "탐사용 드론", "desc": "다음 탐사 크레딧 +25% (1회)"},
+    "kit": {"name": "탐사키트", "desc": "다음 탐사 성공률 +10% (1회)"},
+
+    # Materials (Phase4)
+    "scrap": {"name": "고철", "desc": "공방 재료(제작/판매용)"},
+    "cloth": {"name": "천조각", "desc": "공방 재료(제작/판매용)"},
+    "filter": {"name": "필터", "desc": "공방 재료(제작/판매용)"},
+    "battery": {"name": "배터리", "desc": "공방 재료(제작/판매용)"},
+    "circuit": {"name": "회로기판", "desc": "공방 재료(제작/판매용)"},
 }
+
 
 
 ITEM_ALIASES = {
     "방진": "mask",
     "마스크": "mask",
     "방진마스크": "mask",
+
     "드론": "drone",
     "탐사용드론": "drone",
     "탐사드론": "drone",
+
+    "탐사키트": "kit",
+    "키트": "kit",
+
+    "고철": "scrap",
+    "스크랩": "scrap",
+    "부품": "scrap",
+
+    "천": "cloth",
+    "천조각": "cloth",
+
+    "필터": "filter",
+
+    "배터리": "battery",
+
+    "회로": "circuit",
+    "기판": "circuit",
+    "회로기판": "circuit",
 }
+
+
+MATERIAL_KEYS = {"scrap", "cloth", "filter", "battery", "circuit"}
 
 
 def _apply_interest_once(debt: int, rate: float) -> int:
@@ -152,7 +186,7 @@ class AbyMiniGameCog(commands.Cog):
             "- `!탐사` : 하루 1회 탐사해서 크레딧(가끔 물) 얻기\n"
             "- `!지갑` : 내 재화 확인\n"
             "- `!가방` : 탐사 전리품(아이템) 확인\n"
-            "- `!사용 <아이템>` : 아이템 사용 (버프)\n"
+            "- `!사용 <아이템>` : 아이템 사용 (버프)\n- `!공방` : 제작/판매 안내\n- `!제작 <아이템>` : 아이템 제작\n- `!판매 <재료> [수량|전체]` : 재료 판매\n"
             "- `!빚현황` : 우리 학교 빚/이자 확인\n"
             "- `!빚상환 <금액|전체>` : 내 크레딧으로 빚 상환\n\n"
             "**환경(날씨)**\n"
@@ -205,6 +239,8 @@ class AbyMiniGameCog(commands.Cog):
                 lines.append(f"- 활성 버프: **방진마스크** (만료 `{_fmt_ts_kst(exp)}`)")
             elif bkey == "drone":
                 lines.append(f"- 활성 버프: **탐사용 드론** (남은 {stacks}회, 만료 `{_fmt_ts_kst(exp)}`)")
+            elif bkey == "kit":
+                lines.append(f"- 활성 버프: **탐사키트** (남은 {stacks}회, 만료 `{_fmt_ts_kst(exp)}`)")
             else:
                 lines.append(f"- 활성 버프: **{bkey}** (만료 `{_fmt_ts_kst(exp)}`)")
         else:
@@ -220,7 +256,8 @@ class AbyMiniGameCog(commands.Cog):
                 name = meta.get("name") if meta else k
                 lines.append(f"  • {name}: **{_fmt(qty)}**")
 
-        lines.append("\n사용: `!사용 방진마스크` / `!사용 드론`")
+        lines.append("\n사용: `!사용 방진마스크` / `!사용 드론` / `!사용 탐사키트`")
+        lines.append("공방: `!공방` (제작/판매)")
         await send_ctx(ctx, "\n".join(lines), allow_glitch=True)
 
     @commands.command(name="사용")
@@ -228,7 +265,7 @@ class AbyMiniGameCog(commands.Cog):
         hon = get_honorific(ctx.author, ctx.guild)
         raw = (item_name or "").strip()
         if not raw:
-            await send_ctx(ctx, f"{hon} 사용법: `!사용 <아이템>`\n예) `!사용 방진마스크` / `!사용 드론`", allow_glitch=True)
+            await send_ctx(ctx, f"{hon} 사용법: `!사용 <아이템>`\n예) `!사용 방진마스크` / `!사용 드론` / `!사용 탐사키트`", allow_glitch=True)
             return
 
         key = None
@@ -249,7 +286,20 @@ class AbyMiniGameCog(commands.Cog):
             await send_ctx(ctx, f"{hon} 그 아이템은… 잘 모르겠어.\n가능: {avail}", allow_glitch=True)
             return
 
+
+
+        # 재료 아이템은 여기서 사용하지 않아요(실수로 소모 방지)
+        if key not in {"mask", "drone", "kit"}:
+            meta = ITEMS.get(key) or {"name": key}
+            await send_ctx(
+                ctx,
+                f"{hon} 그건 그냥 재료야.\n`!공방`에서 제작하거나 `!판매`로 팔 수 있어. (아이템: {meta.get('name')})",
+                allow_glitch=True,
+            )
+            return
+
         if not consume_user_item(ctx.author.id, key, 1):
+
             await send_ctx(ctx, f"{hon}… 그건 가방에 없어. (`!가방` 확인!)", allow_glitch=True)
             return
 
@@ -274,6 +324,16 @@ class AbyMiniGameCog(commands.Cog):
             if prev_key and prev_stacks > 0 and prev_key != "drone":
                 extra = " (기존 버프는 덮어썼어…)"
             await send_ctx(ctx, f"{hon} 탐사용 드론 준비 완료!{extra}\n다음 탐사에서 크레딧이 **+25%** (1회). (만료 `{_fmt_ts_kst(exp)}`)")
+            return
+
+
+        if key == "kit":
+            exp = now + 24 * 3600
+            set_user_buff(ctx.author.id, buff_key="kit", stacks=1, expires_at=exp)
+            extra = ""
+            if prev_key and prev_stacks > 0 and prev_key != "kit":
+                extra = " (기존 버프는 덮어썼어…)"
+            await send_ctx(ctx, f"{hon} 탐사키트 준비 완료!{extra}\n다음 탐사에서 성공률이 **+10%** (1회). (만료 `{_fmt_ts_kst(exp)}`)")
             return
 
         # Fallback (shouldn't happen)
@@ -341,6 +401,13 @@ class AbyMiniGameCog(commands.Cog):
             fail_rng = (0, 3_000)
             water_p = 0.06
 
+        # Phase4: 탐사키트(성공률 +10%, 1회)
+        kit_applied = False
+        if bkey == "kit" and bstacks > 0:
+            success_p = min(0.90, success_p + 0.10)
+            water_p = min(0.20, water_p + 0.01)
+            kit_applied = True
+
         success = random.random() < success_p
         if success:
             credits = random.randint(*succ_rng)
@@ -371,6 +438,48 @@ class AbyMiniGameCog(commands.Cog):
             water += 1
             encounter_lines.append("- 조우: **물통** 발견! (+1 물)")
 
+        # Phase4: 공방 재료(고철/천/필터/배터리/회로)
+        # - 탐사 1회당 최대 1종만 드랍
+        mr = random.random()
+        mat_key = None
+        mat_qty = 0
+        if calc_weather == "sandstorm":
+            # 폭풍 속엔 고철이 더 굴러다녀…
+            if mr < 0.26:
+                mat_key = "scrap"
+                mat_qty = random.randint(2, 3)
+            elif mr < 0.34:
+                mat_key = "cloth"
+                mat_qty = 1
+            elif mr < 0.38:
+                mat_key = "filter"
+                mat_qty = 1
+            elif mr < 0.41:
+                mat_key = "battery"
+                mat_qty = 1
+            elif mr < 0.43:
+                mat_key = "circuit"
+                mat_qty = 1
+        else:
+            if mr < 0.18:
+                mat_key = "scrap"
+                mat_qty = random.randint(1, 2)
+            elif mr < 0.26:
+                mat_key = "cloth"
+                mat_qty = 1
+            elif mr < 0.31:
+                mat_key = "filter"
+                mat_qty = 1
+            elif mr < 0.34:
+                mat_key = "battery"
+                mat_qty = 1
+            elif mr < 0.36:
+                mat_key = "circuit"
+                mat_qty = 1
+
+        if mat_key and mat_qty > 0:
+            items_to_add.append((mat_key, mat_qty))
+
         # Phase3: 드론 버프(다음 탐사 크레딧 +25%, 1회)
         drone_applied = False
         if bkey == "drone" and bstacks > 0:
@@ -392,7 +501,7 @@ class AbyMiniGameCog(commands.Cog):
         # 성공적으로 반영된 후에만 전리품/버프 소모를 적용한다.
         for k, q in items_to_add:
             add_user_item(ctx.author.id, k, q)
-        if bkey == "drone" and bstacks > 0:
+        if bkey in {"drone", "kit"} and bstacks > 0:
             consume_user_buff_stack(ctx.author.id)
 
         new_credits = int(result.get("credits", 0))
@@ -485,13 +594,16 @@ class AbyMiniGameCog(commands.Cog):
             for k, q in items_to_add:
                 meta = ITEMS.get(k)
                 name = meta.get("name") if meta else k
-                loot_lines.append(f"- 전리품: {name} x{q}")
+                tag = "재료" if k in MATERIAL_KEYS else "전리품"
+                loot_lines.append(f"- {tag}: {name} x{q}")
 
         note = ""
         if weather != calc_weather:
             note = f" (버프 적용: `{label_calc}`로 계산)"
         if drone_applied:
             loot_lines.append("- 버프: 탐사용 드론 +25% 적용")
+        if kit_applied:
+            loot_lines.append("- 버프: 탐사키트 성공률 +10% 적용")
 
         parts = [
             f"{hon} 탐사 결과!",

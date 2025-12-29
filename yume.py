@@ -130,6 +130,7 @@ EXTENSIONS = [
     "cogs.aby_environment",
     "cogs.rule_maker",
         "cogs.aby_mini_game",
+        "cogs.aby_workshop",
     "cogs.survival_cooking",
     "cogs.stamps",
 "cogs.yume_diary",

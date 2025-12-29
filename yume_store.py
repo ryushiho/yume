@@ -826,6 +826,181 @@ def consume_user_item(user_id: int, item_key: str, qty: int = 1) -> bool:
     return True
 
 
+# ------------------------------
+# Phase6-2 Phase4: Craft / Sell helpers (atomic)
+# ------------------------------
+
+
+def get_user_item_qty(user_id: int, item_key: str) -> int:
+    """Return current qty for (user_id, item_key)."""
+
+    uid = int(user_id)
+    key = str(item_key).strip().lower()
+    if not key:
+        return 0
+    row = fetchone(
+        "SELECT qty FROM aby_inventory WHERE user_id=? AND item_key=?;",
+        (uid, key),
+    )
+    return int((row or {}).get('qty') or 0)
+
+
+def craft_user_items(
+    user_id: int,
+    *,
+    cost_credits: int,
+    req_items: dict[str, int],
+    out_items: dict[str, int],
+    memo: str = '',
+) -> dict:
+    """Atomic craft: spend credits + consume req_items + grant out_items.
+
+    Returns:
+      {ok: bool, reason?: str, credits_after?: int, missing?: list[(key, need, have)]}
+
+    Notes:
+    - This never partially consumes items.
+    - It logs to aby_economy_log(kind='craft') with delta_credits negative.
+    """
+
+    uid = int(user_id)
+    cost = max(0, int(cost_credits))
+    ensure_user_economy(uid)
+
+    # normalize dicts
+    req = {str(k).strip().lower(): int(v) for k, v in (req_items or {}).items() if str(k).strip() and int(v) > 0}
+    out = {str(k).strip().lower(): int(v) for k, v in (out_items or {}).items() if str(k).strip() and int(v) > 0}
+
+    now = now_ts()
+
+    with get_con() as con:
+        u = con.execute("SELECT credits FROM aby_user_economy WHERE user_id=?;", (uid,)).fetchone()
+        credits = int(u[0]) if u else 0
+        if credits < cost:
+            return {"ok": False, "reason": "credits", "credits": credits, "need": cost}
+
+        missing = []
+        for k, need in req.items():
+            row = con.execute(
+                "SELECT qty FROM aby_inventory WHERE user_id=? AND item_key=?;",
+                (uid, k),
+            ).fetchone()
+            have = int(row[0]) if row else 0
+            if have < need:
+                missing.append((k, int(need), int(have)))
+
+        if missing:
+            return {"ok": False, "reason": "items", "missing": missing}
+
+        if cost > 0:
+            con.execute(
+                "UPDATE aby_user_economy SET credits = MAX(0, credits - ?), updated_at=? WHERE user_id=?;",
+                (cost, now, uid),
+            )
+
+        for k, need in req.items():
+            con.execute(
+                "UPDATE aby_inventory SET qty = MAX(0, qty - ?), updated_at=? WHERE user_id=? AND item_key=?;",
+                (int(need), now, uid, k),
+            )
+
+        for k, q in out.items():
+            con.execute(
+                """
+                INSERT INTO aby_inventory(user_id, item_key, qty, updated_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(user_id, item_key) DO UPDATE SET
+                  qty = MAX(0, qty + excluded.qty),
+                  updated_at = excluded.updated_at;
+                """,
+                (uid, k, int(q), now),
+            )
+
+        con.execute(
+            """
+            INSERT INTO aby_economy_log(guild_id, user_id, kind, delta_credits, delta_water, delta_debt, memo, created_at)
+            VALUES(NULL, ?, 'craft', ?, 0, 0, ?, ?);
+            """,
+            (uid, -cost, (str(memo)[:200] if memo else None), now),
+        )
+
+    # re-read
+    after = get_user_economy(uid)
+    return {"ok": True, "credits_after": int(after.get('credits') or 0)}
+
+
+def sell_user_item(
+    user_id: int,
+    *,
+    item_key: str,
+    qty: int,
+    unit_price: int,
+    memo: str = '',
+) -> dict:
+    """Atomic sell: consume item qty and add credits.
+
+    qty:
+      - positive integer
+      - -1 means 'all'
+
+    Returns:
+      {ok: bool, reason?: str, sold?: int, earned?: int, credits_after?: int, have?: int}
+    """
+
+    uid = int(user_id)
+    key = str(item_key).strip().lower()
+    if not key:
+        return {"ok": False, "reason": "item"}
+
+    price = max(0, int(unit_price))
+    q_in = int(qty)
+
+    ensure_user_economy(uid)
+    now = now_ts()
+
+    with get_con() as con:
+        row = con.execute(
+            "SELECT qty FROM aby_inventory WHERE user_id=? AND item_key=?;",
+            (uid, key),
+        ).fetchone()
+        have = int(row[0]) if row else 0
+        if have <= 0:
+            return {"ok": False, "reason": "no_item", "have": have}
+
+        sell_q = have if q_in == -1 else max(0, q_in)
+        if sell_q <= 0:
+            return {"ok": False, "reason": "qty"}
+        if sell_q > have:
+            sell_q = have
+
+        earned = int(sell_q * price)
+
+        con.execute(
+            "UPDATE aby_inventory SET qty = MAX(0, qty - ?), updated_at=? WHERE user_id=? AND item_key=?;",
+            (sell_q, now, uid, key),
+        )
+
+        con.execute(
+            "UPDATE aby_user_economy SET credits = MAX(0, credits + ?), updated_at=? WHERE user_id=?;",
+            (earned, now, uid),
+        )
+
+        con.execute(
+            """
+            INSERT INTO aby_economy_log(guild_id, user_id, kind, delta_credits, delta_water, delta_debt, memo, created_at)
+            VALUES(NULL, ?, 'sell', ?, 0, 0, ?, ?);
+            """,
+            (uid, earned, (str(memo)[:200] if memo else None), now),
+        )
+
+    after = get_user_economy(uid)
+    return {
+        "ok": True,
+        "sold": sell_q,
+        "earned": earned,
+        "credits_after": int(after.get('credits') or 0),
+    }
+
 def get_user_buff(user_id: int) -> Dict[str, Any]:
     uid = int(user_id)
     row = fetchone(
