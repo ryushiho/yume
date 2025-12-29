@@ -457,6 +457,58 @@ def _parse_int(s: str, *, default: int, lo: int, hi: int) -> int:
     return _clamp_int(v, lo, hi)
 
 
+
+class SeekModal(discord.ui.Modal):
+    def __init__(self, cog: "MusicCog"):
+        super().__init__(title="⏩ 점프")
+        self.cog = cog
+
+        self.time = discord.ui.TextInput(
+            label="이동할 시간(초 또는 mm:ss)",
+            placeholder="예) 45  /  1:23",
+            required=True,
+            max_length=16,
+        )
+        self.add_item(self.time)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        t = (self.time.value or "").strip()
+        await self.cog._seek_from_ui(interaction, t)
+
+
+class SegmentModal(discord.ui.Modal):
+    def __init__(self, cog: "MusicCog"):
+        super().__init__(title="🎯 구간 설정")
+        self.cog = cog
+
+        self.start = discord.ui.TextInput(
+            label="시작 시간(초 또는 mm:ss)",
+            placeholder="예) 30  /  0:30",
+            required=True,
+            max_length=16,
+        )
+        self.end = discord.ui.TextInput(
+            label="끝 시간(초 또는 mm:ss)",
+            placeholder="예) 90  /  1:30",
+            required=True,
+            max_length=16,
+        )
+        self.ab = discord.ui.TextInput(
+            label="AB 반복(선택)",
+            placeholder="AB / 반복 / on (비우면 일반 구간)",
+            required=False,
+            max_length=12,
+        )
+        self.add_item(self.start)
+        self.add_item(self.end)
+        self.add_item(self.ab)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        s = (self.start.value or "").strip()
+        e = (self.end.value or "").strip()
+        m = (self.ab.value or "").strip()
+        await self.cog._segment_from_ui(interaction, s, e, m)
+
 class EQSettingsModal(discord.ui.Modal):
     title = "EQ 설정"
 
@@ -618,13 +670,40 @@ class MusicPanelView(discord.ui.View):
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._open_queue_manage(interaction)
 
+    @discord.ui.button(
+        label="점프",
+        style=discord.ButtonStyle.secondary,
+        emoji="⏩",
+        custom_id="yume_music_seek",
+        row=2,
+    )
+    async def seek_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        await interaction.response.send_modal(SeekModal(self.cog))
+
+    @discord.ui.button(
+        label="구간",
+        style=discord.ButtonStyle.secondary,
+        emoji="🎯",
+        custom_id="yume_music_segment",
+        row=2,
+    )
+    async def segment_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
+        if interaction.guild is None:
+            return
+        st = self.cog._state(interaction.guild.id)
+        if st.segment_start_sec is not None and st.segment_end_sec is not None:
+            await self.cog._clear_segment_from_ui(interaction)
+            return
+        await interaction.response.send_modal(SegmentModal(self.cog))
+
+
 
     @discord.ui.button(
         label="이퀄라이저 관리",
         style=discord.ButtonStyle.secondary,
         emoji="🎛️",
         custom_id="yume_music_sound",
-        row=2,
+        row=3,
     )
     async def sound_btn(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         await self.cog._open_sound_manage(interaction)
@@ -2106,6 +2185,152 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("큐를 섞었어.", ephemeral=True)
         except Exception:
             pass
+        await self._refresh_from_interaction(interaction)
+
+
+
+
+    async def _send_ephemeral(self, interaction: discord.Interaction, text: str):
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except Exception:
+            pass
+
+    async def _seek_from_ui(self, interaction: discord.Interaction, t: str):
+        if interaction.guild is None:
+            return
+        st = self._state(interaction.guild.id)
+        vc = interaction.guild.voice_client
+
+        if vc is None or not vc.is_connected() or not (vc.is_playing() or vc.is_paused()):
+            await self._send_ephemeral(interaction, "지금 재생 중이 아니야.")
+            return
+
+        sec = self._parse_time_to_sec(t)
+        if sec is None or sec < 0:
+            await self._send_ephemeral(interaction, "형식: `초` 또는 `mm:ss` (예: 45 / 1:23)")
+            return
+
+        if st.now_playing and getattr(st.now_playing, "is_live", False):
+            await self._send_ephemeral(interaction, "라이브 스트림은 점프가 안 돼…")
+            return
+
+        cur = st.now_playing
+        if cur is None:
+            await self._send_ephemeral(interaction, "지금 재생 중인 곡 정보를 못 찾았어…")
+            return
+
+        q = getattr(st.queue, "_queue", None)
+        if q is not None and hasattr(q, "appendleft"):
+            q.appendleft(cur)
+        else:
+            items: List[_Track] = []
+            try:
+                while not st.queue.empty():
+                    items.append(st.queue.get_nowait())
+            except Exception:
+                pass
+            try:
+                st.queue.put_nowait(cur)
+            except Exception:
+                pass
+            for it in items:
+                try:
+                    st.queue.put_nowait(it)
+                except Exception:
+                    pass
+
+        st.seek_next_sec = float(sec)
+        st._suppress_requeue_once = True
+        try:
+            vc.stop()
+        except Exception:
+            pass
+
+        await self._send_ephemeral(interaction, f"{int(sec)}초로 점프할게.")
+        self._start_player_if_needed(interaction.guild.id)
+        self._start_panel_tick(interaction.guild.id)
+        await self._refresh_from_interaction(interaction)
+
+    async def _segment_from_ui(self, interaction: discord.Interaction, start: str, end: str, mode: str):
+        if interaction.guild is None:
+            return
+        st = self._state(interaction.guild.id)
+        vc = interaction.guild.voice_client
+
+        if vc is None or not vc.is_connected() or not (vc.is_playing() or vc.is_paused()):
+            await self._send_ephemeral(interaction, "지금 재생 중이 아니야.")
+            return
+
+        if st.now_playing and getattr(st.now_playing, "is_live", False):
+            await self._send_ephemeral(interaction, "라이브 스트림은 구간 재생이 안 돼…")
+            return
+
+        s = self._parse_time_to_sec(start)
+        e = self._parse_time_to_sec(end)
+        if s is None or e is None:
+            await self._send_ephemeral(interaction, "시작/끝 시간을 `30` 또는 `1:30` 형태로 입력해줘.")
+            return
+        if e <= s:
+            await self._send_ephemeral(interaction, "끝 시간이 시작보다 커야 해.")
+            return
+
+        st.segment_start_sec = float(s)
+        st.segment_end_sec = float(e)
+        st.segment_ab_repeat = (mode or "").strip().upper() in {"AB", "A", "R", "REPEAT", "ON", "Y", "YES", "TRUE", "1", "반복"}
+        st.seek_next_sec = float(s)
+
+        cur = st.now_playing
+        if cur is not None:
+            q = getattr(st.queue, "_queue", None)
+            if q is not None and hasattr(q, "appendleft"):
+                q.appendleft(cur)
+
+        st._suppress_requeue_once = True
+        try:
+            vc.stop()
+        except Exception:
+            pass
+
+        def _fmt_time(x: float) -> str:
+            mm = int(x // 60)
+            ss = int(x % 60)
+            return f"{mm:02d}:{ss:02d}"
+
+        await self._send_ephemeral(interaction, f"구간 {_fmt_time(s)}~{_fmt_time(e)}" + (" (AB 반복)" if st.segment_ab_repeat else "") + "으로 재생할게.")
+        self._start_player_if_needed(interaction.guild.id)
+        self._start_panel_tick(interaction.guild.id)
+        await self._refresh_from_interaction(interaction)
+
+    async def _clear_segment_from_ui(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return
+        st = self._state(interaction.guild.id)
+        vc = interaction.guild.voice_client
+
+        st.segment_start_sec = None
+        st.segment_end_sec = None
+        st.segment_ab_repeat = False
+
+        if vc and vc.is_connected() and (vc.is_playing() or vc.is_paused()):
+            if st.now_playing and not getattr(st.now_playing, "is_live", False):
+                pos = self._current_pos(st)
+                cur = st.now_playing
+                q = getattr(st.queue, "_queue", None)
+                if cur is not None and q is not None and hasattr(q, "appendleft"):
+                    q.appendleft(cur)
+                st.seek_next_sec = float(pos)
+                st._suppress_requeue_once = True
+                try:
+                    vc.stop()
+                except Exception:
+                    pass
+
+        await self._send_ephemeral(interaction, "구간 재생을 해제했어.")
+        self._start_panel_tick(interaction.guild.id)
         await self._refresh_from_interaction(interaction)
 
 
