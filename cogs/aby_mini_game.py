@@ -16,6 +16,7 @@ from yume_send import send_ctx
 from yume_store import (
     apply_guild_interest_upto_today,
     claim_daily_explore,
+    upsert_explore_meta,
     ensure_world_weather_rotated,
     get_guild_debt,
     get_user_economy,
@@ -186,7 +187,7 @@ class AbyMiniGameCog(commands.Cog):
             "- `!탐사` : 하루 1회 탐사해서 크레딧(가끔 물) 얻기\n"
             "- `!지갑` : 내 재화 확인\n"
             "- `!가방` : 탐사 전리품(아이템) 확인\n"
-            "- `!사용 <아이템>` : 아이템 사용 (버프)\n- `!공방` : 제작/판매 안내\n- `!제작 <아이템>` : 아이템 제작\n- `!판매 <재료> [수량|전체]` : 재료 판매\n"
+            "- `!사용 <아이템>` : 아이템 사용 (버프)\n- `!공방` : 제작/판매 안내\n- `!제작 <아이템>` : 아이템 제작\n- `!판매 <재료> [수량|전체]` : 재료 판매\n- `!의뢰` : 의뢰 게시판 보기(일일/주간)\n- `!납품 <번호>` : 의뢰 보상 받기(조건 달성 시)\n- `!의뢰랭킹` : 주간 의뢰 포인트 랭킹\n"
             "- `!빚현황` : 우리 학교 빚/이자 확인\n"
             "- `!빚상환 <금액|전체>` : 내 크레딧으로 빚 상환\n\n"
             "**환경(날씨)**\n"
@@ -498,6 +499,19 @@ class AbyMiniGameCog(commands.Cog):
             await send_ctx(ctx, txt, allow_glitch=True)
             return
 
+
+        # Phase5: 탐사 메타(날씨/성공 여부) 기록(퀘스트 검증용). 실패해도 게임은 계속 진행.
+        try:
+            upsert_explore_meta(
+                ctx.author.id,
+                today,
+                weather=weather,
+                success=success,
+                credits_delta=int(credits),
+                water_delta=int(water),
+            )
+        except Exception:
+            pass
         # 성공적으로 반영된 후에만 전리품/버프 소모를 적용한다.
         for k, q in items_to_add:
             add_user_item(ctx.author.id, k, q)

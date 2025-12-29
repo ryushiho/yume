@@ -15,6 +15,7 @@ v3: daily_meals
 v4: stamps opt-in + rewards/events logs
 v5: Abydos mini-game economy (debt/interest + exploration)
 v6: Abydos mini-game inventory/buffs (loot + simple one-buff system)
+v7: Abydos quest board + weekly points + explore meta
 """
 
 from __future__ import annotations
@@ -107,7 +108,7 @@ def init_db() -> None:
 
     now = int(time.time())
 
-    SCHEMA_VERSION = 6
+    SCHEMA_VERSION = 7
 
     with transaction() as con:
         con.execute(
@@ -360,6 +361,84 @@ def init_db() -> None:
 
             con.execute(
                 "CREATE INDEX IF NOT EXISTS idx_aby_inv_user ON aby_inventory(user_id);"
+            )
+
+        # ===== v7 =====
+        if current_version < 7:
+            # Phase6-2 Phase5: 의뢰 게시판(일일/주간) + 주간 포인트 랭킹
+            # + 탐사 메타(날씨/성공 여부) 기록 (퀘스트 검증용)
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS aby_explore_meta (
+                  user_id INTEGER NOT NULL,
+                  date_ymd TEXT NOT NULL,
+                  weather TEXT NOT NULL,
+                  success INTEGER NOT NULL DEFAULT 0,
+                  credits_delta INTEGER NOT NULL DEFAULT 0,
+                  water_delta INTEGER NOT NULL DEFAULT 0,
+                  created_at INTEGER NOT NULL,
+                  PRIMARY KEY (user_id, date_ymd)
+                );
+                """
+            )
+
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS aby_quest_board (
+                  guild_id INTEGER NOT NULL,
+                  scope TEXT NOT NULL,          -- 'daily' | 'weekly'
+                  board_key TEXT NOT NULL,      -- daily: YYYY-MM-DD, weekly: ISO week key (e.g., 2025W53)
+                  quest_no INTEGER NOT NULL,
+                  quest_type TEXT NOT NULL,     -- 'deliver_item' | 'repay_total' | 'explore_sandstorm_success' | 'explore_done'
+                  title TEXT NOT NULL,
+                  description TEXT NOT NULL,
+                  target_key TEXT,              -- item_key / weather etc
+                  target_qty INTEGER NOT NULL DEFAULT 0,
+                  reward_points INTEGER NOT NULL DEFAULT 0,
+                  reward_credits INTEGER NOT NULL DEFAULT 0,
+                  reward_item_key TEXT,
+                  reward_item_qty INTEGER NOT NULL DEFAULT 0,
+                  created_at INTEGER NOT NULL,
+                  PRIMARY KEY (guild_id, scope, board_key, quest_no)
+                );
+                """
+            )
+
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS aby_quest_claims (
+                  guild_id INTEGER NOT NULL,
+                  scope TEXT NOT NULL,
+                  board_key TEXT NOT NULL,
+                  quest_no INTEGER NOT NULL,
+                  user_id INTEGER NOT NULL,
+                  claimed_at INTEGER NOT NULL,
+                  PRIMARY KEY (guild_id, scope, board_key, quest_no, user_id)
+                );
+                """
+            )
+
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS aby_weekly_points (
+                  guild_id INTEGER NOT NULL,
+                  week_key TEXT NOT NULL,
+                  user_id INTEGER NOT NULL,
+                  points INTEGER NOT NULL DEFAULT 0,
+                  updated_at INTEGER NOT NULL,
+                  PRIMARY KEY (guild_id, week_key, user_id)
+                );
+                """
+            )
+
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_aby_qb_guild ON aby_quest_board(guild_id, scope, board_key);"
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_aby_qc_user ON aby_quest_claims(user_id, claimed_at);"
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_aby_wp_week ON aby_weekly_points(guild_id, week_key, points);"
             )
         con.execute(
             """

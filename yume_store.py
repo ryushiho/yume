@@ -1275,3 +1275,672 @@ def repay_guild_debt(guild_id: int, user_id: int, amount: int, today_ymd: str) -
         "new_debt": new_debt,
         "credits_after": max(0, credits - pay),
     }
+
+# ------------------------------
+# Phase6-2 Phase5: Explore meta + Quest board + Weekly points
+# ------------------------------
+
+import hashlib
+import re as _re
+
+ABY_DAILY_QUEST_COUNT = 3
+ABY_WEEKLY_QUEST_COUNT = 3
+
+
+def week_key_from_ymd(ymd: str) -> str:
+    """Return ISO week key like '2025W53' for a given KST ymd."""
+
+    d = _date_from_ymd(str(ymd))
+    iso = d.isocalendar()
+    try:
+        year = int(getattr(iso, "year"))
+        week = int(getattr(iso, "week"))
+    except Exception:
+        year = int(iso[0])
+        week = int(iso[1])
+    return f"{year}W{week:02d}"
+
+
+def _parse_week_key(week_key: str) -> tuple[int, int] | None:
+    s = str(week_key or "").strip().upper()
+    m = _re.fullmatch(r"(\d{4})W(\d{1,2})", s)
+    if not m:
+        return None
+    y = int(m.group(1))
+    w = int(m.group(2))
+    if w < 1 or w > 53:
+        return None
+    return y, w
+
+
+def week_ymds_from_week_key(week_key: str) -> list[str]:
+    """Return 7 ymd strings (Mon..Sun) for an ISO week key."""
+
+    parsed = _parse_week_key(week_key)
+    if not parsed:
+        return []
+    y, w = parsed
+    try:
+        start = datetime.date.fromisocalendar(y, w, 1)  # Monday
+    except Exception:
+        # best-effort fallback
+        start = datetime.date.today()
+    return [(start + datetime.timedelta(days=i)).isoformat() for i in range(7)]
+
+
+def upsert_explore_meta(
+    user_id: int,
+    date_ymd: str,
+    *,
+    weather: str,
+    success: bool,
+    credits_delta: int,
+    water_delta: int,
+) -> None:
+    """Record a user's daily explore meta (for quest validation).
+
+    Idempotent per (user_id, date_ymd).
+    """
+
+    uid = int(user_id)
+    ymd = str(date_ymd)
+    w = str(weather or "").strip().lower()[:20]
+    s = 1 if success else 0
+    cd = int(credits_delta)
+    wd = int(water_delta)
+    now = now_ts()
+
+    execute(
+        """
+        INSERT INTO aby_explore_meta(user_id, date_ymd, weather, success, credits_delta, water_delta, created_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, date_ymd) DO UPDATE SET
+          weather = excluded.weather,
+          success = excluded.success,
+          credits_delta = excluded.credits_delta,
+          water_delta = excluded.water_delta,
+          created_at = excluded.created_at;
+        """,
+        (uid, ymd, w, s, cd, wd, now),
+    )
+
+
+def get_explore_meta(user_id: int, date_ymd: str) -> Optional[Dict[str, Any]]:
+    return fetchone(
+        """
+        SELECT user_id, date_ymd, weather, success, credits_delta, water_delta, created_at
+        FROM aby_explore_meta
+        WHERE user_id=? AND date_ymd=?;
+        """,
+        (int(user_id), str(date_ymd)),
+    )
+
+
+def _stable_seed_int(seed: str) -> int:
+    h = hashlib.md5(seed.encode("utf-8")).hexdigest()[:8]
+    return int(h, 16)
+
+
+def _aby_rng(guild_id: int, *, scope: str, board_key: str) -> random.Random:
+    seed = f"aby-quest|{int(guild_id)}|{scope}|{board_key}"
+    return random.Random(_stable_seed_int(seed))
+
+
+_ABY_MATS_BASIC = ["scrap", "cloth"]
+_ABY_MATS_ADV = ["filter", "battery", "circuit"]
+
+
+def _gen_daily_quests(guild_id: int, today_ymd: str) -> list[dict]:
+    r = _aby_rng(guild_id, scope="daily", board_key=today_ymd)
+
+    q: list[dict] = []
+
+    # 1) basic material delivery
+    k1 = r.choice(_ABY_MATS_BASIC)
+    qty1 = r.randint(5, 9) if k1 == "scrap" else r.randint(3, 6)
+    pts1 = r.randint(8, 14)
+    cred1 = r.randint(3_000, 7_000)
+    title1 = "자재 납품(기초)"
+    desc1 = f"{k1} x{qty1} 납품"
+    q.append(
+        {
+            "quest_no": 1,
+            "quest_type": "deliver_item",
+            "title": title1,
+            "description": desc1,
+            "target_key": k1,
+            "target_qty": qty1,
+            "reward_points": pts1,
+            "reward_credits": cred1,
+            "reward_item_key": "",
+            "reward_item_qty": 0,
+        }
+    )
+
+    # 2) advanced material delivery
+    k2 = r.choice(_ABY_MATS_ADV)
+    qty2 = 1 if k2 == "circuit" else r.randint(1, 2)
+    if k2 == "filter":
+        qty2 = r.randint(2, 4)
+    pts2 = r.randint(10, 18)
+    cred2 = r.randint(4_000, 9_000)
+
+    # small chance for a usable item reward
+    reward_item = ""
+    reward_item_qty = 0
+    if r.random() < 0.22:
+        reward_item = r.choice(["kit", "drone", "mask"])
+        reward_item_qty = 1
+
+    title2 = "자재 납품(정밀)"
+    desc2 = f"{k2} x{qty2} 납품"
+    q.append(
+        {
+            "quest_no": 2,
+            "quest_type": "deliver_item",
+            "title": title2,
+            "description": desc2,
+            "target_key": k2,
+            "target_qty": qty2,
+            "reward_points": pts2,
+            "reward_credits": cred2,
+            "reward_item_key": reward_item,
+            "reward_item_qty": reward_item_qty,
+        }
+    )
+
+    # 3) repay total (daily)
+    repay_amt = r.choice([15_000, 20_000, 30_000, 40_000, 50_000])
+    pts3 = r.randint(10, 16)
+    cred3 = r.randint(0, 3_000)
+    title3 = "부채 상환 실적"
+    desc3 = f"오늘 빚 상환 누적 {repay_amt:,} 이상"
+    q.append(
+        {
+            "quest_no": 3,
+            "quest_type": "repay_total",
+            "title": title3,
+            "description": desc3,
+            "target_key": "debt",
+            "target_qty": int(repay_amt),
+            "reward_points": pts3,
+            "reward_credits": cred3,
+            "reward_item_key": "",
+            "reward_item_qty": 0,
+        }
+    )
+
+    return q
+
+
+def _gen_weekly_quests(guild_id: int, week_key: str) -> list[dict]:
+    r = _aby_rng(guild_id, scope="weekly", board_key=week_key)
+
+    q: list[dict] = []
+
+    # 1) big delivery
+    k1 = r.choice(["scrap", "filter", "battery", "circuit"])
+    if k1 == "scrap":
+        qty1 = r.randint(18, 28)
+    elif k1 == "filter":
+        qty1 = r.randint(8, 14)
+    elif k1 == "battery":
+        qty1 = r.randint(5, 10)
+    else:
+        qty1 = r.randint(3, 6)
+
+    pts1 = r.randint(22, 34)
+    cred1 = r.randint(10_000, 25_000)
+    title1 = "주간 납품 계약"
+    desc1 = f"이번 주 {k1} x{qty1} 납품"
+    q.append(
+        {
+            "quest_no": 1,
+            "quest_type": "deliver_item",
+            "title": title1,
+            "description": desc1,
+            "target_key": k1,
+            "target_qty": qty1,
+            "reward_points": pts1,
+            "reward_credits": cred1,
+            "reward_item_key": "",
+            "reward_item_qty": 0,
+        }
+    )
+
+    # 2) repay total (weekly)
+    repay_amt = r.choice([120_000, 150_000, 200_000, 250_000])
+    pts2 = r.randint(26, 40)
+    cred2 = r.randint(15_000, 35_000)
+    title2 = "주간 부채 상환"
+    desc2 = f"이번 주 빚 상환 누적 {repay_amt:,} 이상"
+    q.append(
+        {
+            "quest_no": 2,
+            "quest_type": "repay_total",
+            "title": title2,
+            "description": desc2,
+            "target_key": "debt",
+            "target_qty": int(repay_amt),
+            "reward_points": pts2,
+            "reward_credits": cred2,
+            "reward_item_key": "",
+            "reward_item_qty": 0,
+        }
+    )
+
+    # 3) sandstorm success once in this week
+    pts3 = r.randint(18, 30)
+    cred3 = r.randint(8_000, 18_000)
+    title3 = "모래폭풍 관측 임무"
+    desc3 = "이번 주 모래폭풍 날 탐사 **성공** 1회"
+    q.append(
+        {
+            "quest_no": 3,
+            "quest_type": "explore_sandstorm_success",
+            "title": title3,
+            "description": desc3,
+            "target_key": "sandstorm",
+            "target_qty": 1,
+            "reward_points": pts3,
+            "reward_credits": cred3,
+            "reward_item_key": "mask",
+            "reward_item_qty": 1,
+        }
+    )
+
+    return q
+
+
+def _get_quest_count(guild_id: int, scope: str, board_key: str) -> int:
+    row = fetchone(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM aby_quest_board
+        WHERE guild_id=? AND scope=? AND board_key=?;
+        """,
+        (int(guild_id), str(scope), str(board_key)),
+    )
+    return int((row or {}).get("cnt") or 0)
+
+
+def _insert_quests(guild_id: int, scope: str, board_key: str, quests: list[dict]) -> None:
+    gid = int(guild_id)
+    sc = str(scope)
+    bk = str(board_key)
+    now = now_ts()
+
+    with get_con() as con:
+        for q in quests:
+            con.execute(
+                """
+                INSERT INTO aby_quest_board(
+                  guild_id, scope, board_key, quest_no,
+                  quest_type, title, description,
+                  target_key, target_qty,
+                  reward_points, reward_credits,
+                  reward_item_key, reward_item_qty,
+                  created_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, scope, board_key, quest_no) DO NOTHING;
+                """,
+                (
+                    gid,
+                    sc,
+                    bk,
+                    int(q.get("quest_no") or 0),
+                    str(q.get("quest_type") or ""),
+                    str(q.get("title") or "")[:80],
+                    str(q.get("description") or "")[:200],
+                    (str(q.get("target_key") or "")[:40] if q.get("target_key") is not None else None),
+                    int(q.get("target_qty") or 0),
+                    int(q.get("reward_points") or 0),
+                    int(q.get("reward_credits") or 0),
+                    (str(q.get("reward_item_key") or "")[:40] if q.get("reward_item_key") else None),
+                    int(q.get("reward_item_qty") or 0),
+                    now,
+                ),
+            )
+
+
+def ensure_aby_daily_quest_board(guild_id: int, today_ymd: str) -> None:
+    if _get_quest_count(guild_id, "daily", today_ymd) >= ABY_DAILY_QUEST_COUNT:
+        return
+    quests = _gen_daily_quests(int(guild_id), str(today_ymd))
+    _insert_quests(int(guild_id), "daily", str(today_ymd), quests)
+
+
+def ensure_aby_weekly_quest_board(guild_id: int, week_key: str) -> None:
+    if _get_quest_count(guild_id, "weekly", week_key) >= ABY_WEEKLY_QUEST_COUNT:
+        return
+    quests = _gen_weekly_quests(int(guild_id), str(week_key))
+    _insert_quests(int(guild_id), "weekly", str(week_key), quests)
+
+
+def get_aby_quests(guild_id: int, scope: str, board_key: str) -> list[Dict[str, Any]]:
+    rows = fetchall(
+        """
+        SELECT guild_id, scope, board_key, quest_no, quest_type, title, description,
+               COALESCE(target_key, '') AS target_key, target_qty,
+               reward_points, reward_credits,
+               COALESCE(reward_item_key, '') AS reward_item_key,
+               reward_item_qty,
+               created_at
+        FROM aby_quest_board
+        WHERE guild_id=? AND scope=? AND board_key=?
+        ORDER BY quest_no ASC;
+        """,
+        (int(guild_id), str(scope), str(board_key)),
+    )
+    return rows or []
+
+
+def get_aby_quest(guild_id: int, scope: str, board_key: str, quest_no: int) -> Optional[Dict[str, Any]]:
+    return fetchone(
+        """
+        SELECT guild_id, scope, board_key, quest_no, quest_type, title, description,
+               COALESCE(target_key, '') AS target_key, target_qty,
+               reward_points, reward_credits,
+               COALESCE(reward_item_key, '') AS reward_item_key,
+               reward_item_qty,
+               created_at
+        FROM aby_quest_board
+        WHERE guild_id=? AND scope=? AND board_key=? AND quest_no=?;
+        """,
+        (int(guild_id), str(scope), str(board_key), int(quest_no)),
+    )
+
+
+def is_aby_quest_claimed(guild_id: int, scope: str, board_key: str, quest_no: int, user_id: int) -> bool:
+    row = fetchone(
+        """
+        SELECT 1 AS ok
+        FROM aby_quest_claims
+        WHERE guild_id=? AND scope=? AND board_key=? AND quest_no=? AND user_id=?;
+        """,
+        (int(guild_id), str(scope), str(board_key), int(quest_no), int(user_id)),
+    )
+    return bool(row)
+
+
+def get_user_weekly_points(guild_id: int, week_key: str, user_id: int) -> int:
+    row = fetchone(
+        """
+        SELECT points
+        FROM aby_weekly_points
+        WHERE guild_id=? AND week_key=? AND user_id=?;
+        """,
+        (int(guild_id), str(week_key), int(user_id)),
+    )
+    return int((row or {}).get("points") or 0)
+
+
+def add_user_weekly_points(guild_id: int, week_key: str, user_id: int, delta: int) -> None:
+    gid = int(guild_id)
+    wk = str(week_key)
+    uid = int(user_id)
+    d = int(delta)
+    if d == 0:
+        return
+    now = now_ts()
+    with get_con() as con:
+        con.execute(
+            """
+            INSERT INTO aby_weekly_points(guild_id, week_key, user_id, points, updated_at)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, week_key, user_id) DO UPDATE SET
+              points = MAX(0, points + excluded.points),
+              updated_at = excluded.updated_at;
+            """,
+            (gid, wk, uid, d, now),
+        )
+
+
+def get_weekly_points_ranking(guild_id: int, week_key: str, limit: int = 10) -> list[Dict[str, Any]]:
+    lim = int(limit)
+    if lim <= 0:
+        lim = 10
+    if lim > 50:
+        lim = 50
+
+    rows = fetchall(
+        """
+        SELECT user_id, points, updated_at
+        FROM aby_weekly_points
+        WHERE guild_id=? AND week_key=?
+        ORDER BY points DESC, updated_at ASC
+        LIMIT ?;
+        """,
+        (int(guild_id), str(week_key), lim),
+    )
+    return rows or []
+
+
+def _repay_total_for_ymds(guild_id: int, user_id: int, ymds: list[str]) -> int:
+    gid = int(guild_id)
+    uid = int(user_id)
+    days = [str(x) for x in (ymds or []) if str(x)]
+    if not days:
+        return 0
+    ph = ",".join(["?"] * len(days))
+    row = fetchone(
+        f"""
+        SELECT COALESCE(SUM(-delta_credits), 0) AS total
+        FROM aby_economy_log
+        WHERE guild_id=? AND user_id=? AND kind='repay' AND memo IN ({ph});
+        """,
+        (gid, uid, *days),
+    )
+    return int((row or {}).get("total") or 0)
+
+
+def repay_total_for_day(guild_id: int, user_id: int, ymd: str) -> int:
+    return _repay_total_for_ymds(guild_id, user_id, [str(ymd)])
+
+
+def repay_total_for_week(guild_id: int, user_id: int, week_key: str) -> int:
+    ymds = week_ymds_from_week_key(week_key)
+    return _repay_total_for_ymds(guild_id, user_id, ymds)
+
+
+def _has_sandstorm_success_in_week(user_id: int, week_key: str) -> bool:
+    uid = int(user_id)
+    ymds = week_ymds_from_week_key(week_key)
+    if not ymds:
+        return False
+
+    ph = ",".join(["?"] * len(ymds))
+    row = fetchone(
+        f"""
+        SELECT 1 AS ok
+        FROM aby_explore_meta
+        WHERE user_id=? AND date_ymd IN ({ph}) AND weather='sandstorm' AND success=1
+        LIMIT 1;
+        """,
+        (uid, *ymds),
+    )
+    return bool(row)
+
+
+def has_sandstorm_success_in_week(user_id: int, week_key: str) -> bool:
+    """Public wrapper for sandstorm-success quest checks."""
+    return _has_sandstorm_success_in_week(int(user_id), str(week_key))
+
+
+def claim_aby_quest(
+    *,
+    guild_id: int,
+    user_id: int,
+    scope: str,
+    board_key: str,
+    quest_no: int,
+    today_ymd: str,
+) -> Dict[str, Any]:
+    """Claim a quest reward if requirements are met.
+
+    Returns:
+      {ok: bool, reason?: str, reward_points?: int, reward_credits?: int, reward_item_key?: str, reward_item_qty?: int}
+
+    reason values:
+      - not_found
+      - claimed
+      - items
+      - repay
+      - explore
+      - sandstorm
+    """
+
+    gid = int(guild_id)
+    uid = int(user_id)
+    ensure_user_economy(uid)
+    sc = str(scope)
+    bk = str(board_key)
+    qn = int(quest_no)
+
+    quest = get_aby_quest(gid, sc, bk, qn)
+    if not quest:
+        return {"ok": False, "reason": "not_found"}
+
+    qtype = str(quest.get("quest_type") or "")
+    target_key = str(quest.get("target_key") or "").strip().lower()
+    target_qty = int(quest.get("target_qty") or 0)
+
+    reward_points = int(quest.get("reward_points") or 0)
+    reward_credits = int(quest.get("reward_credits") or 0)
+    reward_item_key = str(quest.get("reward_item_key") or "").strip().lower()
+    reward_item_qty = int(quest.get("reward_item_qty") or 0)
+
+    # Validate first (fast path)
+    if is_aby_quest_claimed(gid, sc, bk, qn, uid):
+        return {"ok": False, "reason": "claimed"}
+
+    if qtype == "deliver_item":
+        have = get_user_item_qty(uid, target_key)
+        if have < target_qty:
+            return {"ok": False, "reason": "items", "have": have, "need": target_qty, "item": target_key}
+
+    elif qtype == "repay_total":
+        if sc == "daily":
+            rep = repay_total_for_day(gid, uid, bk)
+        else:
+            rep = repay_total_for_week(gid, uid, bk)
+        if rep < target_qty:
+            return {"ok": False, "reason": "repay", "have": rep, "need": target_qty}
+
+    elif qtype == "explore_done":
+        meta = get_explore_meta(uid, str(today_ymd))
+        if not meta:
+            return {"ok": False, "reason": "explore"}
+
+    elif qtype == "explore_sandstorm_success":
+        if sc == "daily":
+            meta = get_explore_meta(uid, bk)
+            if not meta or str(meta.get("weather") or "") != "sandstorm" or int(meta.get("success") or 0) != 1:
+                return {"ok": False, "reason": "sandstorm"}
+        else:
+            if not _has_sandstorm_success_in_week(uid, bk):
+                return {"ok": False, "reason": "sandstorm"}
+
+    else:
+        return {"ok": False, "reason": "not_found"}
+
+    # Apply atomically
+    ensure_user_economy(uid)
+
+    week_key = bk if sc == "weekly" else week_key_from_ymd(str(today_ymd))
+    now = now_ts()
+
+    with get_con() as con:
+        # claim check (re-check)
+        row = con.execute(
+            """
+            SELECT 1
+            FROM aby_quest_claims
+            WHERE guild_id=? AND scope=? AND board_key=? AND quest_no=? AND user_id=?;
+            """,
+            (gid, sc, bk, qn, uid),
+        ).fetchone()
+        if row is not None:
+            return {"ok": False, "reason": "claimed"}
+
+        # consume items if needed
+        if qtype == "deliver_item" and target_key and target_qty > 0:
+            row2 = con.execute(
+                "SELECT qty FROM aby_inventory WHERE user_id=? AND item_key=?;",
+                (uid, target_key),
+            ).fetchone()
+            have2 = int(row2[0]) if row2 else 0
+            if have2 < target_qty:
+                return {"ok": False, "reason": "items", "have": have2, "need": target_qty, "item": target_key}
+            con.execute(
+                "UPDATE aby_inventory SET qty = MAX(0, qty - ?), updated_at=? WHERE user_id=? AND item_key=?;",
+                (target_qty, now, uid, target_key),
+            )
+
+        # reward credits
+        if reward_credits != 0:
+            con.execute(
+                "UPDATE aby_user_economy SET credits = MAX(0, credits + ?), updated_at=? WHERE user_id=?;",
+                (reward_credits, now, uid),
+            )
+
+        # reward items
+        if reward_item_key and reward_item_qty > 0:
+            con.execute(
+                """
+                INSERT INTO aby_inventory(user_id, item_key, qty, updated_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(user_id, item_key) DO UPDATE SET
+                  qty = MAX(0, qty + excluded.qty),
+                  updated_at = excluded.updated_at;
+                """,
+                (uid, reward_item_key, reward_item_qty, now),
+            )
+
+        # quest claim record
+        con.execute(
+            """
+            INSERT INTO aby_quest_claims(guild_id, scope, board_key, quest_no, user_id, claimed_at)
+            VALUES(?, ?, ?, ?, ?, ?);
+            """,
+            (gid, sc, bk, qn, uid, now),
+        )
+
+        # weekly points
+        if reward_points > 0:
+            con.execute(
+                """
+                INSERT INTO aby_weekly_points(guild_id, week_key, user_id, points, updated_at)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, week_key, user_id) DO UPDATE SET
+                  points = MAX(0, points + excluded.points),
+                  updated_at = excluded.updated_at;
+                """,
+                (gid, week_key, uid, reward_points, now),
+            )
+
+        # light log (reward credits only)
+        if reward_credits != 0:
+            con.execute(
+                """
+                INSERT INTO aby_economy_log(guild_id, user_id, kind, delta_credits, delta_water, delta_debt, memo, created_at)
+                VALUES(?, ?, 'quest', ?, 0, 0, ?, ?);
+                """,
+                (
+                    gid,
+                    uid,
+                    int(reward_credits),
+                    f"{sc}:{bk}:{qn}",
+                    now,
+                ),
+            )
+
+    return {
+        "ok": True,
+        "reward_points": reward_points,
+        "reward_credits": reward_credits,
+        "reward_item_key": reward_item_key,
+        "reward_item_qty": reward_item_qty,
+        "week_key": week_key,
+    }
