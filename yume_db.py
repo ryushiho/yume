@@ -97,7 +97,7 @@ def init_db() -> None:
     """
     now = int(time.time())
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     with transaction() as con:
         con.execute(
@@ -192,6 +192,19 @@ def init_db() -> None:
                   guild_id INTEGER,
                   content TEXT NOT NULL,
                   created_at INTEGER NOT NULL
+                );
+                """
+            )
+
+        # ===== Phase4 (schema v3): daily meals cache =====
+        if current_version < 3:
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS daily_meals (
+                  date TEXT PRIMARY KEY,          -- YYYY-MM-DD (KST)
+                  meal_text TEXT NOT NULL,
+                  created_at INTEGER NOT NULL,
+                  last_requested_at INTEGER NOT NULL
                 );
                 """
             )

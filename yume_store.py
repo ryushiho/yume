@@ -205,6 +205,47 @@ def add_rule_suggestion(user_id: int, guild_id: Optional[int], content: str) -> 
     )
 
 
+def save_rule_suggestion(user_id: int, guild_id: Optional[int], content: str) -> None:
+    """Backward-compatible alias.
+
+    Phase3 초기 구현에서 함수명이 add_rule_suggestion으로 들어갔는데,
+    Cog(rule_maker)에서는 save_rule_suggestion을 import하도록 작성되어 있었어.
+    기존 배포본/코그 모두 깨지지 않게 alias로 유지한다.
+    """
+
+    add_rule_suggestion(user_id=user_id, guild_id=guild_id, content=content)
+
+
+# =========================
+# Phase4: Survival cooking (상상 급식표)
+# =========================
+
+
+def get_daily_meal(date_ymd: str) -> Optional[Dict[str, Any]]:
+    return fetchone(
+        """
+        SELECT date, meal_text, created_at, last_requested_at
+        FROM daily_meals
+        WHERE date=?;
+        """,
+        (str(date_ymd),),
+    )
+
+
+def upsert_daily_meal(date_ymd: str, meal_text: str) -> None:
+    now = int(time.time())
+    execute(
+        """
+        INSERT INTO daily_meals(date, meal_text, created_at, last_requested_at)
+        VALUES(?, ?, ?, ?)
+        ON CONFLICT(date) DO UPDATE SET
+          meal_text=excluded.meal_text,
+          last_requested_at=excluded.last_requested_at;
+        """,
+        (str(date_ymd), str(meal_text)[:1800], now, now),
+    )
+
+
 def get_recent_rule_suggestions(limit: int = 5) -> list[Dict[str, Any]]:
     # Avoid importing fetchall at top-level to keep API tiny.
     from yume_db import fetchall
