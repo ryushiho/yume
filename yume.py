@@ -104,6 +104,8 @@ def resolve_discord_token() -> Optional[str]:
 _load_env_from_dotenv()
 
 from yume_ai import setup_yume_ai  # type: ignore
+from yume_db import init_db  # type: ignore
+from yume_runtime import start_background_tasks  # type: ignore
 
 
 intents = discord.Intents.default()
@@ -195,6 +197,12 @@ async def sync_command(
 async def on_ready():
     logger.info("유메 로그인 완료: %s (%s)", bot.user, bot.user.id)
     await bot.change_presence(activity=discord.Game(name="!도움"))
+
+    # Phase0: start background loops (safe to call multiple times).
+    try:
+        start_background_tasks(bot)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.exception("백그라운드 작업 시작 중 오류: %s", e)
     try:
         synced = await bot.tree.sync()
         logger.info("슬래시 명령어 동기화 완료: %d개", len(synced))
@@ -209,6 +217,13 @@ async def main():
             "DISCORD_TOKEN 이 설정되어 있지 않습니다.\n"
             ".env 또는 yumebot.env 파일에 DISCORD_TOKEN=... 을 추가해 주세요."
         )
+        return
+
+    # Phase0: ensure DB schema exists before loading cogs.
+    try:
+        init_db()
+    except Exception as e:  # pylint: disable=broad-except
+        logger.exception("DB 초기화 실패: %s", e)
         return
 
     logger.info("로드할 Cog 확장 목록: %s", EXTENSIONS)

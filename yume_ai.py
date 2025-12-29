@@ -28,6 +28,7 @@ import datetime
 from discord.ext import commands
 
 from yume_prompt import YUME_ROLE_PROMPT_KR
+from yume_honorific import get_honorific
 
 try:
     from openai import OpenAI  # type: ignore
@@ -285,9 +286,31 @@ class YumeSpeaker:
           - 정상: 유메의 대사 (LLM이 생성한 텍스트)
           - 오류: OpenAI 설정/호출 오류 설명 문자열 (유메 말투 아님)
         """
+        user_obj = kwargs.get("user") or kwargs.get("member") or kwargs.get("author")
+        guild = kwargs.get("guild")
+
         user_id = kwargs.get("user_id")
-        user_name = kwargs.get("user_name") or "후배"
-        is_dev = bool(kwargs.get("is_dev", False))
+        if user_id is None and user_obj is not None:
+            user_id = int(getattr(user_obj, "id", 0) or 0)
+
+        user_name = kwargs.get("user_name")
+        if not user_name and user_obj is not None:
+            user_name = getattr(user_obj, "display_name", None) or getattr(user_obj, "name", None)
+        user_name = user_name or "상대"
+
+        if guild is None and hasattr(user_obj, "guild"):
+            try:
+                guild = getattr(user_obj, "guild")
+            except Exception:
+                guild = None
+
+        honorific = kwargs.get("honorific")
+        if not honorific and user_obj is not None:
+            honorific = get_honorific(user_obj, guild)
+        honorific = honorific or "선생님"
+
+        extra: Dict[str, Any] = kwargs.get("extra") or {}
+        is_dev = bool(kwargs.get("is_dev", extra.get("is_dev", False)))
 
         if user_id is None:
             affection_score = 0.0
@@ -304,7 +327,7 @@ class YumeSpeaker:
             + "\n\n[출력/말투 규칙]\n"
             "- 반드시 유메(쿠치나시 유메)로서 말한다. AI/모델/LLM 같은 기술 언급 금지.\n"
             "- 자기 호칭은 '나(유메)' 1인칭으로 자연스럽게.\n"
-            "- 상대 호칭은 기본 '선생님', 상황에 따라 '후배 님'도 가능. (user_name은 참고용)\n"
+            f"- 상대 호칭은 기본 '{honorific}'. (user_name은 참고용)\n"
             "- '으헤~'는 거의 쓰지 않는다. 대신 '에헤헤', '와아!', '흐음~' 같은 감탄사를 가끔 사용.\n"
             "- '아저씨' 같은 말투는 절대 금지.\n"
             "- 1~2문장, 최대 90자 정도로 짧게.\n"
@@ -319,6 +342,7 @@ class YumeSpeaker:
             f"[상황 키워드]: {event}\n"
             f"[상황 설명]: {event_hint}\n"
             f"[유저 이름(참고)]: {user_name}\n"
+            f"[기본 호칭]: {honorific}\n"
             f"[유저는 개발자인가?]: {'예' if is_dev else '아니오'}\n"
             f"[호감도 점수]: {affection_score:.1f} (-100~100)\n"
             f"[호감도 단계]: {stage} "

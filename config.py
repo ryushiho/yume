@@ -28,6 +28,9 @@ WORDS_FILE = os.path.join(DICT_DIR, "blue_archive_words.txt")
 
 BLUE_RECORDS_FILE = os.path.join(STORAGE_DIR, "blue_records.json")
 
+# Phase0: bot persistent SQLite DB (shared foundation for world state / settings / scheduled jobs)
+YUME_DB_FILE = os.path.join(STORAGE_DIR, "yume_bot.db")
+
 PERSONALITY_FILE = os.path.join(SYSTEM_DIR, "yume_personality.json")
 
 

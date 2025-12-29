@@ -3,6 +3,8 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 
+from yume_store import get_world_state
+
 OWNER_ID = 1433962010785349634
 
 
@@ -85,6 +87,20 @@ class AdminCog(commands.Cog):
             value=f"`{affection:+.1f}` (stage: `{stage}`)",
             inline=False,
         )
+
+        # Phase0: show virtual world state (weather) for debugging.
+        try:
+            world = get_world_state()
+            embed.add_field(
+                name="아비도스 환경(가상 날씨)",
+                value=(
+                    f"weather: `{world.get('weather')}`\n"
+                    f"next_change_at: `{world.get('next_change_at')}`"
+                ),
+                inline=False,
+            )
+        except Exception:
+            pass
 
         await ctx.send(embed=embed)
 

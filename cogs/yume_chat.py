@@ -10,6 +10,7 @@ import discord
 from discord.ext import commands
 
 from yume_brain import YumeBrain
+from yume_honorific import get_honorific
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ class YumeChatCog(commands.Cog):
         profile: dict = {
             "nickname": getattr(user, "display_name", user.name),
             "bond_level": "normal",
+            "honorific": get_honorific(user, guild),
         }
 
         core = self._core()

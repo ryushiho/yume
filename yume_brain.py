@@ -251,6 +251,7 @@ class YumeBrain:
 
         bond_level = (user_profile or {}).get("bond_level", "normal")
         user_nick = (user_profile or {}).get("nickname", "")
+        honorific = (user_profile or {}).get("honorific", "선생님")
 
         # 유저가 지정한 유메 Role Definition을 시스템 프롬프트로 그대로 사용한다.
         # (모델/AI/LLM 언급 금지 포함)
@@ -269,7 +270,7 @@ class YumeBrain:
         nick_line = f"- 닉네임(참고): {user_nick}\n" if user_nick else ""
         user_desc = (
             f"\n[상대 유저]\n"
-            "- 기본 호칭: '선생님' (상황에 따라 '후배 님'도 가능)\n"
+            f"- 기본 호칭: '{honorific}'\n"
             + nick_line
         )
 

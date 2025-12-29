@@ -5,6 +5,7 @@ import discord
 from discord.ext import commands, tasks
 
 from yume_brain import YumeBrain
+from yume_honorific import get_honorific
 
 
 DAILY_FEEDBACK_TIME_UTC = datetime.time(hour=14, minute=59)
@@ -78,6 +79,7 @@ class YumeDiaryCog(commands.Cog):
         user_profile = {
             "nickname": nickname,
             "bond_level": "normal",
+            "honorific": get_honorific(user, None) if user is not None else "선생님",
         }
 
         user_message = (
@@ -134,6 +136,7 @@ class YumeDiaryCog(commands.Cog):
         user_profile = {
             "nickname": nickname,
             "bond_level": "normal",
+            "honorific": get_honorific(user, guild),
         }
 
         user_message = (
@@ -197,6 +200,7 @@ class YumeDiaryCog(commands.Cog):
         user_profile = {
             "nickname": nickname,
             "bond_level": "normal",
+            "honorific": get_honorific(user, guild),
         }
 
         user_message = (
@@ -248,6 +252,7 @@ class YumeDiaryCog(commands.Cog):
         user_profile = {
             "nickname": nickname,
             "bond_level": "normal",
+            "honorific": get_honorific(user, ctx.guild),
         }
 
         user_message = (
@@ -303,6 +308,7 @@ class YumeDiaryCog(commands.Cog):
         user_profile = {
             "nickname": nickname,
             "bond_level": "normal",
+            "honorific": get_honorific(user, guild),
         }
 
         user_message = (
@@ -367,6 +373,7 @@ class YumeDiaryCog(commands.Cog):
         user_profile = {
             "nickname": guild_name,
             "bond_level": "normal",
+            "honorific": "선생님",
         }
 
         user_message = (
