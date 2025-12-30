@@ -2352,3 +2352,64 @@ def get_weekly_debt_summary(guild_id: int, week_key: str) -> Dict[str, Any]:
         "repaid_credits": int(repaid_credits),
     }
 
+
+# =========================
+# Abydos Web Sync helpers
+# =========================
+
+def list_aby_guild_ids() -> List[int]:
+    """Abydos 관련 데이터가 존재하는 길드 ID 목록을 반환.
+
+    - guild debt / incident state 등에서 guild_id 를 수집
+    - 없으면 빈 리스트
+    """
+    with transaction() as con:
+        rows = con.execute(
+            """
+            SELECT DISTINCT guild_id FROM (
+              SELECT guild_id FROM aby_guild_debt
+              UNION
+              SELECT guild_id FROM aby_incident_state
+              UNION
+              SELECT guild_id FROM aby_incident_log
+            )
+            ORDER BY guild_id ASC
+            """
+        ).fetchall()
+    return [int(r["guild_id"]) for r in rows if r.get("guild_id") is not None]
+
+
+def list_aby_user_economy(limit: int = 500) -> List[Dict[str, Any]]:
+    """Abydos 유저 경제(크레딧/물) 목록.
+
+    현재 구현은 (guild_id 없이) 사용자 단위로 저장되어 있으므로,
+    웹 싱크에서는 각 길드에 동일 목록을 동기화하게 된다.
+    """
+    with transaction() as con:
+        rows = con.execute(
+            """
+            SELECT user_id, credits, water, last_explore_ymd, created_at, updated_at
+            FROM aby_user_economy
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_recent_explore_meta(limit: int = 300) -> List[Dict[str, Any]]:
+    """최근 탐사 메타(= 탐사 로그용) 목록."""
+    with transaction() as con:
+        rows = con.execute(
+            """
+            SELECT user_id, date_ymd, note, weather, success,
+                   credits_delta, water_delta, created_at, updated_at
+            FROM aby_explore_meta
+            ORDER BY date_ymd DESC, updated_at DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
