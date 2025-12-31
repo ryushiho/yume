@@ -45,6 +45,34 @@ from yume_store import (
 )
 
 logger = logging.getLogger(__name__)
+def _row_to_dict(row):
+    """sqlite3.Row / dict / None 을 안전하게 dict로 정규화한다.
+    - sqlite3.Row: .get 이 없어서 dict로 변환해준다.
+    - dict: 그대로 반환
+    - None: None 반환
+    """
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return row
+    # sqlite3.Row 는 keys() 를 제공한다.
+    if hasattr(row, "keys"):
+        try:
+            return {k: row[k] for k in row.keys()}
+        except Exception:
+            pass
+    # (예외) tuple/list 등
+    try:
+        return dict(row)
+    except Exception:
+        return {"_raw": str(row)}
+
+
+def _rows_to_dicts(rows):
+    if not rows:
+        return []
+    return [_row_to_dict(r) for r in rows]
+
 
 KST = timezone(timedelta(hours=9))
 
@@ -107,6 +135,7 @@ def build_sync_payload(bot: discord.Client) -> Dict[str, Any]:
         pass
 
     world = get_world_state()
+    world = _row_to_dict(world) or {}
 
     # Discover guilds that are actually using the Abydos systems.
     guild_ids = list_aby_guild_ids()
@@ -138,7 +167,7 @@ def build_sync_payload(bot: discord.Client) -> Dict[str, Any]:
         if gid in users_payload_cache:
             return users_payload_cache[gid]
         out: List[Dict[str, Any]] = []
-        for u in users_raw:
+        for u in _rows_to_dicts(users_raw):
             uid = int(u.get("user_id") or 0)
             out.append(
                 {
@@ -158,7 +187,7 @@ def build_sync_payload(bot: discord.Client) -> Dict[str, Any]:
         if gid in explores_payload_cache:
             return explores_payload_cache[gid]
         out: List[Dict[str, Any]] = []
-        for e in explores_raw:
+        for e in _rows_to_dicts(explores_raw):
             uid = int(e.get("user_id") or 0)
             day = str(e.get("date_ymd") or "")
             out.append(
@@ -192,15 +221,16 @@ def build_sync_payload(bot: discord.Client) -> Dict[str, Any]:
         debt = get_guild_debt(gid_i)
 
         # Weekly snapshots
+        debt = _row_to_dict(debt) or {}
         weekly = {
             "week_key": week_key,
-            "debt_summary": get_weekly_debt_summary(gid_i, week_key),
-            "points_ranking": get_weekly_points_ranking(gid_i, week_key),
+            "debt_summary": (_row_to_dict(get_weekly_debt_summary(gid_i, week_key)) or {}),
+            "points_ranking": _rows_to_dicts(get_weekly_points_ranking(gid_i, week_key)),
         }
 
         incidents_raw = list_recent_aby_incidents(gid_i, limit=80)
         incidents_payload: List[Dict[str, Any]] = []
-        for inc in incidents_raw:
+        for inc in _rows_to_dicts(incidents_raw):
             iid = int(inc.get("id") or 0)
             incidents_payload.append(
                 {
