@@ -52,35 +52,107 @@ def _sanitize_mentions(text: str) -> str:
     return text.replace("@", "@\u200b")
 
 
-def _pick_time_band_kst(now: Optional[datetime] = None) -> Tuple[str, str, str]:
-    """KST 기준 시간대 키/라벨/시각 문자열을 만든다."""
+_BAND_META: Dict[str, Tuple[str, Tuple[int, int]]] = {
+    # key: (label, (hour, minute))  # 강제 시간대용 대표 시각
+    "dawn": ("새벽", (3, 30)),
+    "morning": ("아침", (8, 30)),
+    "noon": ("점심", (12, 30)),
+    "afternoon": ("오후", (15, 30)),
+    "evening": ("저녁", (19, 30)),
+    "late_night": ("심야", (23, 30)),
+}
+
+
+def _now_kst(now: Optional[datetime] = None) -> datetime:
+    """KST 기준 datetime을 반환한다(zoneinfo 실패 시 로컬)."""
     try:
         from zoneinfo import ZoneInfo
 
         tz = ZoneInfo("Asia/Seoul")
-        now_kst = (now or datetime.now(tz=tz)).astimezone(tz)
+        return (now or datetime.now(tz=tz)).astimezone(tz)
     except Exception:
-        # zoneinfo 불가/예외면 로컬 시간을 사용
-        now_kst = now or datetime.now()
+        return now or datetime.now()
+
+
+def _pick_time_band_kst(now: Optional[datetime] = None, forced_key: Optional[str] = None) -> Tuple[str, str, str]:
+    """KST 기준 시간대 키/라벨/시각 문자열을 만든다.
+
+    - forced_key가 있으면 해당 시간대로 '연출용 대표 시각'을 만들어 반환한다.
+    """
+    now_kst = _now_kst(now)
+
+    if forced_key and forced_key in _BAND_META:
+        label, (hh, mm) = _BAND_META[forced_key]
+        try:
+            forced_dt = now_kst.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        except Exception:
+            forced_dt = now_kst
+        clock = forced_dt.strftime("%Y-%m-%d %H:%M")
+        return forced_key, label, clock
 
     hh = int(now_kst.strftime("%H"))
 
     # 6구간: 새벽/아침/점심/오후/저녁/심야
     if 0 <= hh < 6:
-        key, label = "dawn", "새벽"
+        key = "dawn"
     elif 6 <= hh < 11:
-        key, label = "morning", "아침"
+        key = "morning"
     elif 11 <= hh < 14:
-        key, label = "noon", "점심"
+        key = "noon"
     elif 14 <= hh < 18:
-        key, label = "afternoon", "오후"
+        key = "afternoon"
     elif 18 <= hh < 22:
-        key, label = "evening", "저녁"
+        key = "evening"
     else:
-        key, label = "late_night", "심야"
+        key = "late_night"
 
+    label = _BAND_META.get(key, ("", (0, 0)))[0] or ""
     clock = now_kst.strftime("%Y-%m-%d %H:%M")
     return key, label, clock
+
+
+def _parse_force_band_arg(raw: str) -> Optional[str]:
+    """!호시노 시간대 강제 옵션 파서.
+
+    허용 예:
+    - 새벽/아침/점심/낮/오후/저녁/심야/밤
+    - dawn/morning/noon/afternoon/evening/late_night
+    """
+    s = (raw or "").strip().lower()
+    if not s:
+        return None
+
+    # 자주 쓰는 한국어 키워드
+    ko_map = {
+        "새벽": "dawn",
+        "아침": "morning",
+        "오전": "morning",
+        "점심": "noon",
+        "정오": "noon",
+        "낮": "noon",
+        "오후": "afternoon",
+        "저녁": "evening",
+        "밤": "late_night",
+        "심야": "late_night",
+        "야밤": "late_night",
+    }
+    if raw.strip() in ko_map:
+        return ko_map[raw.strip()]
+
+    # 영어 키워드
+    en_map = {
+        "dawn": "dawn",
+        "morning": "morning",
+        "noon": "noon",
+        "afternoon": "afternoon",
+        "evening": "evening",
+        "late": "late_night",
+        "latenight": "late_night",
+        "late_night": "late_night",
+        "late-night": "late_night",
+        "night": "late_night",
+    }
+    return en_map.get(s)
 
 
 class YumeFunCog(commands.Cog):
@@ -241,6 +313,21 @@ class YumeFunCog(commands.Cog):
         reason = str(result.get("reason", "error"))
         reply = str(result.get("reply") or "").strip()
 
+        # Guard: ensure the last line is a parentheses scene line (prompt requires it).
+        if ok and reply:
+            tail = reply.strip().splitlines()[-1].strip()
+            if not (tail.startswith("(") and tail.endswith(")")):
+                import random
+
+                fallbacks = [
+                    "호시노 방패 뒤에 숨어서 떨면서 씀",
+                    "복도 모서리에서 숨죽이며 씀",
+                    "전봇대 뒤에서 힐끔거리며 씀",
+                    "책상 밑에 쭈그려 앉아 몰래 씀",
+                    "모래바람 속에서 노트를 품에 숨기고 씀",
+                ]
+                reply = reply.rstrip() + "\n(" + random.choice(fallbacks) + ")"
+
         if not ok and reason == "limit_exceeded":
             await ctx.send(
                 "이번 달에 유메가 쓸 수 있는 말 예산을 다 써버렸어… 다음 달에 다시 만들어줄게.",
@@ -288,8 +375,18 @@ class YumeFunCog(commands.Cog):
     @commands.command(name="호시노", aliases=["1학년"])
     @commands.cooldown(1, 12, commands.BucketType.user)
     @commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
-    async def cmd_hoshino(self, ctx: commands.Context):
-        """!호시노 / !1학년 - 호시노 실시간(?) 중계"""
+    async def cmd_hoshino(self, ctx: commands.Context, *, force: str = ""):
+        """!호시노 / !1학년 - 호시노 관찰 일기(시간대 강제 옵션 지원)
+
+        사용 예:
+        - !호시노
+        - !호시노 새벽
+        - !호시노 아침
+        - !호시노 점심
+        - !호시노 오후
+        - !호시노 저녁
+        - !호시노 심야
+        """
 
         if not self._ensure_brain():
             debug = f"\n\n[디버그 brain_error: {self.brain_error}]" if (ctx.author.id == DEV_USER_ID and self.brain_error) else ""
@@ -299,7 +396,15 @@ class YumeFunCog(commands.Cog):
             )
             return
 
-        band_key, band_label, clock = _pick_time_band_kst()
+        forced_key = _parse_force_band_arg(force)
+        if force.strip() and not forced_key:
+            await ctx.send(
+                "시간대 강제는 이렇게 써줘: `!호시노 새벽/아침/점심/오후/저녁/심야`",
+                delete_after=10,
+            )
+            return
+
+        band_key, band_label, clock = _pick_time_band_kst(forced_key=forced_key)
 
         pack_default = {
             "system_extra": "",
@@ -321,16 +426,18 @@ class YumeFunCog(commands.Cog):
             last_summary = str(cache.get("summary") or "").strip()
 
         context_block = (
-            "\n\n[컨텍스트]\n"
-            f"- 현재시간(KST): {clock}\n"
-            f"- 시간대: {band_label}\n"
+            "\n\n[현재 시간]\n"
+            f"{clock}\n"
+            "\n[시간대]\n"
+            f"{band_label}\n"
+            "\n[추가 컨텍스트]\n"
             f"- 유저 닉네임: {user_profile.get('nickname','')}\n"
             f"- 유저 기본 호칭: {user_profile.get('honorific','선생님')}\n"
             f"- bond_level: {user_profile.get('bond_level','normal')}\n"
             f"- affection: {user_profile.get('affection','')}\n"
         )
         if last_summary:
-            context_block += f"- 직전 중계 요약: {last_summary}\n"
+            context_block += f"- 직전 관찰 요약: {last_summary}\n"
 
         user_prompt = band_prompt.strip() + context_block
 
@@ -351,6 +458,21 @@ class YumeFunCog(commands.Cog):
         ok = bool(result.get("ok", False))
         reason = str(result.get("reason", "error"))
         reply = str(result.get("reply") or "").strip()
+
+        # Guard: ensure the last line is a parentheses scene line (prompt requires it).
+        if ok and reply:
+            tail = reply.strip().splitlines()[-1].strip()
+            if not (tail.startswith("(") and tail.endswith(")")):
+                import random
+
+                fallbacks = [
+                    "호시노 방패 뒤에 숨어서 떨면서 씀",
+                    "복도 모서리에서 숨죽이며 씀",
+                    "전봇대 뒤에서 힐끔거리며 씀",
+                    "책상 밑에 쭈그려 앉아 몰래 씀",
+                    "모래바람 속에서 노트를 품에 숨기고 씀",
+                ]
+                reply = reply.rstrip() + "\n(" + random.choice(fallbacks) + ")"
 
         if not ok and reason == "limit_exceeded":
             await ctx.send(

@@ -1,4 +1,5 @@
 import datetime
+import os
 from typing import Optional
 
 import discord
@@ -7,11 +8,13 @@ from discord.ext import commands, tasks
 from yume_brain import YumeBrain
 from yume_honorific import get_honorific
 from yume_send import send_ctx
+from yume_store import get_config
 
 
 DAILY_FEEDBACK_TIME_UTC = datetime.time(hour=14, minute=59)
 
-DAILY_FEEDBACK_CHANNEL_ID = 1438804132613066833  # 요청한 채널 ID
+DEFAULT_DAILY_FEEDBACK_CHANNEL_ID = 1438804132613066833  # 과거 기본값(호환용)
+DIARY_CHANNEL_CFG_KEY = "diary_channel_id"  # !채널지정 set 유메일기 #채널
 
 
 class YumeDiaryCog(commands.Cog):
@@ -347,14 +350,24 @@ class YumeDiaryCog(commands.Cog):
         감정 코어 없이, '오늘 하루 마무리 인사'를 상상해서 생성.
         """
         await self.bot.wait_until_ready()
+        # 채널은 DB 설정(bot_config) > 환경변수 > 기본값 순으로 잡는다
+        raw = (get_config(DIARY_CHANNEL_CFG_KEY, '') or '').strip()
+        if not raw:
+            raw = (os.getenv('YUME_DIARY_CHANNEL_ID', '') or '').strip()
+        if not raw:
+            raw = str(DEFAULT_DAILY_FEEDBACK_CHANNEL_ID)
 
-        channel = self.bot.get_channel(DAILY_FEEDBACK_CHANNEL_ID)
+        channel_id = 0
+        try:
+            channel_id = int(raw)
+        except Exception:
+            channel_id = 0
+
+        channel = self.bot.get_channel(channel_id) if channel_id else None
         if channel is None or not isinstance(
             channel, (discord.TextChannel, discord.Thread)
         ):
-            print(
-                f"[YumeDiaryCog] 채널 ID {DAILY_FEEDBACK_CHANNEL_ID} 를 찾을 수 없습니다."
-            )
+            print(f"[YumeDiaryCog] daily_feedback 채널을 찾을 수 없습니다: raw={raw!r}, channel_id={channel_id}")
             return
 
         brain = self._ensure_brain()

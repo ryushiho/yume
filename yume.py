@@ -127,6 +127,7 @@ DEV_USER_ID = 1433962010785349634
 EXTENSIONS = [
     "cogs.admin",
     "cogs.noise_settings",
+    "cogs.channel_settings",
     "cogs.aby_environment",
     "cogs.rule_maker",
     "cogs.aby_mini_game",

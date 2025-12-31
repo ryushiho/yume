@@ -288,7 +288,6 @@ class HelpCog(commands.Cog):
             return mood, irritation
         except Exception:
             return 0.0, 0.0
-
     @commands.command(name="도움", help="유메 사용법을 알려줄게.")
     async def help_command(self, ctx: commands.Context):
         mood, irritation = self._get_ai_mood_and_irritation()
@@ -297,7 +296,7 @@ class HelpCog(commands.Cog):
         if irritation > 0.5:
             desc = "명령어는 `!`로 시작해. 필요한 것만 빠르게 적어둘게."
         elif mood >= 0.4:
-            desc = "명령어는 `!`로 시작해. 중요한 것만 딱 정리해둘게~ 에헤헤."
+            desc = "명령어는 `!`로 시작해. 중요한 것만 딱 정리해둘게~ 으헤~"
         else:
             desc = "명령어는 `!`로 시작해. 헷갈릴 때는 여기만 보면 돼."
 
@@ -308,32 +307,57 @@ class HelpCog(commands.Cog):
         )
 
         embed.add_field(
-            name="🎮 블루전",
+            name="🤝 관계/재미",
             value=(
-                "`!블루전` / `!블루전연습` / `!연습종료`\n"
-                "`!블루전전적 [@유저]` / `!블루전랭킹`"
+                "`!호시노` / `!1학년`  (호시노 관찰 일기)\n"
+                "└ 시간대 강제: `!호시노 새벽/아침/점심/오후/저녁/심야`\n"
+                "`!포스터 <문구>`  (채팅 포스터 만들기)"
             ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="🏜️ 아비도스(미니게임)",
+            value="`!탐사지원`  (미니게임 도움말)\n`!탐사` / `!지갑` / `!가방` / `!사용 <아이템>`\n`!의뢰` / `!제작` / `!판매`",
+            inline=False,
+        )
+
+        embed.add_field(
+            name="📜 교칙",
+            value=(
+                "`!교칙` / `!교칙건의 <내용>`\n"
+                "`!채널지정 set 교칙 #채널`  (자동 공지 채널)\n"
+                "`!채널지정 test 교칙`  (권한/채널 테스트)\n"
+                "※ 기존: `!교칙채널 #채널` 도 그대로 가능"
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="📔 유메일기",
+            value=(
+                "`!유메일기` / `!유메오늘어땠어` / `!유메기분` / `!유메관계`\n"
+                "`!채널지정 set 유메일기 #채널`  (자동 마무리 채널)\n"
+                "`!채널지정 test 유메일기`  (권한/채널 테스트)"
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="💬 프리토킹",
+            value="`!프리토킹시작` / `!프리토킹종료`\n프리토킹 채널에선 그냥 말 걸면 유메가 받아줘.",
+            inline=False,
+        )
+
+        embed.add_field(
+            name="🎮 블루전",
+            value="`!블루전` / `!블루전연습` / `!연습종료`\n`!블루전전적 [@유저]` / `!블루전랭킹`",
             inline=False,
         )
 
         embed.add_field(
             name="🎵 음악",
             value="`!음악` / `!음악채널지정` / `!음악채널해제`",
-            inline=False,
-        )
-
-        embed.add_field(
-            name="📝 일기/관계",
-            value="`!유메일기` / `!유메오늘어땠어` / `!유메기분` / `!유메관계`",
-            inline=False,
-        )
-
-        embed.add_field(
-            name="💬 프리토킹",
-            value=(
-                "`!프리토킹시작` / `!프리토킹종료`\n"
-                "프리토킹 채널에선 그냥 말 걸면 유메가 받아줘."
-            ),
             inline=False,
         )
 
