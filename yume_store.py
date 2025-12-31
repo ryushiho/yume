@@ -2376,7 +2376,18 @@ def list_aby_guild_ids() -> List[int]:
             ORDER BY guild_id ASC
             """
         ).fetchall()
-    return [int(r["guild_id"]) for r in rows if r.get("guild_id") is not None]
+    # sqlite3.Row 는 dict 처럼 [] 접근은 되지만 .get()은 없다.
+    # (websync / !아비동기화 에서 AttributeError 방지)
+    out: List[int] = []
+    for r in rows or []:
+        try:
+            gid = r["guild_id"]
+            if gid is None:
+                continue
+            out.append(int(gid))
+        except Exception:
+            continue
+    return out
 
 
 def list_aby_user_economy(limit: int = 500) -> List[Dict[str, Any]]:
