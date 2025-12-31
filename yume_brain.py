@@ -467,6 +467,110 @@ class YumeBrain:
         }
 
 
+    def chat_custom(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+        history: Optional[List[Tuple[str, str]]] = None,
+        max_tokens: int = 384,
+        temperature: float = 0.85,
+    ) -> Dict[str, Any]:
+        """커스텀 시스템 프롬프트로 LLM을 호출한다.
+
+        - 특정 기능(포스터/호시노 중계 등)에서 모드별 기본 프롬프트 대신,
+          기능 전용 프롬프트를 쓰고 싶을 때 사용.
+        - 월 사용량/한도 체크는 기본 chat()와 동일하게 적용된다.
+
+        history: [(role, content), ...]
+          - role은 'user' 또는 'assistant'만 허용
+        """
+
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": system_prompt.strip()},
+        ]
+
+        if history:
+            for role, content in history[-12:]:
+                r = str(role).strip().lower()
+                if r not in ("user", "assistant"):
+                    continue
+                c = (content or "").strip()
+                if not c:
+                    continue
+                messages.append({"role": r, "content": c})
+
+        messages.append({"role": "user", "content": user_message.strip()})
+
+        # OpenAI 호출 + 사용량/한도 관리
+        try:
+            response = self.client.chat.completions.create(
+                model=self.config.model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        except Exception as e:
+            return {
+                "ok": False,
+                "reason": "error",
+                "reply": "",
+                "error": str(e),
+                "usage": {},
+            }
+
+        choice = response.choices[0]
+        reply_text = choice.message.content.strip() if choice.message.content else ""
+
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return {
+                "ok": True,
+                "reason": "ok",
+                "reply": reply_text,
+                "usage": {
+                    "tracked": False,
+                    "month": self._month_usage.month,
+                },
+            }
+
+        prompt_tokens = getattr(usage, "prompt_tokens", 0)
+        completion_tokens = getattr(usage, "completion_tokens", 0)
+        total_tokens = getattr(usage, "total_tokens", prompt_tokens + completion_tokens)
+
+        estimated_cost = self._estimate_cost_usd(prompt_tokens, completion_tokens)
+        if not self._can_spend(estimated_cost):
+            return {
+                "ok": False,
+                "reason": "limit_exceeded",
+                "reply": "",
+                "usage": self.get_usage_summary(),
+            }
+
+        cost = self._update_usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        )
+
+        usage_summary = self.get_usage_summary()
+        usage_summary.update(
+            {
+                "last_prompt_tokens": prompt_tokens,
+                "last_completion_tokens": completion_tokens,
+                "last_total_tokens": total_tokens,
+                "last_cost_usd": round(cost, 6),
+            }
+        )
+
+        return {
+            "ok": True,
+            "reason": "ok",
+            "reply": reply_text,
+            "usage": usage_summary,
+        }
+
+
 
 if __name__ == "__main__":
     print("[YumeBrain] 간단 테스트를 시작합니다.")

@@ -136,6 +136,7 @@ EXTENSIONS = [
     "cogs.stamps",
     "cogs.yume_diary",
     "cogs.yume_chat",
+    "cogs.yume_fun",
     "cogs.social",
 ]
 
@@ -260,6 +261,16 @@ async def on_command_error(ctx: commands.Context, error: Exception):
     if isinstance(error, commands.MissingRequiredArgument):
         try:
             await ctx.send("인자가 부족해. `!탐사지원` 같은 도움말을 확인해줘.", delete_after=8)
+        except Exception:
+            pass
+        return
+
+    # 3-1) 쿨다운
+    if isinstance(error, commands.CommandOnCooldown):
+        try:
+            sec = int(getattr(error, "retry_after", 0) or 0)
+            sec = max(1, sec)
+            await ctx.send(f"잠깐만~ {sec}초만 쉬었다가 다시 불러줘.", delete_after=6)
         except Exception:
             pass
         return
