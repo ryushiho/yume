@@ -56,6 +56,20 @@ def _today_ymd_kst() -> str:
 def _read_env() -> tuple[str | None, str | None]:
     url = (os.getenv("YUME_WEB_SYNC_URL", "") or "").strip()
     token = (os.getenv("YUME_WEB_SYNC_TOKEN", "") or "").strip()
+
+    # Accept either a full sync endpoint, "/api/v1/aby" base, or a bare domain.
+    # Examples:
+    #   https://shihonoyume.xyz/api/v1/aby/sync
+    #   https://shihonoyume.xyz/api/v1/aby
+    #   https://shihonoyume.xyz
+    if url:
+        url = url.strip().rstrip("/")
+        if not url.endswith("/sync"):
+            if url.endswith("/api/v1/aby"):
+                url = url + "/sync"
+            elif "/api/" not in url:
+                url = url + "/api/v1/aby/sync"
+
     return (url or None, token or None)
 
 

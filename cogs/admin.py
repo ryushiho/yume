@@ -6,6 +6,7 @@ from discord.ext import commands
 from discord import app_commands
 
 from yume_store import get_world_state
+from yume_websync import post_sync_payload
 
 OWNER_ID = 1433962010785349634
 
@@ -146,6 +147,23 @@ class AdminCog(commands.Cog):
         msg = await ctx.send(f"{count}개 정도… 정리해 뒀어.")
         await msg.delete(delay=5)
 
+
+
+    @commands.command(name="아비동기화")
+    async def aby_sync(self, ctx: commands.Context):
+        """아비도스(탐사/주간포인트/사건/빚) 상태를 웹 패널로 즉시 동기화합니다."""
+        # 오너는 항상 허용. 그 외에는 서버 내 "서버 관리" 권한자만 허용(운영 편의).
+        if ctx.author.id != OWNER_ID:
+            perms = getattr(ctx.author, "guild_permissions", None)
+            if perms is None or not perms.manage_guild:
+                await ctx.reply("권한이 없어요. (서버 관리 권한 필요)")
+                return
+
+        ok = await post_sync_payload(self.bot)
+        if ok:
+            await ctx.reply("✅ 아비도스 상태를 웹에 동기화했어요.")
+        else:
+            await ctx.reply("⚠️ 동기화에 실패했어요. 서버 로그를 확인해줘…")
 
     @app_commands.command(
         name="유메전달",

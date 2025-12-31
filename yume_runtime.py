@@ -296,12 +296,25 @@ async def _web_sync_loop(bot: discord.Client) -> None:
 
     await asyncio.sleep(random.uniform(2.0, 6.0))
 
+    def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+        raw = (os.getenv(name, "") or "").strip()
+        try:
+            v = int(raw) if raw else default
+        except Exception:
+            v = default
+        return max(lo, min(v, hi))
+
+    fail_sec = _env_int("YUME_WEB_SYNC_FAIL_INTERVAL_SEC", 120, 30, 3600)
+    ok_sec = _env_int("YUME_WEB_SYNC_OK_INTERVAL_SEC", 300, 30, 3600)
+    disabled_sec = _env_int("YUME_WEB_SYNC_DISABLED_INTERVAL_SEC", 600, 60, 3600)
+    error_sec = _env_int("YUME_WEB_SYNC_ERROR_INTERVAL_SEC", 300, 30, 3600)
+
     while True:
         try:
             if _websync_enabled():
                 ok = await post_sync_payload(bot)
                 # On failure, retry a bit sooner (but not too spammy).
-                await asyncio.sleep(120 if not ok else 300)
+                await asyncio.sleep(fail_sec if not ok else ok_sec)
             else:
                 # Check again later.
                 await asyncio.sleep(600)
