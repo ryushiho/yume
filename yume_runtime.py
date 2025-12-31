@@ -28,6 +28,7 @@ import discord
 
 from yume_llm import generate_daily_rule
 from yume_send import send_channel
+from yume_presence import apply_random_presence, get_next_presence_interval_seconds
 from yume_websync import post_sync_payload
 from yume_store import (
     bump_daily_rule_attempt,
@@ -336,6 +337,35 @@ async def _web_sync_loop(bot: discord.Client) -> None:
             await asyncio.sleep(300)
 
 
+async def _presence_rotation_loop(bot: discord.Client) -> None:
+    """Rotate Yume's Discord presence at a random interval.
+
+    Config: data/system/status_messages.json
+    - interval_minutes: {min,max}
+    - items: [{type,text,bands}]
+    """
+
+    # gentle startup jitter
+    await asyncio.sleep(random.uniform(1.0, 4.0))
+    logger.info("[runtime] presence rotation loop started")
+
+    while True:
+        try:
+            await apply_random_presence(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[runtime] presence rotation failed")
+
+        try:
+            sec = int(get_next_presence_interval_seconds())
+            if sec < 10 * 60:
+                sec = 10 * 60
+        except Exception:
+            sec = 60 * 60
+
+        await asyncio.sleep(sec)
+
 async def _debt_interest_loop(bot: discord.Client) -> None:
     """Apply daily debt interest once per KST day.
 
@@ -381,6 +411,7 @@ def start_background_tasks(bot: discord.Client) -> None:
         tasks.append(asyncio.create_task(_daily_rule_loop(bot)))
         tasks.append(asyncio.create_task(_debt_interest_loop(bot)))
         tasks.append(asyncio.create_task(_web_sync_loop(bot)))
+        tasks.append(asyncio.create_task(_presence_rotation_loop(bot)))
     except Exception as e:
         logger.error("Failed to start background tasks: %s", e)
 

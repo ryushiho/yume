@@ -7,6 +7,7 @@ from discord import app_commands
 
 from yume_store import get_world_state
 from yume_websync import post_sync_payload
+from yume_presence import apply_random_presence
 
 OWNER_ID = 1433962010785349634
 
@@ -120,6 +121,20 @@ class AdminCog(commands.Cog):
 
         await ctx.send(embed=embed)
 
+
+    @commands.command(name="상태갱신", aliases=["상태변경"])
+    async def refresh_presence(self, ctx: commands.Context):
+        """유메 디스코드 상태(프레즌스)를 즉시 랜덤 갱신한다. (OWNER 전용)"""
+        if ctx.author.id != OWNER_ID:
+            await ctx.send("이건… 유메랑 개발자만 쓰는 스위치야.", delete_after=5)
+            return
+
+        try:
+            result = await apply_random_presence(self.bot)
+            text = str(result.get("text") or "").strip()
+            await ctx.send(f"✅ 상태 갱신 완료: {text}", delete_after=10)
+        except Exception:
+            await ctx.send("❌ 상태 갱신 중 오류가 났어…", delete_after=10)
 
     @commands.command(name="청소")
     async def clean_messages(self, ctx: commands.Context, amount: int):
