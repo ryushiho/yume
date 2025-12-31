@@ -289,7 +289,43 @@ def ensure_world_weather_rotated(*, now_ts: Optional[int] = None) -> Dict[str, A
     next_at = int(state.get("weather_next_change_at") or 0)
     changed_at = int(state.get("weather_changed_at") or 0)
 
-    # If next_at is missing (older DB), initialize it.
+    # Defensive: some older/buggy writes may have stored timestamps in milliseconds.
+    # That would make next_at "far in the future" and the weather would appear stuck.
+    # Normalize to seconds when we detect unreasonable values.
+    def _normalize_ts(ts: int) -> int:
+        # ms epoch is typically 13 digits (>= 1e12). seconds epoch is 10 digits (~1e9).
+        if ts >= 10**12:
+            return int(ts // 1000)
+        return int(ts)
+
+    n_next_at = _normalize_ts(next_at)
+    n_changed_at = _normalize_ts(changed_at)
+
+    # Also guard against "way too far" schedules (e.g. years ahead) which can happen
+    # if a bad value slipped into the DB.
+    if n_next_at > 0 and n_next_at > (now + 14 * 24 * 3600):
+        # Force an immediate re-roll (prevents the weather from looking "stuck").
+        n_next_at = now - 1
+
+    # If we had to normalize, persist the corrected values.
+    if (n_next_at != next_at) or (n_changed_at != changed_at):
+        try:
+            # NOTE: set_world_weather treats falsy next_change_at as "now + 6h",
+            # so we pass an explicit (now-1) when we want an immediate rotate.
+            set_world_weather(weather, changed_at=n_changed_at or now, next_change_at=int(n_next_at))
+            state = get_world_state()
+            weather = str(state.get("weather") or weather)
+            next_at = int(state.get("weather_next_change_at") or 0)
+            changed_at = int(state.get("weather_changed_at") or 0)
+        except Exception:
+            # If correction fails, keep going with normalized locals.
+            next_at = n_next_at
+            changed_at = n_changed_at
+    else:
+        next_at = n_next_at
+        changed_at = n_changed_at
+
+    # If next_at is missing (older DB) or invalid, initialize it.
     if next_at <= 0:
         next_at = now + 6 * 3600
         set_world_weather(weather, changed_at=changed_at or now, next_change_at=next_at)

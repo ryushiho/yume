@@ -121,6 +121,16 @@ class AbyEnvironmentCog(commands.Cog):
             prev = get_world_state()
             now = int(time.time())
             next_at = int(prev.get("weather_next_change_at") or 0)
+            # Defensive: if next_at is absurdly far in the future (ms timestamp bug etc.),
+            # force a rotate repair via ensure_world_weather_rotated.
+            if next_at >= 10**12 or (next_at > 0 and next_at > (now + 14 * 24 * 3600)):
+                # Set next_change_at to (now-1) so ensure_world_weather_rotated rotates immediately.
+                try:
+                    set_world_weather(str(prev.get("weather") or "clear"), changed_at=int(prev.get("weather_changed_at") or now), next_change_at=now - 1)
+                except Exception:
+                    pass
+                next_at = now - 1
+
             if next_at > 0 and now < next_at:
                 return
 

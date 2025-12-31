@@ -255,6 +255,16 @@ async def _world_state_loop(bot: discord.Client) -> None:
             current_weather = str(state.get("weather") or "clear")
             next_at = int(state.get("weather_next_change_at") or 0)
 
+            # Defensive: bad writes (e.g. milliseconds timestamp) can make next_at
+            # absurdly far in the future, freezing rotation.
+            if next_at >= 10**12 or (next_at > 0 and next_at > (now + 14 * 24 * 3600)):
+                set_world_weather(
+                    current_weather,
+                    changed_at=int(state.get("weather_changed_at") or now),
+                    next_change_at=now - 1,
+                )
+                next_at = now - 1
+
             # Defensive: if next_at is missing or in the past, schedule a new one.
             if next_at <= 0:
                 next_at = _roll_next_change_at(now)
