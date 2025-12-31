@@ -157,38 +157,6 @@ def _parse_force_band_arg(raw: str) -> Optional[str]:
 
     return None
 
-    # 자주 쓰는 한국어 키워드
-    ko_map = {
-        "새벽": "dawn",
-        "아침": "morning",
-        "오전": "morning",
-        "점심": "noon",
-        "정오": "noon",
-        "낮": "noon",
-        "오후": "afternoon",
-        "저녁": "evening",
-        "밤": "late_night",
-        "심야": "late_night",
-        "야밤": "late_night",
-    }
-    if raw.strip() in ko_map:
-        return ko_map[raw.strip()]
-
-    # 영어 키워드
-    en_map = {
-        "dawn": "dawn",
-        "morning": "morning",
-        "noon": "noon",
-        "afternoon": "afternoon",
-        "evening": "evening",
-        "late": "late_night",
-        "latenight": "late_night",
-        "late_night": "late_night",
-        "late-night": "late_night",
-        "night": "late_night",
-    }
-    return en_map.get(s)
-
 
 class YumeFunCog(commands.Cog):
     """유메의 특수 컨텐츠 커맨드: !호시노 / !포스터"""

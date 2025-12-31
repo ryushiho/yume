@@ -154,7 +154,24 @@ async def apply_random_presence(bot: discord.Client, *, forced_band: Optional[st
     if not candidates:
         candidates = [it for it in items if isinstance(it, dict)]
 
-    chosen = random.choice(candidates) if candidates else {"type": "playing", "text": "!도움"}
+    def _weight(item: Dict[str, Any]) -> float:
+        # JSON에서 weight를 지정하면 그 값을 우선 사용.
+        w = item.get("weight")
+        if isinstance(w, (int, float)) and w > 0:
+            return float(w)
+
+        # 호시노/방패 계열은 '가끔'만 나오도록 기본 가중치를 낮춘다.
+        t = str(item.get("text") or "")
+        if any(k in t for k in ("호시노", "1학년", "방패", "선배 시끄러워요")):
+            return 0.15
+
+        return 1.0
+
+    if candidates:
+        weights = [_weight(it) for it in candidates]
+        chosen = random.choices(candidates, weights=weights, k=1)[0]
+    else:
+        chosen = {"type": "playing", "text": "!도움"}
 
     item_type = str(chosen.get("type") or "playing")
     text = str(chosen.get("text") or "!도움").replace("@", "@\u200b")  # 안전
