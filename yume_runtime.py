@@ -293,8 +293,16 @@ async def _world_state_loop(bot: discord.Client) -> None:
 
 def _websync_enabled() -> bool:
     # Phase6-1: bot -> web dashboard sync is optional.
-    url = (os.getenv("YUME_WEB_SYNC_URL", "") or "").strip()
-    token = (os.getenv("YUME_WEB_SYNC_TOKEN", "") or "").strip()
+    url = (
+        (os.getenv("YUME_WEB_SYNC_URL", "") or "").strip()
+        or (os.getenv("YUME_ABY_SYNC_URL", "") or "").strip()
+        or (os.getenv("YUME_ABY_API_URL", "") or "").strip()
+    )
+    token = (
+        (os.getenv("YUME_WEB_SYNC_TOKEN", "") or "").strip()
+        or (os.getenv("YUME_ABY_SYNC_TOKEN", "") or "").strip()
+        or (os.getenv("YUME_ABY_API_TOKEN", "") or "").strip()
+    )
     return bool(url and token)
 
 

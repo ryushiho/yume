@@ -82,8 +82,32 @@ def _today_ymd_kst() -> str:
 
 
 def _read_env() -> tuple[str | None, str | None]:
-    url = (os.getenv("YUME_WEB_SYNC_URL", "") or "").strip()
-    token = (os.getenv("YUME_WEB_SYNC_TOKEN", "") or "").strip()
+    """Read sync URL/token from environment.
+
+    키 이름이 배포 과정에서 여러 번 바뀌면서(웹/봇 각각) 어긋날 수 있어서,
+    아래 키들을 모두 허용합니다.
+
+    URL:
+      - YUME_WEB_SYNC_URL (현재 권장)
+      - YUME_ABY_SYNC_URL (호환)
+      - YUME_ABY_API_URL  (호환)
+
+    TOKEN:
+      - YUME_WEB_SYNC_TOKEN (현재 권장)
+      - YUME_ABY_SYNC_TOKEN (호환)
+      - YUME_ABY_API_TOKEN  (호환)
+    """
+
+    url = (
+        (os.getenv("YUME_WEB_SYNC_URL", "") or "").strip()
+        or (os.getenv("YUME_ABY_SYNC_URL", "") or "").strip()
+        or (os.getenv("YUME_ABY_API_URL", "") or "").strip()
+    )
+    token = (
+        (os.getenv("YUME_WEB_SYNC_TOKEN", "") or "").strip()
+        or (os.getenv("YUME_ABY_SYNC_TOKEN", "") or "").strip()
+        or (os.getenv("YUME_ABY_API_TOKEN", "") or "").strip()
+    )
 
     # Accept either a full sync endpoint, "/api/v1/aby" base, or a bare domain.
     # Examples:
@@ -99,6 +123,16 @@ def _read_env() -> tuple[str | None, str | None]:
                 url = url + "/api/v1/aby/sync"
 
     return (url or None, token or None)
+
+
+def get_sync_url() -> str:
+    """Debug helper: resolved sync URL."""
+    return (_read_env()[0] or "")
+
+
+def get_sync_token() -> str:
+    """Debug helper: resolved sync token."""
+    return (_read_env()[1] or "")
 
 
 def _safe_display_name(bot: discord.Client, guild_id: int, user_id: int) -> str:
