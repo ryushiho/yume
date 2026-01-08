@@ -105,25 +105,21 @@ def generate_text(
         return ""
 
     m = model or os.getenv("YUME_OPENAI_MODEL", "gpt-4o-mini")
-
-    response = client.responses.create(  # type: ignore[union-attr]
+    response = client.chat.completions.create(  # type: ignore[union-attr]
         model=m,
-        instructions=instructions,
-        input=input_text,
-        max_output_tokens=int(max_output_tokens),
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": input_text},
+        ],
+        max_tokens=int(max_output_tokens),
     )
 
-    out_items = getattr(response, "output", None) or []
-    if not out_items:
+    choices = getattr(response, "choices", None) or []
+    if not choices:
         return ""
 
-    message = out_items[0]
-    content_list = getattr(message, "content", None) or []
-    if not content_list:
-        return ""
-
-    text_obj = content_list[0]
-    text = getattr(text_obj, "text", None) or ""
+    msg = getattr(choices[0], "message", None)
+    text = getattr(msg, "content", None) or ""
     return _cleanup_text(str(text))
 
 
@@ -143,25 +139,21 @@ def generate_text_multiline(
         return ""
 
     m = model or os.getenv("YUME_OPENAI_MODEL", "gpt-4o-mini")
-
-    response = client.responses.create(  # type: ignore[union-attr]
+    response = client.chat.completions.create(  # type: ignore[union-attr]
         model=m,
-        instructions=instructions,
-        input=input_text,
-        max_output_tokens=int(max_output_tokens),
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": input_text},
+        ],
+        max_tokens=int(max_output_tokens),
     )
 
-    out_items = getattr(response, "output", None) or []
-    if not out_items:
+    choices = getattr(response, "choices", None) or []
+    if not choices:
         return ""
 
-    message = out_items[0]
-    content_list = getattr(message, "content", None) or []
-    if not content_list:
-        return ""
-
-    text_obj = content_list[0]
-    text = getattr(text_obj, "text", None) or ""
+    msg = getattr(choices[0], "message", None)
+    text = getattr(msg, "content", None) or ""
     return _cleanup_text_multiline(str(text), max_lines=max_lines, max_chars=max_chars)
 
 

@@ -29,7 +29,7 @@ import discord
 from yume_llm import generate_daily_rule
 from yume_send import send_channel
 from yume_presence import apply_random_presence, get_next_presence_interval_seconds
-from yume_websync import post_sync_payload
+from yume_websync import post_sync_payload, websync_enabled
 from yume_store import (
     bump_daily_rule_attempt,
     ensure_daily_rule_row,
@@ -293,17 +293,8 @@ async def _world_state_loop(bot: discord.Client) -> None:
 
 def _websync_enabled() -> bool:
     # Phase6-1: bot -> web dashboard sync is optional.
-    url = (
-        (os.getenv("YUME_WEB_SYNC_URL", "") or "").strip()
-        or (os.getenv("YUME_ABY_SYNC_URL", "") or "").strip()
-        or (os.getenv("YUME_ABY_API_URL", "") or "").strip()
-    )
-    token = (
-        (os.getenv("YUME_WEB_SYNC_TOKEN", "") or "").strip()
-        or (os.getenv("YUME_ABY_SYNC_TOKEN", "") or "").strip()
-        or (os.getenv("YUME_ABY_API_TOKEN", "") or "").strip()
-    )
-    return bool(url and token)
+    # 여러 env 키 이름을 yume_websync 쪽에서 흡수하므로, 여기서는 그 결과만 본다.
+    return websync_enabled()
 
 
 async def _web_sync_loop(bot: discord.Client) -> None:

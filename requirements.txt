@@ -1,3 +1,4 @@
 discord.py
 python-dotenv
 aiohttp
+openai>=1.0.0

@@ -371,29 +371,27 @@ class YumeSpeaker:
         )
 
         try:
-            response = self.client.responses.create(  # type: ignore[union-attr]
+            response = self.client.chat.completions.create(  # type: ignore[union-attr]
                 model=self.model,
-                instructions=instructions,
-                input=prompt,
-                max_output_tokens=96,
+                messages=[
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=96,
             )
-            out_items = getattr(response, "output", None) or []
-            if not out_items:
-                raise RuntimeError("empty output from OpenAI")
 
-            message = out_items[0]
-            content_list = getattr(message, "content", None) or []
-            if not content_list:
-                raise RuntimeError("empty content from OpenAI")
+            choices = getattr(response, "choices", None) or []
+            if not choices:
+                raise RuntimeError("empty choices from OpenAI")
 
-            text_obj = content_list[0]
-            text = getattr(text_obj, "text", None) or ""
+            msg = getattr(choices[0], "message", None)
+            text = getattr(msg, "content", None) or ""
             text = str(text).strip()
             if not text:
-                raise RuntimeError("empty text from OpenAI")
+                raise RuntimeError("empty content from OpenAI")
 
-            if (text.startswith('"') and text.endswith('"')) or (
-                text.startswith("“") and text.endswith("”")
+            if (text.startswith(') and text.endswith(')) or (
+                text.startswith('“') and text.endswith('”')
             ):
                 text = text[1:-1].strip()
             return text

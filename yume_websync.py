@@ -82,57 +82,62 @@ def _today_ymd_kst() -> str:
 
 
 def _read_env() -> tuple[str | None, str | None]:
-    """Read sync URL/token from environment.
-
-    키 이름이 배포 과정에서 여러 번 바뀌면서(웹/봇 각각) 어긋날 수 있어서,
-    아래 키들을 모두 허용합니다.
-
-    URL:
-      - YUME_WEB_SYNC_URL (현재 권장)
-      - YUME_ABY_SYNC_URL (호환)
-      - YUME_ABY_API_URL  (호환)
-
-    TOKEN:
-      - YUME_WEB_SYNC_TOKEN (현재 권장)
-      - YUME_ABY_SYNC_TOKEN (호환)
-      - YUME_ABY_API_TOKEN  (호환)
-    """
-
+    # NOTE: 서버/봇 사이에 env 이름이 섞이는 일이 많아서(구버전 호환),
+    # 여러 키를 폭넓게 허용한다.
     url = (
-        (os.getenv("YUME_WEB_SYNC_URL", "") or "").strip()
-        or (os.getenv("YUME_ABY_SYNC_URL", "") or "").strip()
-        or (os.getenv("YUME_ABY_API_URL", "") or "").strip()
+        (os.getenv("YUME_WEB_SYNC_URL") or "").strip()
+        or (os.getenv("YUME_ABY_SYNC_URL") or "").strip()
+        or (os.getenv("YUME_ABY_API_URL") or "").strip()
+        or (os.getenv("YUME_ADMIN_URL") or "").strip()
+        or (os.getenv("ADMIN_URL") or "").strip()
     )
     token = (
-        (os.getenv("YUME_WEB_SYNC_TOKEN", "") or "").strip()
-        or (os.getenv("YUME_ABY_SYNC_TOKEN", "") or "").strip()
-        or (os.getenv("YUME_ABY_API_TOKEN", "") or "").strip()
+        (os.getenv("YUME_WEB_SYNC_TOKEN") or "").strip()
+        or (os.getenv("YUME_ABY_SYNC_TOKEN") or "").strip()
+        or (os.getenv("YUME_ABY_API_TOKEN") or "").strip()
+        or (os.getenv("YUME_WEB_SYNC_SECRET") or "").strip()
     )
 
     # Accept either a full sync endpoint, "/api/v1/aby" base, or a bare domain.
+    # Also accept legacy "/api/aby" form and rewrite to "/api/v1/aby".
+    #
     # Examples:
     #   https://shihonoyume.xyz/api/v1/aby/sync
     #   https://shihonoyume.xyz/api/v1/aby
+    #   https://shihonoyume.xyz/api/aby/sync   (legacy)
     #   https://shihonoyume.xyz
     if url:
         url = url.strip().rstrip("/")
+
+        # legacy fix: /api/aby -> /api/v1/aby
+        if "/api/aby" in url and "/api/v1/aby" not in url:
+            url = url.replace("/api/aby", "/api/v1/aby")
+
+        # If user gave a base that ends with /api or /api/v1, complete it.
+        if url.endswith("/api"):
+            url = url + "/v1/aby/sync"
+        elif url.endswith("/api/v1"):
+            url = url + "/aby/sync"
+
+        # If it's not the final endpoint yet, finish it.
         if not url.endswith("/sync"):
             if url.endswith("/api/v1/aby"):
                 url = url + "/sync"
-            elif "/api/" not in url:
+            elif "/api/v1/" not in url:
+                # Bare domain or unknown base -> append the canonical endpoint.
                 url = url + "/api/v1/aby/sync"
 
     return (url or None, token or None)
 
+def get_sync_config() -> tuple[str | None, str | None]:
+    """Return normalized (url, token) for Abydos web sync."""
+    return _read_env()
 
-def get_sync_url() -> str:
-    """Debug helper: resolved sync URL."""
-    return (_read_env()[0] or "")
 
+def websync_enabled() -> bool:
+    url, token = _read_env()
+    return bool(url and token)
 
-def get_sync_token() -> str:
-    """Debug helper: resolved sync token."""
-    return (_read_env()[1] or "")
 
 
 def _safe_display_name(bot: discord.Client, guild_id: int, user_id: int) -> str:
