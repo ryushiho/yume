@@ -614,9 +614,13 @@ def add_stamp_reward(
     guild_id: Optional[int],
     milestone: int,
     title: str,
-    letter_text: str,
+    letter_text: Optional[str] = None,
+    # Backward-compat: older callers used `letter=`.
+    letter: Optional[str] = None,
+    created_at: Optional[int] = None,
 ) -> None:
-    now = int(time.time())
+    now = int(created_at or time.time())
+    text = letter_text if letter_text is not None else (letter if letter is not None else "")
     execute(
         """
         INSERT INTO stamp_rewards(user_id, guild_id, milestone, title, letter_text, created_at)
@@ -627,7 +631,7 @@ def add_stamp_reward(
             int(guild_id) if guild_id is not None else None,
             int(milestone),
             str(title)[:80],
-            str(letter_text)[:2000],
+            str(text)[:2000],
             now,
         ),
     )
