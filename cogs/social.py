@@ -589,8 +589,17 @@ class ReactionsCog(commands.Cog):
                     "이번 달엔 유메가 너무 많이 떠들어서… 잠깐 쉬어야겠어. 흐음~"
                 )
             else:
+                # DEV에겐 원인 파악용 에러 요약을 붙여준다.
+                if message.author.id == DEV_USER_ID:
+                    err = str(result.get("error") or "").strip().replace("\n", " ")
+                    if len(err) > 300:
+                        err = err[:300] + "…"
+                    suffix = f"\n\n[디버그 reason: {reason!r}]" + (f"\n[디버그 error: {err}]" if err else "")
+                else:
+                    suffix = ""
+
                 await message.channel.send(
-                    "지금은 말이 잘 안 나와… 잠깐만 다시 불러줘. 흐음~"
+                    "지금은 말이 잘 안 나와… 잠깐만 다시 불러줘. 흐음~" + suffix
                 )
             return
 
@@ -634,6 +643,13 @@ class ReactionsCog(commands.Cog):
             return
 
         if self.bot.user and self.bot.user.mention in message.content:
+            # 프리토킹 채널(YumeChatCog)이 켜진 곳에서는 중복 응답을 막는다.
+            try:
+                active = getattr(self.bot, "yume_chat_active_channels", set())
+                if message.channel.id in set(active):
+                    return
+            except Exception:
+                pass
             await self._handle_mention_chat(message)
 
     async def _hehe_loop(self):

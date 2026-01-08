@@ -279,6 +279,7 @@ class YumeChatCog(commands.Cog):
         reply = result.get("reply") or ""
         ok = result.get("ok", False)
         reason = result.get("reason", "ok")
+        err = str(result.get("error") or "").strip()
 
         if not ok and reason == "limit_exceeded":
             await reply_message(
@@ -293,6 +294,12 @@ class YumeChatCog(commands.Cog):
             dev_suffix = ""
             if message.author.id == DEV_USER_ID:
                 dev_suffix = f"\n\n[디버그 reason: {reason!r}]"
+                if err:
+                    # 너무 길면 디스코드 메시지/보안 측면에서 위험하니 잘라서 노출
+                    safe_err = err.replace("\n", " ")
+                    if len(safe_err) > 300:
+                        safe_err = safe_err[:300] + "…"
+                    dev_suffix += f"\n[디버그 error: {safe_err}]"
 
             if not reply:
                 reply = (

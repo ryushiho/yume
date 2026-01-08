@@ -1,6 +1,7 @@
 import json
 import os
 import datetime
+import logging
 from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -11,6 +12,9 @@ except ImportError:
 
 from yume_prompt import YUME_ROLE_PROMPT_KR
 from yume_store import get_world_state
+
+
+logger = logging.getLogger(__name__)
 
 
 WEATHER_LABEL = {
@@ -367,6 +371,155 @@ class YumeBrain:
         return messages
 
 
+    @staticmethod
+    def _is_reasoning_model(model: str) -> bool:
+        """추론 계열 모델(o1/o3 등)은 ChatCompletions 대신 Responses API를 우선 사용."""
+        m = (model or "").strip().lower()
+        return m.startswith("o1") or m.startswith("o3")
+
+
+    def _call_chat_completions(
+        self,
+        *,
+        model: str,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+        temperature: float,
+    ) -> Tuple[str, Optional[Tuple[int, int, int]]]:
+        """ChatCompletions 호출.
+
+        반환: (reply_text, (prompt_tokens, completion_tokens, total_tokens) | None)
+        """
+        response = self.client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+        choice = response.choices[0]
+        reply_text = choice.message.content.strip() if choice.message.content else ""
+
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return reply_text, None
+
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        total_tokens = int(getattr(usage, "total_tokens", prompt_tokens + completion_tokens) or 0)
+        return reply_text, (prompt_tokens, completion_tokens, total_tokens)
+
+
+    def _call_responses(
+        self,
+        *,
+        model: str,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+        temperature: float,
+    ) -> Tuple[str, Optional[Tuple[int, int, int]]]:
+        """Responses API 호출.
+
+        - openai-python 2.x에서 지원.
+        - 반환: (reply_text, (prompt_tokens, completion_tokens, total_tokens) | None)
+        """
+
+        # reasoning 모델은 temperature를 지원하지 않는 경우가 많으므로 조건부로 제거
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "input": messages,
+            "max_output_tokens": max_tokens,
+        }
+        if not self._is_reasoning_model(model):
+            kwargs["temperature"] = temperature
+
+        response = self.client.responses.create(**kwargs)
+
+        # 가장 안전한 추출: output_text 속성이 있으면 우선 사용
+        reply_text = (getattr(response, "output_text", None) or "").strip()
+
+        # output_text가 비어 있으면 구조를 파싱
+        if not reply_text:
+            try:
+                out = getattr(response, "output", None) or []
+                chunks: List[str] = []
+                for item in out:
+                    contents = getattr(item, "content", None) or []
+                    for c in contents:
+                        t = getattr(c, "type", None)
+                        if t in ("output_text", "text"):
+                            txt = getattr(c, "text", None)
+                            if isinstance(txt, str) and txt.strip():
+                                chunks.append(txt.strip())
+                reply_text = "\n".join(chunks).strip()
+            except Exception:
+                reply_text = ""
+
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return reply_text, None
+
+        # Responses API의 usage 필드명은 input_tokens/output_tokens(혹은 prompt/completion)일 수 있다.
+        prompt_tokens = int(
+            getattr(usage, "input_tokens", None)
+            or getattr(usage, "prompt_tokens", 0)
+            or 0
+        )
+        completion_tokens = int(
+            getattr(usage, "output_tokens", None)
+            or getattr(usage, "completion_tokens", 0)
+            or 0
+        )
+        total_tokens = int(
+            getattr(usage, "total_tokens", prompt_tokens + completion_tokens)
+            or (prompt_tokens + completion_tokens)
+        )
+        return reply_text, (prompt_tokens, completion_tokens, total_tokens)
+
+
+    def _call_openai(
+        self,
+        *,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+        temperature: float,
+    ) -> Tuple[str, Optional[Tuple[int, int, int]]]:
+        """모델/SDK 환경 차이를 흡수하는 통합 호출.
+
+        - reasoning 모델(o1/o3)은 Responses를 우선
+        - 그 외는 ChatCompletions를 우선
+        - 첫 시도가 실패하면 반대 API로 한 번 더 시도
+        """
+
+        model = (self.config.model or "").strip() or "gpt-4o-mini"
+        prefer_responses = self._is_reasoning_model(model)
+        order = ["responses", "chat"] if prefer_responses else ["chat", "responses"]
+
+        errors: List[str] = []
+        for api in order:
+            try:
+                if api == "chat":
+                    return self._call_chat_completions(
+                        model=model,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                    )
+                else:
+                    return self._call_responses(
+                        model=model,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                    )
+            except Exception as e:
+                # 로그에는 스택트레이스를 남기고, 반환 에러에는 요약만 넣는다.
+                logger.exception("[YumeBrain] OpenAI %s call failed", api)
+                errors.append(f"{api}:{type(e).__name__}:{e}")
+
+        raise RuntimeError("; ".join(errors) or "OpenAI call failed")
+
+
     def chat(
         self,
         user_message: str,
@@ -399,27 +552,34 @@ class YumeBrain:
             history=history,
         )
 
+        # 이미 한도 초과면 호출하지 않는다.
+        if self._month_usage.total_usd >= self.config.hard_limit_usd:
+            return {
+                "ok": False,
+                "reason": "limit_exceeded",
+                "reply": "",
+                "usage": self.get_usage_summary(),
+            }
+
         try:
-            response = self.client.chat.completions.create(
-                model=self.config.model,
+            reply_text, usage_tuple = self._call_openai(
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
         except Exception as e:
+            # 여기서의 에러는 Discord에서 'reason=error'로만 보이므로,
+            # 운영 로그(journalctl)에서 원인을 바로 찾을 수 있게 스택트레이스를 남긴다.
+            logger.exception("[YumeBrain] OpenAI call failed (final)")
             return {
                 "ok": False,
                 "reason": "error",
                 "reply": "",
-                "error": str(e),
+                "error": f"{type(e).__name__}: {e}",
                 "usage": {},
             }
 
-        choice = response.choices[0]
-        reply_text = choice.message.content.strip() if choice.message.content else ""
-
-        usage = getattr(response, "usage", None)
-        if usage is None:
+        if usage_tuple is None:
             return {
                 "ok": True,
                 "reason": "ok",
@@ -430,9 +590,7 @@ class YumeBrain:
                 },
             }
 
-        prompt_tokens = getattr(usage, "prompt_tokens", 0)
-        completion_tokens = getattr(usage, "completion_tokens", 0)
-        total_tokens = getattr(usage, "total_tokens", prompt_tokens + completion_tokens)
+        prompt_tokens, completion_tokens, total_tokens = usage_tuple
 
         estimated_cost = self._estimate_cost_usd(prompt_tokens, completion_tokens)
         if not self._can_spend(estimated_cost):
@@ -502,28 +660,33 @@ class YumeBrain:
 
         messages.append({"role": "user", "content": user_message.strip()})
 
+        # 이미 한도 초과면 호출하지 않는다.
+        if self._month_usage.total_usd >= self.config.hard_limit_usd:
+            return {
+                "ok": False,
+                "reason": "limit_exceeded",
+                "reply": "",
+                "usage": self.get_usage_summary(),
+            }
+
         # OpenAI 호출 + 사용량/한도 관리
         try:
-            response = self.client.chat.completions.create(
-                model=self.config.model,
+            reply_text, usage_tuple = self._call_openai(
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
         except Exception as e:
+            logger.exception("[YumeBrain] OpenAI call failed (custom)")
             return {
                 "ok": False,
                 "reason": "error",
                 "reply": "",
-                "error": str(e),
+                "error": f"{type(e).__name__}: {e}",
                 "usage": {},
             }
 
-        choice = response.choices[0]
-        reply_text = choice.message.content.strip() if choice.message.content else ""
-
-        usage = getattr(response, "usage", None)
-        if usage is None:
+        if usage_tuple is None:
             return {
                 "ok": True,
                 "reason": "ok",
@@ -534,9 +697,7 @@ class YumeBrain:
                 },
             }
 
-        prompt_tokens = getattr(usage, "prompt_tokens", 0)
-        completion_tokens = getattr(usage, "completion_tokens", 0)
-        total_tokens = getattr(usage, "total_tokens", prompt_tokens + completion_tokens)
+        prompt_tokens, completion_tokens, total_tokens = usage_tuple
 
         estimated_cost = self._estimate_cost_usd(prompt_tokens, completion_tokens)
         if not self._can_spend(estimated_cost):
