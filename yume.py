@@ -135,6 +135,7 @@ EXTENSIONS = [
     "cogs.aby_quest_board",
     "cogs.survival_cooking",
     "cogs.stamps",
+    "cogs.leveling",
     "cogs.yume_diary",
     "cogs.yume_chat",
     "cogs.yume_fun",

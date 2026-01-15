@@ -9,7 +9,3 @@ data/storage/*.json
 .env.txt
 .env.*
 !.env.example
-*.key
-*.pem
-id_rsa
-id_rsa.pub

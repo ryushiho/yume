@@ -17,6 +17,7 @@ We keep this module intentionally tiny and boring:
 from __future__ import annotations
 
 import random
+import re
 import time
 from typing import Any, Dict, Optional
 
@@ -2464,3 +2465,452 @@ def list_recent_explore_meta(limit: int = 300) -> List[Dict[str, Any]]:
         ).fetchall()
     return [dict(r) for r in rows]
 
+
+
+# =========================
+# Guild leveling (XP/Level)
+# =========================
+
+
+def xp_needed_for_next_level(level: int) -> int:
+    """XP required to go from `level` to `level + 1`.
+
+    - Level starts at 1.
+    - This is a common leveling curve used by many Discord leveling bots.
+    """
+
+    l = max(1, int(level))
+    return int(5 * (l ** 2) + 50 * l + 100)
+
+
+def total_xp_required_for_level(level: int) -> int:
+    """Cumulative XP required to reach `level`.
+
+    Example:
+      - level=1 -> 0
+      - level=2 -> xp_needed_for_next_level(1)
+      - level=3 -> xp_needed_for_next_level(1) + xp_needed_for_next_level(2)
+    """
+
+    lv = max(1, int(level))
+    total = 0
+    for l in range(1, lv):
+        total += xp_needed_for_next_level(l)
+    return int(total)
+
+
+def ensure_guild_xp_config(guild_id: int) -> None:
+    now = now_ts()
+    execute(
+        """
+        INSERT INTO guild_xp_config(
+          guild_id,
+          enabled,
+          chat_xp_min,
+          chat_xp_max,
+          chat_cooldown_sec,
+          cmd_xp,
+          cmd_cooldown_sec,
+          interaction_xp,
+          interaction_cooldown_sec,
+          announce_levelup,
+          announce_channel_id,
+          ignore_channel_ids,
+          ignore_role_ids,
+          created_at,
+          updated_at
+        )
+        VALUES(?, 1, 15, 25, 0, 5, 0, 2, 0, 1, NULL, '', '', ?, ?)
+        ON CONFLICT(guild_id) DO NOTHING;
+        """,
+        (int(guild_id), int(now), int(now)),
+    )
+
+
+def get_guild_xp_config(guild_id: int) -> dict:
+    ensure_guild_xp_config(guild_id)
+    row = fetchone("SELECT * FROM guild_xp_config WHERE guild_id=?;", (int(guild_id),))
+    return row or {
+        "guild_id": int(guild_id),
+        "enabled": 1,
+        "chat_xp_min": 15,
+        "chat_xp_max": 25,
+        "chat_cooldown_sec": 0,
+        "cmd_xp": 5,
+        "cmd_cooldown_sec": 0,
+        "interaction_xp": 2,
+        "interaction_cooldown_sec": 0,
+        # detailed XP knobs (v10+). If DB is older, these are just defaults.
+        "chat_len_step": 30,
+        "chat_len_cap": 10,
+        "chat_attach_bonus": 3,
+        "chat_link_bonus": 0,
+        "chat_total_cap": 50,
+        # keep strict "no cooldown" defaults
+        "chat_min_chars": 0,
+        "chat_repeat_window_sec": 0,
+        "cmd_xp_game": 12,
+        "cmd_xp_chat": 8,
+        "cmd_xp_social": 8,
+        "cmd_xp_system": 0,
+        "interaction_xp_component": 2,
+        "interaction_xp_modal": 3,
+        "announce_style": "banner",
+        "announce_ping": 1,
+        "announce_levelup": 1,
+        "announce_channel_id": None,
+        "ignore_channel_ids": "",
+        "ignore_role_ids": "",
+        "created_at": 0,
+        "updated_at": 0,
+    }
+
+
+def set_guild_xp_config(
+    guild_id: int,
+    *,
+    enabled: int | None = None,
+    announce_levelup: int | None = None,
+    announce_channel_id: int | None = None,
+    announce_style: str | None = None,
+    announce_ping: int | None = None,
+    chat_xp_min: int | None = None,
+    chat_xp_max: int | None = None,
+    chat_cooldown_sec: int | None = None,
+    chat_len_step: int | None = None,
+    chat_len_cap: int | None = None,
+    chat_attach_bonus: int | None = None,
+    chat_link_bonus: int | None = None,
+    chat_total_cap: int | None = None,
+    chat_min_chars: int | None = None,
+    chat_repeat_window_sec: int | None = None,
+    cmd_xp: int | None = None,
+    cmd_xp_game: int | None = None,
+    cmd_xp_chat: int | None = None,
+    cmd_xp_social: int | None = None,
+    cmd_xp_system: int | None = None,
+    cmd_cooldown_sec: int | None = None,
+    interaction_xp: int | None = None,
+    interaction_xp_component: int | None = None,
+    interaction_xp_modal: int | None = None,
+    interaction_cooldown_sec: int | None = None,
+    ignore_channel_ids: str | None = None,
+    ignore_role_ids: str | None = None,
+) -> None:
+    ensure_guild_xp_config(guild_id)
+    now = now_ts()
+
+    fields = []
+    params: list = []
+
+    def _set(name: str, val) -> None:
+        fields.append(f"{name}=?")
+        params.append(val)
+
+    if enabled is not None:
+        _set("enabled", int(enabled))
+    if announce_levelup is not None:
+        _set("announce_levelup", int(announce_levelup))
+    if announce_channel_id is not None:
+        # allow 0 to clear
+        _set("announce_channel_id", (int(announce_channel_id) if int(announce_channel_id) != 0 else None))
+    if announce_style is not None:
+        _set("announce_style", str(announce_style))
+    if announce_ping is not None:
+        _set("announce_ping", int(announce_ping))
+    if chat_xp_min is not None:
+        _set("chat_xp_min", max(0, int(chat_xp_min)))
+    if chat_xp_max is not None:
+        _set("chat_xp_max", max(0, int(chat_xp_max)))
+    if chat_cooldown_sec is not None:
+        _set("chat_cooldown_sec", max(0, int(chat_cooldown_sec)))
+    if chat_len_step is not None:
+        _set("chat_len_step", max(1, int(chat_len_step)))
+    if chat_len_cap is not None:
+        _set("chat_len_cap", max(0, int(chat_len_cap)))
+    if chat_attach_bonus is not None:
+        _set("chat_attach_bonus", max(0, int(chat_attach_bonus)))
+    if chat_link_bonus is not None:
+        _set("chat_link_bonus", max(0, int(chat_link_bonus)))
+    if chat_total_cap is not None:
+        _set("chat_total_cap", max(1, int(chat_total_cap)))
+    if chat_min_chars is not None:
+        _set("chat_min_chars", max(0, int(chat_min_chars)))
+    if chat_repeat_window_sec is not None:
+        _set("chat_repeat_window_sec", max(0, int(chat_repeat_window_sec)))
+    if cmd_xp is not None:
+        _set("cmd_xp", max(0, int(cmd_xp)))
+    if cmd_xp_game is not None:
+        _set("cmd_xp_game", max(0, int(cmd_xp_game)))
+    if cmd_xp_chat is not None:
+        _set("cmd_xp_chat", max(0, int(cmd_xp_chat)))
+    if cmd_xp_social is not None:
+        _set("cmd_xp_social", max(0, int(cmd_xp_social)))
+    if cmd_xp_system is not None:
+        _set("cmd_xp_system", max(0, int(cmd_xp_system)))
+    if cmd_cooldown_sec is not None:
+        _set("cmd_cooldown_sec", max(0, int(cmd_cooldown_sec)))
+    if interaction_xp is not None:
+        _set("interaction_xp", max(0, int(interaction_xp)))
+    if interaction_xp_component is not None:
+        _set("interaction_xp_component", max(0, int(interaction_xp_component)))
+    if interaction_xp_modal is not None:
+        _set("interaction_xp_modal", max(0, int(interaction_xp_modal)))
+    if interaction_cooldown_sec is not None:
+        _set("interaction_cooldown_sec", max(0, int(interaction_cooldown_sec)))
+    if ignore_channel_ids is not None:
+        _set("ignore_channel_ids", str(ignore_channel_ids))
+    if ignore_role_ids is not None:
+        _set("ignore_role_ids", str(ignore_role_ids))
+
+    if not fields:
+        return
+
+    fields.append("updated_at=?")
+    params.append(int(now))
+    params.append(int(guild_id))
+
+    execute(
+        f"UPDATE guild_xp_config SET {', '.join(fields)} WHERE guild_id=?;",
+        tuple(params),
+    )
+
+
+def ensure_user_xp(guild_id: int, user_id: int) -> None:
+    now = now_ts()
+    execute(
+        """
+        INSERT INTO user_xp(
+          guild_id, user_id, total_xp, level,
+          last_chat_at, last_cmd_at, last_interaction_at,
+          created_at, updated_at
+        )
+        VALUES(?, ?, 0, 1, 0, 0, 0, ?, ?)
+        ON CONFLICT(guild_id, user_id) DO NOTHING;
+        """,
+        (int(guild_id), int(user_id), int(now), int(now)),
+    )
+
+
+def get_user_xp(guild_id: int, user_id: int) -> dict:
+    ensure_user_xp(guild_id, user_id)
+    row = fetchone(
+        "SELECT * FROM user_xp WHERE guild_id=? AND user_id=?;",
+        (int(guild_id), int(user_id)),
+    )
+    return row or {
+        "guild_id": int(guild_id),
+        "user_id": int(user_id),
+        "total_xp": 0,
+        "level": 1,
+        "last_chat_at": 0,
+        "last_cmd_at": 0,
+        "last_interaction_at": 0,
+        "created_at": 0,
+        "updated_at": 0,
+    }
+
+
+def parse_id_list(value: str) -> list[int]:
+    """Parse comma/space-separated integer IDs.
+
+    Examples:
+      - "123, 456" -> [123, 456]
+      - "123 456"  -> [123, 456]
+      - ""         -> []
+    """
+
+    s = (value or "").strip()
+    if not s:
+        return []
+    parts = re.split(r"[\s,]+", s)
+    out: list[int] = []
+    for p in parts:
+        p = (p or "").strip()
+        if not p:
+            continue
+        if p.isdigit():
+            try:
+                out.append(int(p))
+            except Exception:
+                continue
+    return out
+
+
+def get_user_xp_progress(guild_id: int, user_id: int) -> dict:
+    """Return user XP plus progress fields: xp_into_level / xp_to_next."""
+
+    row = get_user_xp(guild_id, user_id)
+    total = int(row.get("total_xp", 0) or 0)
+    cur_level = int(row.get("level", 1) or 1)
+    level, xp_into, xp_to_next = _apply_level_from_total(total, cur_level)
+
+    # keep DB-consistent level even if something drifted
+    if int(row.get("level", 1) or 1) != int(level):
+        try:
+            execute(
+                "UPDATE user_xp SET level=?, updated_at=? WHERE guild_id=? AND user_id=?;",
+                (int(level), int(now_ts()), int(guild_id), int(user_id)),
+            )
+            row["level"] = int(level)
+        except Exception:
+            pass
+
+    row["xp_into_level"] = int(xp_into)
+    row["xp_to_next"] = int(xp_to_next)
+    return row
+
+
+def reset_user_xp(guild_id: int, user_id: int) -> None:
+    """Reset a user's XP/level (admin helper)."""
+
+    ensure_user_xp(guild_id, user_id)
+    now = now_ts()
+    execute(
+        """
+        UPDATE user_xp
+        SET total_xp=0, level=1,
+            last_chat_at=0, last_cmd_at=0, last_interaction_at=0,
+            updated_at=?
+        WHERE guild_id=? AND user_id=?;
+        """,
+        (int(now), int(guild_id), int(user_id)),
+    )
+
+
+def _apply_level_from_total(total_xp: int, current_level: int) -> tuple[int, int, int]:
+    """Return (new_level, xp_into_level, xp_to_next)."""
+
+    total = max(0, int(total_xp))
+    level = max(1, int(current_level))
+
+    # Compute the floor XP for current level
+    floor = total_xp_required_for_level(level)
+    # If total is below current floor (shouldn't happen), drop level safely.
+    while level > 1 and total < floor:
+        level -= 1
+        floor = total_xp_required_for_level(level)
+
+    # Level up as long as we can.
+    while True:
+        need = xp_needed_for_next_level(level)
+        if total >= floor + need:
+            floor += need
+            level += 1
+            continue
+        break
+
+    xp_into = total - floor
+    xp_to_next = xp_needed_for_next_level(level)
+    return int(level), int(xp_into), int(xp_to_next)
+
+
+def add_user_xp(
+    *,
+    guild_id: int,
+    user_id: int,
+    delta: int,
+    kind: str,
+    now: int | None = None,
+) -> dict:
+    """Add XP and update level atomically.
+
+    kind: 'chat' | 'cmd' | 'interaction'
+
+    Returns:
+      {
+        before_level, after_level, leveled_up,
+        before_total_xp, after_total_xp,
+        xp_into_level, xp_to_next
+      }
+    """
+
+    ensure_guild_xp_config(guild_id)
+    ensure_user_xp(guild_id, user_id)
+
+    now_ts_ = int(now or now_ts())
+    d = int(delta)
+
+    last_field = {
+        "chat": "last_chat_at",
+        "cmd": "last_cmd_at",
+        "interaction": "last_interaction_at",
+    }.get(str(kind), "last_chat_at")
+
+    with transaction() as con:
+        row = con.execute(
+            "SELECT total_xp, level, last_chat_at, last_cmd_at, last_interaction_at FROM user_xp WHERE guild_id=? AND user_id=?;",
+            (int(guild_id), int(user_id)),
+        ).fetchone()
+
+        before_total = int(row[0]) if row else 0
+        before_level = int(row[1]) if row else 1
+        last_chat_at = int(row[2]) if row else 0
+        last_cmd_at = int(row[3]) if row else 0
+        last_interaction_at = int(row[4]) if row else 0
+
+        after_total = max(0, before_total + d)
+        after_level, xp_into, xp_to_next = _apply_level_from_total(after_total, before_level)
+
+        # update last timestamps
+        if last_field == "last_chat_at":
+            last_chat_at = now_ts_
+        elif last_field == "last_cmd_at":
+            last_cmd_at = now_ts_
+        elif last_field == "last_interaction_at":
+            last_interaction_at = now_ts_
+
+        con.execute(
+            """
+            UPDATE user_xp
+            SET total_xp=?, level=?,
+                last_chat_at=?, last_cmd_at=?, last_interaction_at=?,
+                updated_at=?
+            WHERE guild_id=? AND user_id=?;
+            """,
+            (
+                int(after_total),
+                int(after_level),
+                int(last_chat_at),
+                int(last_cmd_at),
+                int(last_interaction_at),
+                int(now_ts_),
+                int(guild_id),
+                int(user_id),
+            ),
+        )
+
+    return {
+        "before_level": int(before_level),
+        "after_level": int(after_level),
+        "leveled_up": int(after_level) > int(before_level),
+        "before_total_xp": int(before_total),
+        "after_total_xp": int(after_total),
+        "xp_into_level": int(xp_into),
+        "xp_to_next": int(xp_to_next),
+        "last_field": last_field,
+    }
+
+
+def get_xp_leaderboard(guild_id: int, *, limit: int = 10, offset: int = 0) -> list[dict]:
+    """Return leaderboard rows ordered by total_xp desc."""
+
+    rows = fetchall(
+        """
+        SELECT user_id, total_xp, level
+        FROM user_xp
+        WHERE guild_id=?
+        ORDER BY total_xp DESC, level DESC, updated_at DESC
+        LIMIT ? OFFSET ?;
+        """,
+        (int(guild_id), int(limit), int(offset)),
+    )
+    return rows
+
+
+def count_xp_users(guild_id: int) -> int:
+    row = fetchone("SELECT COUNT(1) AS c FROM user_xp WHERE guild_id=?;", (int(guild_id),))
+    try:
+        return int(row.get("c") or 0) if row else 0
+    except Exception:
+        return 0

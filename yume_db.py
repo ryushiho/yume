@@ -17,6 +17,7 @@ v5: Abydos mini-game economy (debt/interest + exploration)
 v6: Abydos mini-game inventory/buffs (loot + simple one-buff system)
 v7: Abydos quest board + weekly points + explore meta
 v8: Abydos incidents + broadcast logs
+v9: guild leveling (XP/Level)
 """
 
 from __future__ import annotations
@@ -109,7 +110,7 @@ def init_db() -> None:
 
     now = int(time.time())
 
-    SCHEMA_VERSION = 8
+    SCHEMA_VERSION = 10
 
     with transaction() as con:
         con.execute(
@@ -473,6 +474,80 @@ def init_db() -> None:
             con.execute(
                 "CREATE INDEX IF NOT EXISTS idx_aby_incident_log_guild_time ON aby_incident_log(guild_id, created_at);"
             )
+
+        
+
+        # ===== v9 =====
+        if current_version < 9:
+            # PhaseX: MEE6-style guild leveling (XP/Level)
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS guild_xp_config (
+                  guild_id INTEGER PRIMARY KEY,
+                  enabled INTEGER NOT NULL DEFAULT 1,
+                  chat_xp_min INTEGER NOT NULL DEFAULT 15,
+                  chat_xp_max INTEGER NOT NULL DEFAULT 25,
+                  chat_cooldown_sec INTEGER NOT NULL DEFAULT 60,
+                  cmd_xp INTEGER NOT NULL DEFAULT 5,
+                  cmd_cooldown_sec INTEGER NOT NULL DEFAULT 20,
+                  interaction_xp INTEGER NOT NULL DEFAULT 2,
+                  interaction_cooldown_sec INTEGER NOT NULL DEFAULT 30,
+                  announce_levelup INTEGER NOT NULL DEFAULT 1,
+                  announce_channel_id INTEGER,
+                  ignore_channel_ids TEXT NOT NULL DEFAULT '',
+                  ignore_role_ids TEXT NOT NULL DEFAULT '',
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL
+                );
+                """
+            )
+
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_xp (
+                  guild_id INTEGER NOT NULL,
+                  user_id INTEGER NOT NULL,
+                  total_xp INTEGER NOT NULL DEFAULT 0,
+                  level INTEGER NOT NULL DEFAULT 1,
+                  last_chat_at INTEGER NOT NULL DEFAULT 0,
+                  last_cmd_at INTEGER NOT NULL DEFAULT 0,
+                  last_interaction_at INTEGER NOT NULL DEFAULT 0,
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL,
+                  PRIMARY KEY (guild_id, user_id)
+                );
+                """
+            )
+
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_user_xp_guild_total ON user_xp(guild_id, total_xp DESC);"
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_user_xp_guild_level ON user_xp(guild_id, level DESC, total_xp DESC);"
+            )
+
+        # ===== v10 =====
+        if current_version < 10:
+            # Leveling: detailed XP knobs + banner announce options
+            _add_column("guild_xp_config", "chat_len_step INTEGER NOT NULL DEFAULT 30")
+            _add_column("guild_xp_config", "chat_len_cap INTEGER NOT NULL DEFAULT 10")
+            _add_column("guild_xp_config", "chat_attach_bonus INTEGER NOT NULL DEFAULT 3")
+            _add_column("guild_xp_config", "chat_link_bonus INTEGER NOT NULL DEFAULT 0")
+            _add_column("guild_xp_config", "chat_total_cap INTEGER NOT NULL DEFAULT 50")
+            # Defaults keep a strict "no cooldown" behavior.
+            _add_column("guild_xp_config", "chat_min_chars INTEGER NOT NULL DEFAULT 0")
+            _add_column("guild_xp_config", "chat_repeat_window_sec INTEGER NOT NULL DEFAULT 0")
+
+            _add_column("guild_xp_config", "cmd_xp_game INTEGER NOT NULL DEFAULT 12")
+            _add_column("guild_xp_config", "cmd_xp_chat INTEGER NOT NULL DEFAULT 8")
+            _add_column("guild_xp_config", "cmd_xp_social INTEGER NOT NULL DEFAULT 8")
+            _add_column("guild_xp_config", "cmd_xp_system INTEGER NOT NULL DEFAULT 0")
+
+            _add_column("guild_xp_config", "interaction_xp_component INTEGER NOT NULL DEFAULT 2")
+            _add_column("guild_xp_config", "interaction_xp_modal INTEGER NOT NULL DEFAULT 3")
+
+            _add_column("guild_xp_config", "announce_style TEXT NOT NULL DEFAULT 'banner'")
+            _add_column("guild_xp_config", "announce_ping INTEGER NOT NULL DEFAULT 1")
 
         con.execute(
             """
